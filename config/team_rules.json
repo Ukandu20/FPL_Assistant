@@ -1,0 +1,28 @@
+[
+  { "pattern": "^advanced_goalkeeping$",        "replacement": "team_gk" },
+  { "pattern": "^goalkeeping$",                 "replacement": "team_goalkeeping" },
+
+  { "pattern": "^defensive_actions$",           "replacement": "team_def_actions" },
+  { "pattern": "^goal_and_shot_creation$",      "replacement": "team_gca" },
+  { "pattern": "^standard_stats$",              "replacement": "team_stats" },
+  { "pattern": "^miscellaneous_stats$",         "replacement": "team_misc_stats" },
+  { "pattern": "^pass_types$",                  "replacement": "team_pass_types" },
+  { "pattern": "^passing$",                     "replacement": "team_passing" },
+  { "pattern": "^playing_time$",                "replacement": "team_playing_time" },
+  { "pattern": "^possession$",                  "replacement": "team_possession" },
+  { "pattern": "^shooting$",                    "replacement": "team_shooting" },
+
+  { "pattern": "^opp_advanced_goalkeeping$",    "replacement": "opp_team_gk" },
+  { "pattern": "^opp_goalkeeping$",             "replacement": "opp_team_goalkeeping" },
+  { "pattern": "^opp_defensive_actions$",       "replacement": "opp_team_def_actions" },
+  { "pattern": "^opp_goal_and_shot_creation$",  "replacement": "opp_team_gca" },
+  { "pattern": "^opp_standard_stats$",          "replacement": "opp_team_stats" },
+  { "pattern": "^opp_miscellaneous_stats$",     "replacement": "opp_team_misc_stats" },
+  { "pattern": "^opp_pass_types$",              "replacement": "opp_team_pass_types" },
+  { "pattern": "^opp_passing$",                 "replacement": "opp_team_passing" },
+  { "pattern": "^opp_playing_time$",            "replacement": "opp_team_playing_time" },
+  { "pattern": "^opp_possession$",              "replacement": "opp_team_possession" },
+  { "pattern": "^opp_shooting$",                "replacement": "opp_team_shooting" },
+
+  { "pattern": "^wages$",                       "replacement": "wages" }
+]
