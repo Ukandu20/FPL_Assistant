@@ -1,4 +1,4 @@
-# 🧠 Fantasy Premier League ML Assistant
++/🧠 Fantasy Premier League ML Assistant
 
 > A machine learning-powered assistant to help optimize Fantasy Premier League (FPL) team decisions each gameweek — built for interpretability and open-source reproducibility.
 
