@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-clean_fbref_csvs.py – ALL-IN-ONE cleaner                 2025-07-31  rev K
+clean_fbref_csvs.py – ALL-IN-ONE cleaner                 2025-08-02  rev L
 
-∆ Added fpl_pos:
-   • Inherit from player’s latest prior season (any league), else fallback.
-   • Column saved in player_season + player_match CSVs and season_players.json
+NEW IN rev L
+────────────
+1. `is_promoted`  → 1 if the club was **not** in the previous season.
+2. Rename `is_home` / `is_away` ⇒ `home` / `away`.
+3. Add boolean `is_home` / `is_away` (row’s team ⇢ venue).
+4. Keeps the fpl_pos & opponent_id logic from rev K.
 """
 
 from __future__ import annotations
@@ -128,6 +131,16 @@ def add_opponent_ids(df: pd.DataFrame) -> None:
 
         df["opponent_id"] = df.apply(_opp, axis=1)
 
+def inject_promoted_flag(df: pd.DataFrame, prev_team_ids: set[str]) -> None:
+    """
+    Adds `is_promoted` (Int8) column based on whether team_id was absent
+    in the *previous* season.
+    """
+    if "team_id" in df.columns and prev_team_ids:
+        df["is_promoted"] = df["team_id"].apply(
+            lambda tid: pd.NA if tid == "" else int(tid not in prev_team_ids)
+        ).astype("Int8")
+
 # ───────────── header helpers ─────────────
 def normalize(col: str) -> str:
     s = re.sub(r"(?i)^unnamed(?:_\d+)?_", "", str(col)).lower()
@@ -163,13 +176,13 @@ def choose_subfolder(stem: str):
     return "player_match"
 
 def split_game_cols(df: pd.DataFrame, team_map: dict):
-    parts = df["game"].astype(str).str.extract(GAME_RE)
+    parts = df["game"].astype(str).str.extract(GAME_RE.pattern)
     good  = parts["date"].notna()
     if not good.any(): return None
     df.loc[good, "game_date"] = parts.loc[good, "date"]
-    df.loc[good, "is_home"]   = parts.loc[good, "home"].str.strip().apply(
+    df.loc[good, "home"]      = parts.loc[good, "home"].str.strip().apply(
         lambda s: team_map.get(s.lower(), team_map.get(s.upper(), s.strip())))
-    df.loc[good, "is_away"]   = parts.loc[good, "away"].str.strip().apply(
+    df.loc[good, "away"]      = parts.loc[good, "away"].str.strip().apply(
         lambda s: team_map.get(s.lower(), team_map.get(s.upper(), s.strip())))
     return good
 
@@ -215,6 +228,7 @@ def clean_csv(
     pos_counts: dict[str, Counter],
     pos_map: dict,
     team_map: dict,
+    prev_team_ids: set[str],
     force=False,
 ):
     stem = path.stem
@@ -226,7 +240,6 @@ def clean_csv(
         return
 
     sched = path.stem.endswith("schedule")
-    # schedule tables have a single header row
     df = pd.read_csv(path, header=[0] if sched else [0, 1, 2])
 
     df  = flatten_header(df)
@@ -240,7 +253,7 @@ def clean_csv(
                     lambda s: team_map.get(s.strip().lower(),
                                            team_map.get(s.strip().upper(),
                                                         s.strip().lower()))
-                ).str.upper()          # ← ensure final value is MUN, ARS …
+                ).str.upper()
             )
 
     # 2️⃣  split game & game_id
@@ -251,7 +264,7 @@ def clean_csv(
                 slug = next((extract_game_slug(str(v))
                              for v in row if isinstance(v, str)
                              if extract_game_slug(str(v))), None)
-                return slug or make_game_id(row["game_date"], row["is_home"], row["is_away"])
+                return slug or make_game_id(row["game_date"], row["home"], row["away"])
             df.loc[good, "game_id"] = df.loc[good].apply(_gid, axis=1)
 
     # 3️⃣  numeric coercion (skip id-like + age/born)
@@ -332,12 +345,21 @@ def clean_csv(
             return get_team_id((r.get("team") or r.get("club") or r.get("squad") or "").strip(), mt_lookup)
         df["team_id"] = df.apply(row_team_id, axis=1)
 
+    # NEW: is_promoted flag
+    inject_promoted_flag(df, prev_team_ids)
+
+    # NEW: rename venue columns + boolean flags
+    if {"is_home", "is_away"} <= set(df.columns):
+        df.rename(columns={"is_home": "home", "is_away": "away"}, inplace=True)
+
+    if "team" in df.columns and {"home", "away"} <= set(df.columns):
+        df["is_home"] = (df["team"] == df["home"]).astype("Int8")
+        df["is_away"] = (df["team"] == df["away"]).astype("Int8")
 
     # NEW: inject opponent_id for team_match & player_match
     if sub in {"team_match", "player_match"} and {"game_id","team_id"} <= set(df.columns):
         add_opponent_ids(df)
 
-        
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False, na_rep="")
 
@@ -348,8 +370,8 @@ def main():
     ap.add_argument("--raw-dir",   type=Path, required=True)
     ap.add_argument("--clean-dir", type=Path, required=True)
     ap.add_argument("--rules",     type=Path)
-    ap.add_argument("--pos-map",   type=Path, default=Path("data/config/position_map.json"))
-    ap.add_argument("--team-map",  type=Path, default=Path("data/config/team_map.json"))
+    ap.add_argument("--pos-map",   type=Path, default=Path("data/config/positions.json"))
+    ap.add_argument("--team-map",  type=Path, default=Path("data/config/teams.json"))
     ap.add_argument("--workers",   type=int, default=4)
     ap.add_argument("--force",     action="store_true")
     ap.add_argument("--log-level", default="INFO")
@@ -381,6 +403,9 @@ def main():
             season = season_dir.name
             if a.season and season != a.season: continue
 
+            # --- new: snapshot of teams seen BEFORE this season (for is_promoted)
+            prev_team_ids = {tid for tid in mt_league}  # keys are team_ids
+
             ps_files    = [*season_dir.rglob("*player_season_*.csv")]
             other_files = [f for f in season_dir.rglob("*.csv") if f not in ps_files]
 
@@ -391,14 +416,14 @@ def main():
                     f, season, league, a.clean_dir, rules,
                     mp_lookup, mt_lookup, mp_league, mt_league, mp_global,
                     season_players, season_teams, pos_counts,
-                    pos_map, team_map, a.force), ps_files),
+                    pos_map, team_map, prev_team_ids, a.force), ps_files),
                 total=len(ps_files), desc=f"{league} {season} player-season"))
 
             list(tqdm(mapper(lambda f: clean_csv(
                     f, season, league, a.clean_dir, rules,
                     mp_lookup, mt_lookup, mp_league, mt_league, mp_global,
                     season_players, season_teams, pos_counts,
-                    pos_map, team_map, a.force), other_files),
+                    pos_map, team_map, prev_team_ids, a.force), other_files),
                 total=len(other_files), desc=f"{league} {season} other"))
 
             # majority-vote positions
@@ -406,7 +431,6 @@ def main():
                 raw = pos_counts[pid].most_common(1)[0][0] if pos_counts[pid] else rec["pri_position"]
                 rec["pri_position"] = raw
                 rec["position"]     = pos_map.get(raw, "UNK")
-                # If this is the first season we met the player, fpl_pos may need update now
                 if last_fpl_pos(pid, mp_global, season) is None:
                     rec["fpl_pos"] = rec["position"]
 
@@ -429,19 +453,16 @@ def main():
                 df_sync = pd.read_csv(fp)
 
                 if "player_id" in df_sync.columns:
-                    # position sync
                     df_sync["position"] = (
                         df_sync.get("position", pd.Series("UNK", index=df_sync.index))
                         .where(~df_sync["player_id"].map(pid2pos).notna(),
                                df_sync["player_id"].map(pid2pos))
                     )
-                    # fpl_pos sync
                     df_sync["fpl_pos"] = df_sync["player_id"].map(pid2fpl)
 
                 if "game_id" in df_sync.columns:
                     df_sync["round"] = df_sync["game_id"].map(round_map)
 
-                # dtype fix for age/born + team mapping
                 for col in ("age", "born"):
                     if col in df_sync.columns:
                         df_sync[col] = (
@@ -456,8 +477,13 @@ def main():
                                 lambda s: team_map.get(s.strip().lower(),
                                                        team_map.get(s.strip().upper(),
                                                                     s.strip().lower()))
-                            ).str.upper()
-                        )
+                        ).str.upper()
+                )
+                # venue booleans re-compute after sync
+                if {"team", "home", "away"} <= set(df_sync.columns):
+                    df_sync["is_home"] = (df_sync["team"] == df_sync["home"]).astype("Int8")
+                    df_sync["is_away"] = (df_sync["team"] == df_sync["away"]).astype("Int8")
+
                 df_sync.to_csv(fp, index=False, na_rep="")
 
             # ---------- JSON outputs ----------

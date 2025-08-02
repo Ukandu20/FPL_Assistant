@@ -140,7 +140,7 @@ def best_fuzzy_match(name: str,
 def process_season(season_dir: Path,
                    out_dir: Path,
                    global_map: Dict[str, str],
-                   overrides: Dict[str, str],
+                   overrides: Dict[str, Dict[str, str]],
                    root_fbref: Path,
                    threshold: int,
                    skip_substrings: Set[str]) -> None:
