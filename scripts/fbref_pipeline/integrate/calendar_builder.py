@@ -36,6 +36,11 @@ def load_fixture_calendar(season_dir: Path) -> pd.DataFrame:
             "date_played",
             "team_id",
             "team",
+            "venue",
+            "gf",
+            "ga",
+            "fdr_home",
+            "fdr_away",
         ],
     )
 
@@ -97,12 +102,96 @@ def load_roster_jsons(season_dir: Path, fbref_root: Path) -> pd.DataFrame:
 def load_minutes(season_dir: Path, fbref_root: Path) -> pd.DataFrame:
     """
     Reads fbref_root/<season>/player_match/summary.csv
+    and fbref_root/<season>/player_match/keepers.csv,
+    renames columns, and concatenates them into one DataFrame.
     """
     season_key = season_dir.name
-    fp = fbref_root / season_key / "player_match" / "summary.csv"
-    df = pd.read_csv(fp, usecols=["game_id", "player_id", "player", "min", "team_id"])
-    df.rename(columns={"game_id": "fbref_id"}, inplace=True)
+    summary_fp = fbref_root / season_key / "player_match" / "summary.csv"
+    keeper_fp  = fbref_root / season_key / "player_match" / "keepers.csv"
+    def_fp  = fbref_root / season_key / "player_match" / "defense.csv"
+    misc_fp  = fbref_root / season_key / "player_match" / "misc.csv"
+    
+    # 1. load outfield player minutes & events
+    df = pd.read_csv(
+        summary_fp,
+        usecols=[
+            "game_id", "player_id", "player", "min", "team_id",
+            "crdy", "crdr", "fpl_pos", "gls", "ast", "xg", "npxg", "xag", "pkatt", "pk", "sh", "sot"
+        ]
+    ).rename(columns={
+        "game_id": "fbref_id",
+        "min": "minutes",
+        "crdy":     "yellow_crd",
+        "crdr":     "red_crd",
+        "fpl_pos":  "pos",
+        "pk":       "pk_scored",
+        "sh": "shots"
+    })
+    
+
+    # 2. load goalkeeper stats
+    df_gk = pd.read_csv(
+        keeper_fp,
+        usecols=[
+            "game_id", "player_id",
+            "team_id", "sota", "saves", "save"
+        ]
+    ).rename(columns={
+        "game_id": "fbref_id",
+        "sota":     "sot_against",
+        "save":     "save_pct"
+    })
+
+    
+    # 2. load defending stats
+    df_def = pd.read_csv(
+        def_fp,
+        usecols=[
+            "game_id", "player_id",
+            "team_id", "blocks", "tklw", "int", "clr"
+        ]
+    ).rename(columns={
+        "game_id": "fbref_id",
+        "tklw":     "tkl",
+    })
+
+    
+    df_misc = pd.read_csv(
+        misc_fp,
+        usecols=[
+            "game_id", "player_id",
+            "team_id", "recov", "pkwon", "og"
+        ]
+    ).rename(columns={
+        "game_id": "fbref_id",
+        "recov":     "recoveries",
+        "pkwon": "pk_won",
+        "og": "own_goals",
+    })
+    
+    # 3) merge GK onto outfield frame (so every row has minutes & events)
+    df = df.merge(
+        df_gk,
+        on=["fbref_id", "player_id", "team_id"],
+        how="left"
+    )
+    df = df.merge(
+        df_def,
+        on=["fbref_id", "player_id", "team_id"],
+        how="left"
+    )
+    df = df.merge(
+        df_misc,
+        on=["fbref_id", "player_id", "team_id"],
+        how="left"
+    )
+    
+    # 4) fill missing GK stats with 0 for non-GKs
+    for col in ("sot_against", "saves", "save_pct"):
+        df[col] = df[col].fillna(0)
+
     return df
+
 
 
 def build_minutes_calendar(
@@ -115,6 +204,7 @@ def build_minutes_calendar(
 
     # Load fixture calendar
     cal = load_fixture_calendar(season_dir)
+    cal["date_played"] = pd.to_datetime(cal["date_played"])
 
     # Load player minutes directly
     minutes = load_minutes(season_dir, fbref_root)
@@ -129,19 +219,41 @@ def build_minutes_calendar(
         merged.dropna(subset=["date_played"], inplace=True)
 
     # Flag active (minutes played greater than 0)
-    merged["is_active"] = np.where(merged["min"].gt(0), 1, 0).astype("uint8")
+    merged["is_active"] = np.where(merged["minutes"].gt(0), 1, 0).astype("uint8")
+
+    # ─── Calculate days since last match for each player ────────────────────────
+    #  sort by player & date so diff() compares correctly
+    merged = merged.sort_values(["player_id", "date_played"])
+    merged["days_since_last"] = (
+        merged.groupby("player_id")["date_played"]
+              .diff()                # Timedelta since previous appearance
+              .dt.days               # integer days
+              .fillna(0)             # first appearance → 0 days
+              .astype(int)
+    )
 
     # Output columns
     out_cols = [
+        "player_id",
+        "player",
+        "pos",
         "fbref_id",
         "fpl_id",
         "gw_orig",
         "date_played",
         "team_id",
-        "player_id",
-        "player",
-        "min",
+        "team",        
+        "minutes",
+        "days_since_last",
         "is_active",
+        "yellow_crd",
+        "red_crd",
+        "venue",
+        "gf",
+        "ga",
+        "fdr_home",
+        "fdr_away",
+        "gls", "ast", "shots","sot", "blocks", "tkl", "int","clr", "xg", "npxg", "xag", "pkatt", "pk_scored", "pk_won", "saves", "sot_against", "save_pct", "own_goals", "recoveries", 
     ]
     merged[out_cols].to_csv(out_fp, index=False)
     logging.info("✅ %s written (%d rows)", out_fp.name, len(merged))

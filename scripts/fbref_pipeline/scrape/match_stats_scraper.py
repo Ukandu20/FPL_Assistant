@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 import soccerdata as sd
-from fbref_utils import (
+from utils.fbref_utils import (
     STAT_MAP, safe_write, seasons_from_league,
     init_logger, polite_sleep
 )

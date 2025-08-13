@@ -8,7 +8,7 @@ import csv
 def parse_data():
     """ Parse and store all the data
     """
-    season = '2019-20'
+    season = '2025-26'
     base_filename = 'data/' + 'raw/' + 'fpl/'  + season + '/'
     print("Getting data")
     data = get_data()
