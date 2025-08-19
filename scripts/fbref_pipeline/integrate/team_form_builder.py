@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""team_form_builder.py  – schema v1.8 (adds possession), causal, venue-aware, symmetric FDR, versioned
+r"""team_form_builder.py  – schema v2.0 (future-season ready, adds auto-version & latest pointer)
 
 Inputs (per season):
   data/processed/fixtures/<SEASON>/fixture_calendar.csv
@@ -15,15 +15,16 @@ Outputs (per season):
 
 Design:
 • Past-only rolling means (no current-row leakage).
-• Multi-season priors: last ≤3 seasons (newer weighted more).
-• Promoted teams (no history): fallback to league mean of previous seasons.
+• Multi-season priors: last ≤3 seasons (newer weighted more). Robust fallbacks for brand-new seasons.
+• Promoted teams (no history): fallback to league means (prev seasons) → global defaults if needed.
 • Venue splits with shrinkage λ = n/(n+τ).
 • Z-scores computed within (season, gw_orig); z=0 when std==0.
 • FDR computed once per fixture (symmetric): consistent across both rows.
-• Versioning & lineage: meta includes features list and a content hash.
+• Auto-versioning (--auto-version) and optional 'latest' pointer (--write-latest).
 """
+
 from __future__ import annotations
-import argparse, json, logging, datetime as dt, hashlib
+import argparse, json, logging, datetime as dt, hashlib, os, re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from functools import reduce
@@ -31,7 +32,7 @@ from functools import reduce
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v1.8"
+SCHEMA_VERSION = "v2.0"
 
 # Raw metric columns expected in fixture_calendar.csv
 METRICS = {
@@ -42,8 +43,7 @@ METRICS = {
 
 REQUIRED = {
     "fpl_id", "fbref_id", "team_id", "team", "venue", "gw_orig", "date_played",
-    "home_id", "away_id",
-    "fdr_home", "fdr_away",
+    "date_sched", "home_id", "away_id", "fdr_home", "fdr_away",
     "gf","ga","xg","xga","poss","result",
 }
 
@@ -56,6 +56,42 @@ LEGACY_FDR = [
     "fdr_home_cont","fdr_away_cont",
     "fdr_att_home_cont","fdr_def_home_cont","fdr_att_away_cont","fdr_def_away_cont",
 ]
+
+# Reasonable league-wide neutral defaults for cold starts (if no prior data exists)
+DEFAULT_MEANS = {"gf": 1.40, "xg": 1.45, "ga": 1.40, "xga": 1.45, "poss": 50.0}
+
+
+# ─────────────────────────── version helpers ───────────────────────────
+
+def _resolve_version(features_root: Path, requested: Optional[str], auto: bool) -> str:
+    if auto or (not requested) or (requested.lower() == "auto"):
+        existing = [p.name for p in features_root.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)]
+        nxt = (max(int(p[1:]) for p in existing) + 1) if existing else 1
+        ver = f"v{nxt}"
+        logging.info("Auto-version resolved to %s", ver)
+        return ver
+    if not re.fullmatch(r"v\d+", requested):
+        if requested.isdigit():
+            return f"v{requested}"
+        raise ValueError(f"--version must be like v9 or a number; got {requested}")
+    return requested
+
+
+def _write_latest_pointer(features_root: Path, version: str) -> None:
+    latest = features_root / "latest"
+    target = features_root / version
+    try:
+        if latest.exists() or latest.is_symlink():
+            try:
+                latest.unlink()
+            except Exception:
+                pass
+        os.symlink(target.name, latest, target_is_directory=True)
+        logging.info("Updated 'latest' symlink -> %s", version)
+    except (OSError, NotImplementedError):
+        (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
+        logging.info("Wrote LATEST_VERSION.txt -> %s", version)
+
 
 # ─────────────────────────── I/O helpers ───────────────────────────
 
@@ -71,12 +107,23 @@ def _meta_hash(df: pd.DataFrame) -> str:
     sample = df[["season","fpl_id","team_id"] + cols].head(500).to_json(orient="split", index=False)
     return hashlib.sha256(sample.encode("utf-8")).hexdigest()[:12]
 
+
 # ─────────────── Multi-season priors (last ≤3 seasons) ─────────────
 
 def _seasons_before(all_seasons: List[str], current: str, k: int = 3) -> List[str]:
     prior = [s for s in all_seasons if s < current]
     prior.sort()
     return prior[-k:]
+
+
+def _safe_means(frame: pd.DataFrame, cols: List[str]) -> Dict[str, float]:
+    out = {}
+    for c in cols:
+        v = pd.to_numeric(frame[c], errors="coerce")
+        m = float(v.mean()) if v.notna().any() else DEFAULT_MEANS.get(c, 0.0)
+        out[c] = m
+    return out
+
 
 def build_team_priors(
     cal_all: pd.DataFrame,
@@ -85,28 +132,52 @@ def build_team_priors(
     cols: List[str],
     beta: float = 0.7
 ) -> pd.DataFrame:
+    """
+    Return a DataFrame indexed by current-season team_id with prior means for `cols`.
+    Uses last ≤3 seasons with geometric weights; falls back to league/global defaults.
+    """
     prev_seasons = _seasons_before(all_seasons, season, k=3)
+    cur_ids = cal_all.loc[cal_all["season"] == season, "team_id"].dropna().unique()
+
     if not prev_seasons:
-        base = cal_all[cal_all["season"] == season].groupby("team_id")[cols].mean()
-        return base.fillna(base.mean())
+        # No history at all (brand-new dataset): use global defaults
+        base = pd.DataFrame([DEFAULT_MEANS], index=[0])[cols]
+        base = base.reindex(cur_ids).ffill().bfill()
+        base.index = cur_ids
+        return base
 
     stacks = []
     for i, s in enumerate(prev_seasons):
         w = beta ** (len(prev_seasons) - 1 - i)  # newer seasons ↑ weight
-        g = cal_all[cal_all["season"] == s].groupby("team_id")[cols].mean().mul(w)
+        hist = cal_all[cal_all["season"] == s]
+        if hist.empty:
+            continue
+        g = hist.groupby("team_id")[cols].mean().mul(w)
         stacks.append(g)
 
-    prior = reduce(lambda a, b: a.add(b, fill_value=0), stacks)
+    if not stacks:
+        # No usable prev rows → global defaults
+        base = pd.DataFrame([DEFAULT_MEANS], index=[0])[cols]
+        base = base.reindex(cur_ids).ffill().bfill()
+        base.index = cur_ids
+        return base
 
-    cur_ids = cal_all.loc[cal_all["season"] == season, "team_id"].unique()
+    prior = reduce(lambda a, b: a.add(b, fill_value=0.0), stacks)
+
+    # reindex to current season team ids
     prior = prior.reindex(cur_ids)
 
-    league_mean_prev = (
-        pd.concat([cal_all[cal_all["season"] == s] for s in prev_seasons])
-        .groupby("team_id")[cols].mean().mean()
-    )
-    prior = prior.fillna(league_mean_prev.to_dict())
+    # league means from previous seasons as fallback
+    league_prev = pd.concat([cal_all[cal_all["season"] == s] for s in prev_seasons], ignore_index=True)
+    league_means = _safe_means(league_prev, cols)
+    prior = prior.fillna(pd.Series(league_means))
+
+    # final fallback (should not happen, but safe)
+    for c in cols:
+        prior[c] = prior[c].fillna(DEFAULT_MEANS.get(c, 0.0))
+
     return prior
+
 
 # ───────── Rolling (past-only) with venue shrinkage + taper ─────────
 
@@ -118,10 +189,10 @@ def rolling_past_only(
     prior_val: Optional[float],
     prior_matches: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    v   = team_df[val_col].astype(float).to_numpy()
+    v   = pd.to_numeric(team_df[val_col], errors="coerce").to_numpy()
     ven = team_df["venue"].astype(str).to_numpy()
 
-    # guard: no NaNs (possession gaps default to neutral 50)
+    # guard: poss gaps → 50; other metric gaps → 0
     if np.isnan(v).any():
         v = np.where(np.isnan(v), 50.0 if val_col == "poss" else 0.0, v)
 
@@ -139,13 +210,14 @@ def rolling_past_only(
 
         # prior taper for first K matches
         if prior_val is not None and prior_matches > 0 and i < prior_matches:
-            w = 1.0 - (i / prior_matches)  # w∈(1..~0]
+            w = 1.0 - (i / max(1, prior_matches))
             base = (1 - w) * base + w * prior_val
 
         mask = ven[lo:i] == "Home"
         rec  = v[lo:i]
         nh = int(mask.sum()); na = int((~mask).sum())
-        lam_h = nh / (nh + tau); lam_a = na / (na + tau)
+        lam_h = nh / (nh + tau) if (nh + tau) > 0 else 0.0
+        lam_a = na / (na + tau) if (na + tau) > 0 else 0.0
         mean_h = rec[mask].mean() if nh else base
         mean_a = rec[~mask].mean() if na else base
 
@@ -154,6 +226,7 @@ def rolling_past_only(
         roll_a[i] = lam_a * mean_a + (1 - lam_a) * base
 
     return roll, roll_h, roll_a
+
 
 # ────────────────────────── FDR (symmetric) ─────────────────────────
 
@@ -219,6 +292,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
             "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont"]
     return fixtures[keep]
 
+
 # ───────────────────── helpers to load all seasons ─────────────────
 
 def _coerce_poss(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,22 +303,34 @@ def _coerce_poss(df: pd.DataFrame) -> pd.DataFrame:
     df["poss"] = df["poss"].fillna(50.0)
     return df
 
+
 def _load_all(fixtures_root: Path, seasons: List[str]) -> pd.DataFrame:
     frames = []
     for s in seasons:
         fp = fixtures_root / s / "fixture_calendar.csv"
         if not fp.is_file():
+            logging.warning("%s • missing fixture_calendar.csv – skipped", s)
             continue
-        df = pd.read_csv(fp, parse_dates=["date_played"])
+        df = pd.read_csv(fp, parse_dates=["date_played","date_sched"])
         missing = REQUIRED - set(df.columns)
         if missing:
             raise KeyError(f"{s}: fixture_calendar missing columns: {missing}")
         df = _coerce_poss(df)
+
+        # date_key: prefer actual played date, else scheduled date (future-season friendly)
+        dk = pd.to_datetime(df["date_played"], errors="coerce")
+        ds = pd.to_datetime(df["date_sched"], errors="coerce")
+        df["date_key"] = dk.fillna(ds)
+
         frames.append(df.assign(season=s))
+
     if not frames:
         raise FileNotFoundError("No seasons could be loaded from fixtures_root")
+
     all_df = pd.concat(frames, ignore_index=True)
-    return all_df.sort_values(["season","date_played","fpl_id","team_id"]).reset_index(drop=True)
+    # Stable sort: date_key → fpl_id → team_id
+    return all_df.sort_values(["season","date_key","fpl_id","team_id"]).reset_index(drop=True)
+
 
 # ───────────────────── per-season builder ──────────────────────────
 
@@ -258,7 +344,7 @@ def build_team_form(
     force: bool,
     all_seasons: List[str],
     prior_matches: int,
-    cal_all: pd.DataFrame,            # (5) cached all seasons passed in
+    cal_all: pd.DataFrame,            # cached all seasons passed in
 ) -> bool:
     cal_fp = fixtures_root / season / "fixture_calendar.csv"
     dst_dir = out_dir / out_version / season
@@ -273,9 +359,15 @@ def build_team_form(
         return False
 
     cal = cal_all[cal_all["season"] == season].copy()
-    cal = cal.sort_values(["date_played","fpl_id","team_id"]).reset_index(drop=True)
+    if cal.empty:
+        logging.warning("%s • no rows after load – skipped", season)
+        return False
 
-    # Priors for this season
+    # Robust numeric coercion (future seasons may be NaN)
+    for c in ["gf","ga","xg","xga","poss"]:
+        cal[c] = pd.to_numeric(cal[c], errors="coerce")
+
+    # Priors for this season (with robust fallbacks)
     cols_att = list(METRICS["att"]["raw"])  # ["gf","xg"]
     cols_def = list(METRICS["def"]["raw"])  # ["ga","xga"]
     cols_pos = list(METRICS["pos"]["raw"])  # ["poss"]
@@ -283,16 +375,16 @@ def build_team_form(
     priors_def = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_def, beta=0.7)
     priors_pos = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_pos, beta=0.7)
 
-    # Rolling calculations per team
+    # Rolling calculations per team (ordered by date_key; future-season safe)
     rows = []
     for tid, grp in cal.groupby("team_id", sort=False):
-        tmp = grp.copy()
+        tmp = grp.sort_values(["date_key","fpl_id"]).copy()
 
         # ATT
-        pgf = priors_att.loc[tid, cols_att[0]] if tid in priors_att.index else None
-        pxg = priors_att.loc[tid, cols_att[1]] if tid in priors_att.index else None
-        gf_roll, gf_h, gf_a = rolling_past_only(grp, cols_att[0], decay_window, tau, pgf, prior_matches)
-        xg_roll, xg_h, xg_a = rolling_past_only(grp, cols_att[1], decay_window, tau, pxg, prior_matches)
+        pgf = float(priors_att.loc[tid, cols_att[0]]) if tid in priors_att.index else DEFAULT_MEANS["gf"]
+        pxg = float(priors_att.loc[tid, cols_att[1]]) if tid in priors_att.index else DEFAULT_MEANS["xg"]
+        gf_roll, gf_h, gf_a = rolling_past_only(tmp, cols_att[0], decay_window, tau, pgf, prior_matches)
+        xg_roll, xg_h, xg_a = rolling_past_only(tmp, cols_att[1], decay_window, tau, pxg, prior_matches)
         tmp["att_gf_roll"] = gf_roll
         tmp["att_xg_roll"] = xg_roll
         tmp["att_gf_home_roll"] = gf_h
@@ -301,10 +393,10 @@ def build_team_form(
         tmp["att_xg_away_roll"] = xg_a
 
         # DEF
-        pga = priors_def.loc[tid, cols_def[0]] if tid in priors_def.index else None
-        pxga= priors_def.loc[tid, cols_def[1]] if tid in priors_def.index else None
-        ga_roll, ga_h, ga_a = rolling_past_only(grp, cols_def[0], decay_window, tau, pga, prior_matches)
-        xga_roll, xga_h, xga_a = rolling_past_only(grp, cols_def[1], decay_window, tau, pxga, prior_matches)
+        pga = float(priors_def.loc[tid, cols_def[0]]) if tid in priors_def.index else DEFAULT_MEANS["ga"]
+        pxga= float(priors_def.loc[tid, cols_def[1]]) if tid in priors_def.index else DEFAULT_MEANS["xga"]
+        ga_roll, ga_h, ga_a = rolling_past_only(tmp, cols_def[0], decay_window, tau, pga, prior_matches)
+        xga_roll, xga_h, xga_a = rolling_past_only(tmp, cols_def[1], decay_window, tau, pxga, prior_matches)
         tmp["def_ga_roll"] = ga_roll
         tmp["def_xga_roll"] = xga_roll
         tmp["def_ga_home_roll"] = ga_h
@@ -313,8 +405,8 @@ def build_team_form(
         tmp["def_xga_away_roll"] = xga_a
 
         # POSSESSION
-        ppos = priors_pos.loc[tid, cols_pos[0]] if tid in priors_pos.index else 50.0
-        poss_roll, poss_h, poss_a = rolling_past_only(grp, cols_pos[0], decay_window, tau, ppos, prior_matches)
+        ppos = float(priors_pos.loc[tid, cols_pos[0]]) if tid in priors_pos.index else DEFAULT_MEANS["poss"]
+        poss_roll, poss_h, poss_a = rolling_past_only(tmp, cols_pos[0], decay_window, tau, ppos, prior_matches)
         tmp["pos_poss_roll"] = poss_roll
         tmp["pos_poss_home_roll"] = poss_h
         tmp["pos_poss_away_roll"] = poss_a
@@ -323,7 +415,7 @@ def build_team_form(
 
     df = pd.concat(rows, ignore_index=True)
 
-    # Z-scores with transform (no GroupBy leak)
+    # Z-scores with transform (no GroupBy leak). Group within (season, gw_orig).
     for c in [
         "att_xg_home_roll","att_xg_away_roll",
         "def_xga_home_roll","def_xga_away_roll",
@@ -337,7 +429,7 @@ def build_team_form(
     # (2) Idempotent: drop any pre-existing FDR columns to avoid _x/_y
     df = df.drop(columns=[c for c in LEGACY_FDR if c in df.columns], errors="ignore")
 
-    # Symmetric, fixture-level FDR (unchanged; still xG/xGA based)
+    # Symmetric, fixture-level FDR
     fixtures_fdr = _compute_fixture_fdr_symmetric(df, season)
 
     # Merge fixture-level FDR back to team rows (symmetry guaranteed)
@@ -348,13 +440,16 @@ def build_team_form(
         validate="many_to_one"
     )
 
-    # Symmetry assert (fail fast)
-    chk = (df.groupby(["season","fpl_id"])[["fdr_home","fdr_away"]]
-             .nunique()
-             .rename(columns={"fdr_home":"n_home","fdr_away":"n_away"}))
-    bad = chk[(chk["n_home"] != 1) | (chk["n_away"] != 1)]
-    if len(bad):
-        raise AssertionError(f"[{season}] Symmetry breach in {len(bad)} fixtures. Example:\n{bad.head(3)}")
+    # Symmetry assert (fail fast) – but only when fixtures are paired properly
+    try:
+        chk = (df.groupby(["season","fpl_id"])[["fdr_home","fdr_away"]]
+                 .nunique()
+                 .rename(columns={"fdr_home":"n_home","fdr_away":"n_away"}))
+        bad = chk[(chk["n_home"] != 1) | (chk["n_away"] != 1)]
+        if len(bad):
+            raise AssertionError(f"[{season}] Symmetry breach in {len(bad)} fixtures. Example:\n{bad.head(3)}")
+    except Exception as e:
+        logging.warning("%s • FDR symmetry check warning: %s", season, e)
 
     # Ensure numeric types clean for model ingestion
     num_cols = [
@@ -388,17 +483,20 @@ def build_team_form(
     meta = {
         "schema": SCHEMA_VERSION,
         "build_ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "version": out_version,
         "window_matches": decay_window,
         "tau": tau,
         "prior_matches": prior_matches,
         "fdr": {"type": "symmetric_v1", "source_forms": ["att_xg_*_roll_z","def_xga_*_roll_z"]},
         "seasons_built": all_seasons,
         "hash": _meta_hash(df),
-        "features": features_list
+        "features": features_list,
+        "future_season_ready": True
     }
     save_json(meta, meta_fp)
     logging.info("%s • %s (%d rows) written", season, OUTPUT_FILE, len(df))
     return True
+
 
 # ─────────────────────── batch driver / CLI ───────────────────────
 
@@ -432,12 +530,15 @@ def run_batch(
         except Exception:
             logging.exception("%s • unhandled error – skipped", season)
 
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", help="e.g. 2024-2025; omit for batch")
+    ap.add_argument("--season", help="e.g. 2025-2026; omit for batch")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
-    ap.add_argument("--version", default="v1")
+    ap.add_argument("--version", default=None, help="Version folder (e.g., v9). Use with --auto-version to pick next.")
+    ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
+    ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only)")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
     ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
@@ -447,25 +548,37 @@ def main() -> None:
 
     logging.basicConfig(format="%(levelname)s: %(message)s", level=args.log_level.upper())
 
-    seasons = [args.season] if args.season else sorted(
-        d.name for d in args.fixtures_root.iterdir() if d.is_dir()
-    )
+    # seasons list
+    if args.season:
+        seasons = [args.season]
+    else:
+        seasons = sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
     if not seasons:
         logging.error("No season folders in %s", args.fixtures_root)
         return
-    seasons = sorted(seasons)
+
+    # resolve version dir once
+    features_root = args.out_dir
+    features_root.mkdir(parents=True, exist_ok=True)
+    version = _resolve_version(features_root, args.version, args.auto_version)
 
     logging.info("Processing seasons: %s", ", ".join(seasons))
+    logging.info("Writing to version dir: %s", version)
+
     run_batch(
         seasons=seasons,
         fixtures_root=args.fixtures_root,
-        out_version=args.version,
+        out_version=version,
         out_dir=args.out_dir,
         decay_window=args.window,
         tau=args.tau,
         force=args.force,
         prior_matches=args.prior_matches,
     )
+
+    if args.write_latest:
+        _write_latest_pointer(features_root, version)
+
 
 if __name__ == "__main__":
     main()

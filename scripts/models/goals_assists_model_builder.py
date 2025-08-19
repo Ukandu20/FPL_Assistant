@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""
-goals_assists_model_builder.py – v9
+r"""
+goals_assists_model_builder.py – v10
 
-Adds:
-  • Non-negative clamp on all per-90 outputs.
-  • Optional Poisson heads (GLM via TweedieRegressor power=1, link='log') that predict per-90 directly.
-  • Uses predicted minutes to convert per-90 -> per-match on TEST.
-  • Saves models to disk: LGBM boosters (.txt) and Poisson GLMs (.joblib).
-  • Wires in shots and shots-on-target ("sot") as per-90 features + 5-match rolling (overall + H/A).
+Adds future-season inference:
+• --predict-season [--predict-gws 1,2,3] to emit predictions for any season/GWs (no labels required).
+• Training uses all labeled rows; prediction target set is separate and can be unlabeled.
+• Robust join to minutes with coverage CSV; alignment via rid.
+
+Retains / improves:
+• Non-negative clamp on per-90 outputs (LGBM & Poisson).
+• Optional Poisson heads (TweedieRegressor, power=1, log link).
+• Uses predicted minutes to convert per-90 -> per-match on TARGET (eval or predict).
+• Saves models and artifacts (feature lists, importances).
+• Shot features (shots/sot per-90 + 5-match rolling overall & H/A).
+• Team context merge: team_att_z_venue, opp_def_z_venue.
 
 Outputs under data/models/goals_assists/<model_version>/predictions/goals_assists_predictions.csv:
   season, gw_orig, date_played, player_id, team_id, player, pos, venue, minutes,
@@ -20,7 +26,7 @@ Outputs under data/models/goals_assists/<model_version>/predictions/goals_assist
 """
 
 from __future__ import annotations
-import argparse, logging, re
+import argparse, logging, re, json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -60,27 +66,40 @@ def _load_players(features_dir: Path, version: str, seasons: List[str]) -> pd.Da
         raise FileNotFoundError("No players_form.csv files loaded")
     df = pd.concat(frames, ignore_index=True)
     need = {
-        "season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes",
-        "gls","ast"
+        "season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes"
     }
     miss = need - set(df.columns)
     if miss:
         raise KeyError(f"players_form missing required columns: {miss}")
+
+    # Targets may be absent (future season) -> create if missing
+    if "gls" not in df.columns: df["gls"] = np.nan
+    if "ast" not in df.columns: df["ast"] = np.nan
+
+    # Unique row id for robust alignment
+    df["rid"] = df.index.astype(int)
     return df
 
 
 def _load_minutes_predictions(path: Optional[Path]) -> Optional[pd.DataFrame]:
-    if path is None or not path.is_file():
-        if path is not None:
-            logging.warning("minutes_preds file not found at %s – will skip", path)
+    if path is None:
+        logging.warning("No minutes predictions path provided.")
         return None
+    if not path.is_file():
+        logging.warning("minutes_preds file not found at %s – skipping minutes join.", path)
+        return None
+
     mp = pd.read_csv(path, parse_dates=["date_played"])
     need = {"season","gw_orig","date_played","player_id","pred_exp_minutes"}
     missing = need - set(mp.columns)
     if missing:
-        logging.warning("minutes_preds missing columns %s – will skip", missing)
+        logging.warning("minutes_preds missing columns %s – skipping minutes join.", missing)
         return None
-    return mp[list(need)]
+
+    # Deduplicate by unique key
+    key = ["season","gw_orig","date_played","player_id"]
+    mp = mp.sort_values(key).drop_duplicates(subset=key, keep="last")
+    return mp[key + ["pred_exp_minutes"]].copy()
 
 # ───────────── team z merge ─────────────
 def _try_merge(df: pd.DataFrame, t: pd.DataFrame, keys: List[str]) -> Optional[pd.DataFrame]:
@@ -243,12 +262,22 @@ def _time_split_last_n(df: pd.DataFrame, test_season: str, last_n_gws: int) -> T
     return train_idx, test_idx
 
 
+def _build_inference_index(df: pd.DataFrame, season: str, gws: Optional[List[int]]) -> pd.Index:
+    mask = (df["season"] == season)
+    if gws is not None:
+        mask &= df["gw_orig"].isin(gws)
+    idx = df.index[mask]
+    if len(idx) == 0:
+        raise ValueError(f"No rows available to predict for season={season} gws={gws}")
+    return idx
+
+
 def _build_features(df: pd.DataFrame, use_z: bool, na_thresh: float) -> Tuple[pd.DataFrame, List[str]]:
     feats: List[str] = []
 
     # base features
     df["venue_bin"] = (df["venue"] == "Home").astype(int); feats.append("venue_bin")
-    df["fdr"] = np.where(df["venue"] == "Home", df["fdr_home"], df["fdr_away"]).astype(float) if {"fdr_home","fdr_away"}.issubset(df.columns) else np.nan
+    df["fdr"] = np.where(df["venue"] == "Home", df.get("fdr_home", np.nan), df.get("fdr_away", np.nan)).astype(float)
     feats.append("fdr")
     if "days_since_last" in df.columns: feats.append("days_since_last")
     if "is_active" in df.columns: feats.append("is_active")
@@ -265,10 +294,10 @@ def _build_features(df: pd.DataFrame, use_z: bool, na_thresh: float) -> Tuple[pd
     enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
     df["pos_enc"] = enc.fit_transform(df[["pos"]]); feats.append("pos_enc")
 
-    # rolling form features from players_form
     def _maybe(cols):
         return [c for c in cols if c in df.columns]
 
+    # rolling form features
     roll_cols = _maybe([
         "gls_gls_p90_roll","gls_gls_p90_home_roll","gls_gls_p90_away_roll",
         "gls_npxg_p90_roll","gls_npxg_p90_home_roll","gls_npxg_p90_away_roll",
@@ -282,11 +311,10 @@ def _build_features(df: pd.DataFrame, use_z: bool, na_thresh: float) -> Tuple[pd
             "ast_ast_p90_roll_z","ast_ast_p90_home_roll_z","ast_ast_p90_away_roll_z",
             "ast_xag_p90_roll_z","ast_xag_p90_home_roll_z","ast_xag_p90_away_roll_z",
         ])
-
     keep = [c for c in roll_cols if df[c].notna().mean() >= na_thresh]
     feats.extend(sorted(keep))
 
-    # add shots features (creates cols if raw shots/sot exist)
+    # add shots features
     df, shot_feats = _add_shot_features(df)
     feats.extend([c for c in shot_feats if df[c].notna().mean() >= na_thresh])
 
@@ -315,6 +343,31 @@ def _train_glm_poisson(Xtr: np.ndarray, ytr: np.ndarray, max_iter: int = 5000) -
     model.fit(Xtr, ytr)
     return model
 
+# ───────────── artifacts / coverage ─────────────
+def _write_missing_join_csv(out_pred_dir: Path, frame: pd.DataFrame, miss_mask: pd.Series) -> None:
+    """Write rows (from `frame`) where minutes were missing, using positional boolean mask."""
+    if isinstance(miss_mask, pd.Series):
+        mask_np = miss_mask.to_numpy()
+    else:
+        mask_np = np.asarray(miss_mask, dtype=bool)
+    if mask_np.any():
+        miss = frame.iloc[mask_np].copy()
+        (out_pred_dir / "missing_minutes_join.csv").parent.mkdir(parents=True, exist_ok=True)
+        miss.to_csv(out_pred_dir / "missing_minutes_join.csv", index=False)
+
+def _save_feature_artifacts(outdir: Path,
+                            features: List[str],
+                            g_model: lgb.LGBMRegressor,
+                            a_model: lgb.LGBMRegressor) -> None:
+    art = outdir / "artifacts"
+    art.mkdir(parents=True, exist_ok=True)
+    (art / "features.json").write_text(json.dumps(features, indent=2), encoding="utf-8")
+    try:
+        pd.DataFrame({"feature": features, "importance": g_model.feature_importances_}).to_csv(art / "goals_feature_importances.csv", index=False)
+        pd.DataFrame({"feature": features, "importance": a_model.feature_importances_}).to_csv(art / "assists_feature_importances.csv", index=False)
+    except Exception:
+        pass
+
 # ───────────── main ─────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -323,12 +376,19 @@ def main():
     ap.add_argument("--team-form-dir", type=Path, default=Path("data/processed/features"), help="root where <version>/<season>/team_form.csv lives")
     ap.add_argument("--test-season", required=True)
     ap.add_argument("--test-last-n", type=int, default=10)
+
+    ap.add_argument("--predict-season", type=str, default=None,
+                    help="If set, run inference for this season (all GWs or --predict-gws).")
+    ap.add_argument("--predict-gws", type=str, default=None,
+                    help="Comma-separated GW list for inference, e.g., '1,2,3'.")
+
     ap.add_argument("--use-z", action="store_true", help="use *_roll_z and team z features if available")
     ap.add_argument("--na-thresh", type=float, default=0.70)
-    ap.add_argument("--minutes-preds", type=Path, help="path to minutes_predictions.csv to use predicted minutes on TEST")
-    ap.add_argument("--models-out", type=Path, default=Path("data/models/goals_assists"))
-    ap.add_argument("--model-version", default="v9")
+    ap.add_argument("--minutes-preds", type=Path, help="path to minutes_predictions.csv to use predicted minutes on TARGET")
     ap.add_argument("--poisson-heads", action="store_true", help="fit GLM Poisson per-90 heads alongside LGBM")
+
+    ap.add_argument("--models-out", type=Path, default=Path("data/models/goals_assists"))
+    ap.add_argument("--model-version", default="v10")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
@@ -339,81 +399,101 @@ def main():
 
     df = _load_players(args.features_dir, args.version, seasons)
 
-    # drop NaN target rows up-front (often GK rows if present)
-    before = len(df)
-    df = df.dropna(subset=["gls","ast"]).reset_index(drop=True)
-    logging.info("Dropped %d rows with NaN gls/ast before feature build.", before - len(df))
-
     # team z merge
     df = _merge_team_z(df, args.team_form_dir, args.version)
     used_cols = [c for c in ("team_att_z_venue","opp_def_z_venue") if c in df.columns]
-    if used_cols:
-        logging.info("team_form: using columns -> %s", ", ".join(used_cols))
-    else:
-        logging.info("team_form: no z columns found – proceeding without")
+    logging.info("team_form: using columns -> %s", ", ".join(used_cols) if used_cols else "(none)")
 
-    # build features
+    # stable sort + rid
     df = df.sort_values(["season","date_played","gw_orig","player_id"]).reset_index(drop=True)
+    df["rid"] = df.index.astype(int)
+
+    # build features over the whole DF (we'll slice later)
     X, feat_cols = _build_features(df, use_z=args.use_z, na_thresh=args.na_thresh)
 
-    # targets – per-90 actuals for training
+    # targets – per-90 (can be NaN for unlabeled rows)
     m = df["minutes"].fillna(0).clip(lower=0)
     m90 = (m / 90.0).replace(0, np.nan)
-    df["y_goals_p90"]   = (df["gls"] / m90).fillna(0)
-    df["y_assists_p90"] = (df["ast"] / m90).fillna(0)
+    df["y_goals_p90"]   = (df["gls"] / m90).astype(float)
+    df["y_assists_p90"] = (df["ast"] / m90).astype(float)
 
-    # split
-    train_idx, test_idx = _time_split_last_n(df, args.test_season, args.test_last_n)
+    # choose TRAIN and TARGET sets
+    if args.predict_season:
+        # TRAIN: everything except the predict window (we'll filter to rows with labels)
+        train_idx, _ = _time_split_last_n(df, args.test_season, args.test_last_n)
+        df_train = df.loc[train_idx].copy()
+        # TARGET for inference
+        pred_gws = None if not args.predict_gws else [int(x) for x in args.predict_gws.split(",")]
+        target_idx = _build_inference_index(df, args.predict_season, pred_gws)
+        df_target = df.loc[target_idx].copy()
+        logging.info("Mode: PREDICT-ONLY for season %s%s",
+                     args.predict_season,
+                     f" GWs {args.predict_gws}" if args.predict_gws else " (all GWs)")
+    else:
+        train_idx, test_idx = _time_split_last_n(df, args.test_season, args.test_last_n)
+        df_train = df.loc[train_idx].copy()
+        df_target = df.loc[test_idx].copy()
+        logging.info("Mode: EVAL (last %d GWs of %s)", args.test_last_n, args.test_season)
 
-    # minutes predictions for TEST
+    # TRAIN rows must have labels
+    y_g_tr = df_train["y_goals_p90"].to_numpy()
+    y_a_tr = df_train["y_assists_p90"].to_numpy()
+    tr_mask = np.isfinite(y_g_tr) & np.isfinite(y_a_tr)
+    if tr_mask.sum() == 0:
+        raise ValueError("No valid training rows with gls/ast labels in the training split.")
+    Xtr = X.loc[df_train.index].iloc[tr_mask].copy()
+    ytr_g_p90 = y_g_tr[tr_mask]
+    ytr_a_p90 = y_a_tr[tr_mask]
+
+    # Minutes predictions for TARGET (eval or predict)
     mp = _load_minutes_predictions(args.minutes_preds)
-    dump_cols = ["season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes"]
-    dump = df.loc[test_idx, dump_cols].copy()
+    dump_cols = ["season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes","rid"]
+    dump = df_target[dump_cols].copy()
     dump["pred_exp_minutes"] = np.nan
-    kept_test_idx = test_idx
 
-    if mp is not None:
+    kept_idx = df_target.index.to_numpy()
+    if mp is not None and len(dump) > 0:
         key = ["season","gw_orig","date_played","player_id"]
-        # de-dupe minutes predictions on merge keys
-        mp = mp.sort_values(key).drop_duplicates(subset=key, keep="last").rename(
-            columns={"pred_exp_minutes":"pred_exp_minutes_mp"}
+        join = dump.merge(mp, on=key, how="left", validate="many_to_one").rename(
+            columns={"pred_exp_minutes_y":"pred_exp_minutes"}
         )
-        tmp = dump.merge(mp, on=key, how="left")
-        # move into main name and drop temp
-        tmp["pred_exp_minutes"] = tmp["pred_exp_minutes_mp"]
-        tmp.drop(columns=["pred_exp_minutes_mp"], inplace=True)
+        if "pred_exp_minutes_x" in join.columns:
+            join.drop(columns=["pred_exp_minutes_x"], inplace=True)
 
-        miss_mask = tmp["pred_exp_minutes"].isna()
+        miss_mask = join["pred_exp_minutes"].isna()
         n_miss = int(miss_mask.sum())
         if n_miss:
-            logging.warning("Dropping %d/%d test rows with missing predicted minutes.", n_miss, len(tmp))
-            kept_mask = ~miss_mask.values
-            kept_test_idx = test_idx[kept_mask]
-            tmp = tmp.loc[~miss_mask].reset_index(drop=True)
-        dump = tmp
+            logging.warning("Dropping %d/%d target rows with missing predicted minutes.", n_miss, len(join))
+        # keep only rows with minutes
+        kept = join.loc[~miss_mask].reset_index(drop=True)
+        kept_rids = kept["rid"].astype(int).to_numpy()
+        dump = kept.drop(columns=["rid"]).copy()
     else:
-        logging.warning("No minutes predictions provided; test rows cannot be scaled – dropping all test rows.")
-        kept_test_idx = test_idx[:0]
-        dump = dump.iloc[:0].copy()
+        if mp is None:
+            logging.warning("No minutes predictions provided; cannot scale per-90 to per-match.")
+        kept_rids = np.array([], dtype=int)
+        dump = dump.iloc[:0].drop(columns=["rid"]) if "rid" in dump.columns else dump.iloc[:0]
 
-    # slice features/targets to TRAIN and kept TEST rows
-    Xtr = X.loc[train_idx].copy()
-    Xte = X.loc[kept_test_idx].copy()
-    ytr_g_p90 = df.loc[train_idx, "y_goals_p90"].to_numpy()
-    ytr_a_p90 = df.loc[train_idx, "y_assists_p90"].to_numpy()
-    yte_g = df.loc[kept_test_idx, "gls"].to_numpy()
-    yte_a = df.loc[kept_test_idx, "ast"].to_numpy()
+    # Slice TARGET features by rid alignment
+    Xte = X.loc[kept_rids].copy()
 
-    logging.info("Train rows: %d • Test rows kept: %d (dropped %d)", len(train_idx), len(kept_test_idx), len(test_idx) - len(kept_test_idx))
+    # Optional ground-truth for EVAL mode
+    if not args.predict_season and len(kept_rids) > 0:
+        yte_g = df.loc[kept_rids, "gls"].to_numpy()
+        yte_a = df.loc[kept_rids, "ast"].to_numpy()
+    else:
+        yte_g = yte_a = None
 
-    # LGBM mean heads (per-90), then clamp >= 0
+    logging.info("Train rows: %d • Target rows kept: %d", len(Xtr), len(Xte))
+
+    # LGBM mean heads (per-90), clamp >= 0
     g_lgbm = _lgbm_reg().fit(Xtr, ytr_g_p90)
     a_lgbm = _lgbm_reg().fit(Xtr, ytr_a_p90)
-    g_mean_p90 = np.clip(g_lgbm.predict(Xte), 0, None)
-    a_mean_p90 = np.clip(a_lgbm.predict(Xte), 0, None)
+    g_mean_p90 = np.clip(g_lgbm.predict(Xte), 0, None) if len(Xte) else np.array([])
+    a_mean_p90 = np.clip(a_lgbm.predict(Xte), 0, None) if len(Xte) else np.array([])
 
     # Optional Poisson (GLM) heads – per-90 (median-imputed for NaN safety)
-    if args.poisson_heads and len(kept_test_idx) > 0:
+    if args.poisson_heads and len(Xte) > 0:
         med = Xtr.median(numeric_only=True)
         Xtr_glm = Xtr.fillna(med).to_numpy()
         Xte_glm = Xte.fillna(med).to_numpy()
@@ -425,49 +505,40 @@ def main():
         g_pois_model = a_pois_model = None
         g_pois_p90 = a_pois_p90 = None
 
-    # convert per-90 to per-match using predicted minutes on TEST
-    exp_mins = dump["pred_exp_minutes"].to_numpy() if len(dump) else np.array([])
-    scale = (exp_mins / 90.0) if len(exp_mins) else np.array([])
-
-    pred_goals_mean   = (g_mean_p90 * scale) if len(scale) else np.array([])
-    pred_assists_mean = (a_mean_p90 * scale) if len(scale) else np.array([])
-
-    if g_pois_p90 is not None:
-        pred_goals_pois   = g_pois_p90 * scale
-        pred_assists_pois = a_pois_p90 * scale
+    # convert per-90 to per-match using predicted minutes on TARGET
+    if len(dump) > 0:
+        exp_mins = dump["pred_exp_minutes"].to_numpy()
+        scale = exp_mins / 90.0
+        pred_goals_mean   = g_mean_p90 * scale
+        pred_assists_mean = a_mean_p90 * scale
+        if g_pois_p90 is not None:
+            pred_goals_pois   = g_pois_p90 * scale
+            pred_assists_pois = a_pois_p90 * scale
+        else:
+            pred_goals_pois = pred_assists_pois = None
     else:
+        pred_goals_mean = pred_assists_mean = np.array([])
         pred_goals_pois = pred_assists_pois = None
 
-    # Evaluate MAE on per-match (actual counts)
-    if len(kept_test_idx) > 0:
-        mae_g_mean = mean_absolute_error(yte_g, pred_goals_mean)
-        mae_a_mean = mean_absolute_error(yte_a, pred_assists_mean)
-        logging.info("Test MAE (goals, mean head):   %.4f", mae_g_mean)
-        logging.info("Test MAE (assists, mean head): %.4f", mae_a_mean)
-        if pred_goals_pois is not None:
-            mae_g_pois = mean_absolute_error(yte_g, pred_goals_pois)
-            mae_a_pois = mean_absolute_error(yte_a, pred_assists_pois)
-            logging.info("Test MAE (goals, poisson):   %.4f", mae_g_pois)
-            logging.info("Test MAE (assists, poisson): %.4f", mae_a_pois)
+    # Evaluate MAE on per-match (actual counts) — only in eval mode
+    if (not args.predict_season) and len(dump) > 0 and yte_g is not None:
+        try:
+            mae_g_mean = mean_absolute_error(yte_g, pred_goals_mean)
+            mae_a_mean = mean_absolute_error(yte_a, pred_assists_mean)
+            logging.info("Test MAE (goals, mean head):   %.4f", mae_g_mean)
+            logging.info("Test MAE (assists, mean head): %.4f", mae_a_mean)
+            if pred_goals_pois is not None:
+                mae_g_pois = mean_absolute_error(yte_g, pred_goals_pois)
+                mae_a_pois = mean_absolute_error(yte_a, pred_assists_pois)
+                logging.info("Test MAE (goals, poisson):   %.4f", mae_g_pois)
+                logging.info("Test MAE (assists, poisson): %.4f", mae_a_pois)
+        except Exception:
+            pass
 
-        # Per-position MAE (mean head)
-        pos_vals: Dict[str, Tuple[float,float,int]] = {}
-        pos_series = df.loc[kept_test_idx, "pos"].to_numpy()
-        for pos in pd.unique(pos_series):
-            idx = np.where(pos_series == pos)[0]
-            if len(idx) == 0: 
-                continue
-            pos_mae_g = mean_absolute_error(yte_g[idx], pred_goals_mean[idx])
-            pos_mae_a = mean_absolute_error(yte_a[idx], pred_assists_mean[idx])
-            pos_vals[str(pos)] = (pos_mae_g, pos_mae_a, int(len(idx)))
-        if pos_vals:
-            logging.info("Per-position MAE (mean head):")
-            for p,(mg,ma,n) in pos_vals.items():
-                logging.info("   %3s  goals: %.4f  assists: %.4f  (n=%d)", p, mg, ma, n)
-
-    # Assemble predictions dump
+    # Assemble predictions dump (add back team context)
     for c in ("team_att_z_venue","opp_def_z_venue"):
-        dump[c] = df.loc[kept_test_idx, c].to_numpy() if len(kept_test_idx) else np.array([])
+        if c in df.columns and len(kept_rids) > 0:
+            dump[c] = df.loc[kept_rids, c].to_numpy()
 
     dump["pred_goals_p90_mean"]    = g_mean_p90
     dump["pred_assists_p90_mean"]  = a_mean_p90
@@ -488,12 +559,17 @@ def main():
     dump.to_csv(fp, index=False)
     logging.info("Wrote predictions to %s", fp.resolve())
 
-    # save features used
+    # coverage CSV for minutes join (use the joined frame)
+    if args.minutes_preds is not None and 'join' in locals():
+        _write_missing_join_csv(pred_dir, join, join["pred_exp_minutes"].isna())
+
+    # artifacts
+    _save_feature_artifacts(outdir, feat_cols, g_lgbm, a_lgbm)
     (outdir / "features_used.txt").write_text("\n".join(feat_cols), encoding="utf-8")
 
     # save models
-    g_lgbm.booster_.save_model(outdir / "goals_lgbm.txt")
-    a_lgbm.booster_.save_model(outdir / "assists_lgbm.txt")
+    g_lgbm.booster_.save_model(str(outdir / "goals_lgbm.txt"))
+    a_lgbm.booster_.save_model(str(outdir / "assists_lgbm.txt"))
     if g_pois_model is not None:
         joblib.dump(g_pois_model, outdir / "goals_poisson.joblib")
     if a_pois_model is not None:

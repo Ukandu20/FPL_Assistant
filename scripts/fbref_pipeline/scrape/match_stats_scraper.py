@@ -5,10 +5,8 @@ import argparse
 from pathlib import Path
 
 import soccerdata as sd
-from utils.fbref_utils import (
-    STAT_MAP, safe_write, seasons_from_league,
-    init_logger, polite_sleep
-)
+from scripts.fbref_pipeline.utils.fbref_utils import STAT_MAP, safe_write, seasons_from_league, init_logger, polite_sleep
+
 
 def scrape_one(league: str, season, out_base: Path, delay: float):
     log = __import__("logging").getLogger("fbref")

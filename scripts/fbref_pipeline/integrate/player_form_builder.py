@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-r"""player_form_builder.py – schema v1.5
+r"""player_form_builder.py – schema v1.6
 (per-90, causal, venue-aware, binomial save% using saves & sot_against, venue-conditional z-scores)
+
 Versioning:
 • Writes under data/processed/features/<version>/<SEASON>/players_form.csv
 • --auto-version chooses next vN if not specified, e.g., v7
@@ -9,76 +10,114 @@ Versioning:
 Outputs (per season):
   players_form.csv
   player_form.meta.json
+
+What’s new vs v1.5:
+  • Robust schema coercion:
+      - Tolerates alias column names (e.g., yellow_cards → yellow_crd, was_home → venue).
+      - Derives date_played from kickoff_time/date.
+      - Derives save_pct if missing (saves/sot_against).
+      - Derives days_since_last if missing.
+      - Defaults/zeros harmlessly for rare-event cols (pk_won, own_goals…).
+  • Optional FDR fill for future fixtures (--fill-missing-fdr).
+  • Safer dtypes for gw/date; duplicate guard.
+  • Better logging of fills and coverage.
 """
 
 from __future__ import annotations
-import argparse, json, logging, datetime as dt, os, re, sys
+import argparse, json, logging, datetime as dt, os, re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v1.5"
+SCHEMA_VERSION = "v1.6"
 
-# ───────────────────────── Configuration ─────────────────────────
-
-METRICS = {
-    "gls": {"raw": ("gls", "npxg", "shots", "sot"), "rate_like": {"gls": False, "npxg": False, "shots": False, "sot": False},
-            "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
-    "ast": {"raw": ("ast", "xag"), "rate_like": {"ast": False, "xag": False},
-            "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
-    "def": {"raw": ("blocks", "tkl", "int", "own_goals", "recoveries", "clr"),
-            "rate_like": {"blocks": False, "tkl": False, "int": False, "own_goals": False, "recoveries": False, "clr": False},
-            "applies_to": "OUT", "flip_sign": True, "bayes_alpha": {"own_goals": 6}},
-    "gk":  {"raw": ("saves", "sot_against"),
-            "rate_like": {"saves": False, "sot_against": False},
-            "applies_to": "GK", "flip_sign": True, "bayes_alpha": {}},
-    "pens":{"raw": ("pk_won",), "rate_like": {"pk_won": False},
-            "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {"pk_won": 6}},
-    # GK save% handled via binomial (not per-90)
-}
+# ───────────────────────── Canonical schema ─────────────────────────
 
 OUTPUT_FILE = "players_form.csv"
 
-REQUIRED_BASE = {
-    "player_id","player","pos","fbref_id","fpl_id",
-    "gw_orig","date_played","team_id","team","minutes","days_since_last",
-    "is_active","yellow_crd","red_crd","venue","gf","ga","fdr_home","fdr_away",
-    "gls", "shots", "sot", "ast","blocks","tkl","int","clr","xg","npxg","xag",
-    "pkatt","pk_scored","pk_won",
-    "saves","sot_against","save_pct",
-    "own_goals","recoveries",
+# Canonical names & alias map (left = canonical)
+ALIASES: Dict[str, List[str]] = {
+    "player_id": ["player_id", "fbref_player_id", "fpl_player_id"],
+    "player": ["player", "player_name", "name"],
+    "pos": ["pos", "position", "position_short"],
+    "fbref_id": ["fbref_id", "fbref_url_id"],
+    "fpl_id": ["fpl_id", "fpl_code", "fpl_player_id"],
+    "team_id": ["team_id", "team_code", "team_short_id"],
+    "team": ["team", "team_name", "squad", "club"],
+    "gw_orig": ["gw_orig", "gw", "gameweek", "round"],
+    "date_played": ["date_played", "kickoff_time", "match_date", "date"],
+    "venue": ["venue", "was_home", "is_home", "home"],
+    "minutes": ["minutes", "mins"],
+    "days_since_last": ["days_since_last", "days_rest", "rest_days"],
+    "is_active": ["is_active", "active", "in_squad"],
+    "yellow_crd": ["yellow_crd", "yellow", "yellow_cards", "yc"],
+    "red_crd": ["red_crd", "red", "red_cards", "rc"],
+    "gf": ["gf", "goals_for", "team_goals_for"],
+    "ga": ["ga", "goals_against", "team_goals_against", "conceded"],
+    "fdr_home": ["fdr_home", "fdr_h", "fixture_difficulty_home"],
+    "fdr_away": ["fdr_away", "fdr_a", "fixture_difficulty_away"],
+
+    # attacking
+    "gls": ["gls", "goals"],
+    "shots": ["shots", "sh", "shots_total"],
+    "sot": ["sot", "shots_on_target", "shots_ot"],
+    "ast": ["ast", "assists"],
+    "xg": ["xg", "expected_goals"],
+    "npxg": ["npxg", "np_xg", "non_pen_xg"],
+    "xag": ["xag", "xa", "expected_assists"],
+    "pkatt": ["pkatt", "pens_att", "pen_att", "penalties_att"],
+    "pk_scored": ["pk_scored", "pens_scored", "pen_scored"],
+    "pk_won": ["pk_won", "pens_won", "pen_won"],
+
+    # defensive / misc
+    "blocks": ["blocks", "blk"],
+    "tkl": ["tkl", "tackles"],
+    "int": ["int", "interceptions"],
+    "clr": ["clr", "clearances"],
+    "own_goals": ["own_goals", "og"],
+    "recoveries": ["recoveries", "rec"],
+
+    # GK
+    "saves": ["saves", "sv"],
+    "sot_against": ["sot_against", "shots_on_target_against", "on_target_against", "sota"],
+    "save_pct": ["save_pct", "save%", "sv_pct"],
 }
 
+# Numeric canonicals we’ll coerce
 NUMERIC_BASE = [
     "minutes","days_since_last","is_active","yellow_crd","red_crd",
-    "gf","ga","shots", "sot","fdr_home","fdr_away",
+    "gf","ga","shots","sot","fdr_home","fdr_away",
     "gls","ast","blocks","tkl","int","clr","xg","npxg","xag",
     "pkatt","pk_scored","pk_won",
     "saves","sot_against","save_pct",
     "own_goals","recoveries",
 ]
 
+# Metrics config (same semantics as v1.5)
+METRICS = {
+    "gls": {"raw": ("gls", "npxg", "shots", "sot"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
+    "ast": {"raw": ("ast", "xag"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
+    "def": {"raw": ("blocks", "tkl", "int", "own_goals", "recoveries", "clr"),
+            "applies_to": "OUT", "flip_sign": True, "bayes_alpha": {"own_goals": 6}},
+    "gk" : {"raw": ("saves", "sot_against"),
+            "applies_to": "GK", "flip_sign": True, "bayes_alpha": {}},
+    "pens":{"raw": ("pk_won",), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {"pk_won": 6}},
+}
+
 # ───────────────────────── Helpers ─────────────────────────
 
 def _resolve_version(base_dir: Path, requested: Optional[str], auto: bool) -> str:
     if auto or (not requested) or (requested.lower() == "auto"):
         existing = [p.name for p in base_dir.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)]
-        if existing:
-            nums = sorted(int(s[1:]) for s in existing)
-            nxt = nums[-1] + 1
-        else:
-            nxt = 1
+        nxt = (max(int(s[1:]) for s in existing) + 1) if existing else 1
         ver = f"v{nxt}"
         logging.info("Auto-version resolved to %s", ver)
         return ver
-    # normalize: ensure a leading 'v'
     if not re.fullmatch(r"v\d+", requested):
-        if requested.isdigit():
-            requested = f"v{requested}"
-        else:
-            raise ValueError(f"--version must be like v3 or a number; got {requested}")
+        if requested.isdigit(): return f"v{requested}"
+        raise ValueError(f"--version must be like v3 or a number; got {requested}")
     return requested
 
 def _write_latest_pointer(features_root: Path, version: str) -> None:
@@ -86,22 +125,13 @@ def _write_latest_pointer(features_root: Path, version: str) -> None:
     target = features_root / version
     try:
         if latest.exists() or latest.is_symlink():
-            if latest.is_dir() and not latest.is_symlink():
-                # replace dir with symlink when possible
-                for _ in (latest.iterdir() if latest.is_dir() else []): pass
-            latest.unlink(missing_ok=True)
+            try: latest.unlink()
+            except Exception: pass
         os.symlink(target.name, latest, target_is_directory=True)
         logging.info("Updated 'latest' symlink -> %s", version)
     except (OSError, NotImplementedError):
-        # Windows without admin can’t symlink by default; write a file instead
         (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
         logging.info("Wrote LATEST_VERSION.txt -> %s", version)
-
-def load_json(p: Path) -> dict:
-    return json.loads(p.read_text("utf-8")) if p.is_file() else {}
-
-def save_json(obj: dict, p: Path) -> None:
-    p.write_text(json.dumps(obj, indent=2))
 
 def _ensure_numeric(df: pd.DataFrame, cols: List[str]) -> None:
     for c in cols:
@@ -128,6 +158,7 @@ def _z_by_season_gw_venue(df: pd.DataFrame, col: str, venue_value: str) -> pd.Se
 def _applicable_mask(pos_series: pd.Series, applies_to: str) -> pd.Series:
     return pos_series.eq("GK") if applies_to == "GK" else ~pos_series.eq("GK")
 
+# Rolling mean with venue shrinkage + prior blending
 def _rolling_past_only_bayes_mean(
     vals: np.ndarray, venues: np.ndarray, window: int, tau: float,
     prior_val: Optional[float], prior_matches: int, bayes_alpha: float = 0.0
@@ -138,7 +169,7 @@ def _rolling_past_only_bayes_mean(
     csum = np.r_[0.0, np.cumsum(v)]; cnum = np.r_[0, np.cumsum(~is_nan)]
     ven = venues.astype(str)
     for i in range(n):
-        lo = max(0, i - window)  # exclude current
+        lo = max(0, i - window)
         cnt = int(cnum[i] - cnum[lo]); base = np.nan
         if cnt > 0: base = (csum[i] - csum[lo]) / cnt
         if prior_val is not None and prior_matches > 0 and i < prior_matches:
@@ -147,7 +178,8 @@ def _rolling_past_only_bayes_mean(
         if (bayes_alpha > 0) and (not np.isnan(base)) and (prior_val is not None):
             base = (base * cnt + prior_val * bayes_alpha) / (cnt + bayes_alpha)
         roll[i] = base
-        mask = (ven[lo:i] == "Home"); rec = vals[lo:i]
+        mask = (ven[lo:i] == "Home")
+        rec = vals[lo:i]
         rec_h = rec[mask]; nh = int(np.sum(~np.isnan(rec_h)))
         rec_a = rec[~mask]; na = int(np.sum(~np.isnan(rec_a)))
         mean_h = np.nanmean(rec_h) if nh else base
@@ -160,15 +192,15 @@ def _rolling_past_only_bayes_mean(
         roll_a[i] = lam_a*mean_a + (1-lam_a)*base if not np.isnan(base) else np.nan
     return roll, roll_h, roll_a
 
+# Beta-binomial posterior save% with venue shrinkage
 def _rolling_past_only_binomial_savepct(
     saves: np.ndarray, shots: np.ndarray, venues: np.ndarray,
-    window: int, tau: float, prior_p: Optional[float], prior_shots: Optional[float]
+    window: int, tau: float, prior_p: float, prior_shots: float
 ) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
     n = len(saves)
     post  = np.full(n, np.nan); post_h = np.full(n, np.nan); post_a = np.full(n, np.nan)
     sv = np.nan_to_num(saves.astype(float), nan=0.0); st = np.nan_to_num(shots.astype(float), nan=0.0)
     csum_sv = np.r_[0.0, np.cumsum(sv)]; csum_st = np.r_[0.0, np.cumsum(st)]; ven = venues.astype(str)
-    if prior_p is None or prior_shots is None or prior_shots <= 0: prior_p, prior_shots = 0.70, 80.0
     a0 = prior_p * prior_shots; b0 = (1.0 - prior_p) * prior_shots
     for i in range(n):
         lo = max(0, i - window)
@@ -192,15 +224,18 @@ def _compute_last_season_priors(all_players: pd.DataFrame, last_season: Optional
     prev = all_players.loc[all_players["season"] == last_season].copy()
     if prev.empty: return priors
     prev["minutes"] = pd.to_numeric(prev["minutes"], errors="coerce")
+    # per-90 baselines
     for cfg in METRICS.values():
         for raw in cfg["raw"]:
             col = f"{raw}_p90"
             prev[col] = np.where(prev["minutes"] > 0, prev[raw] * 90.0 / prev["minutes"], np.nan)
+    # GK save% priors
     gk_prev = prev[prev["pos"] == "GK"].copy()
     gk_aggr = gk_prev.groupby("player_id").agg(saves_sum=("saves","sum"), sot_sum=("sot_against","sum"))
     gk_aggr["p0"] = np.where(gk_aggr["sot_sum"] > 0, gk_aggr["saves_sum"]/gk_aggr["sot_sum"], np.nan)
     gk_aggr["s0"] = gk_aggr["sot_sum"].clip(lower=20)
 
+    # positional/global per-90 priors
     is_gk_prev = prev["pos"].eq("GK")
     pos_means: Dict[str, Dict[str, float]] = {"GK": {}, "OUT": {}}
     global_means: Dict[str, float] = {}
@@ -249,41 +284,166 @@ def _get_savepct_prior(priors: Dict[str, Dict[str, float]], pid: str) -> Tuple[f
     grp = priors.get("_SAVE_PCT_", {})
     return float(grp.get("p0", 0.70)), float(grp.get("s0", 80.0))
 
+# ───────────────────────── Schema coercion ─────────────────────────
+
+def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tuple[pd.DataFrame, Dict[str,int]]:
+    """
+    Map aliases → canonical, derive missing canonical fields, coerce types, and fill safe defaults.
+    Returns the coerced DataFrame + a small stats dict for logging.
+    """
+    stats = {"filled_days_since_last": 0, "derived_save_pct": 0, "venue_from_flag": 0, "filled_fdr": 0}
+
+    # 1) Rename aliases
+    rename_map = {}
+    for canon, alts in ALIASES.items():
+        if canon in df.columns:
+            continue
+        for alt in alts:
+            if alt in df.columns:
+                rename_map[alt] = canon
+                break
+    df = df.rename(columns=rename_map).copy()
+
+    # 2) Basic keys & types
+    if "season" not in df.columns:
+        raise KeyError("Input must have a 'season' column per row (builder adds it upstream; bug if missing).")
+
+    # date
+    if "date_played" in df.columns:
+        df["date_played"] = pd.to_datetime(df["date_played"], errors="coerce")
+    else:
+        raise KeyError("Could not coerce a 'date_played' column from input (check aliases).")
+
+    # venue normalization
+    if "venue" not in df.columns:
+        # Try flags from alias pass (was_home/is_home/home)
+        # If still missing, set Unknown (will limit venue z but OK)
+        df["venue"] = pd.NA
+    # Convert booleans/0-1 to Home/Away if needed
+    if df["venue"].dropna().isin([0,1,True,False]).any():
+        mask = df["venue"].notna()
+        home_like = df.loc[mask, "venue"].astype(str).isin(["1","True","true","TRUE"])
+        df.loc[mask, "venue"] = np.where(home_like, "Home", "Away")
+        stats["venue_from_flag"] += int(mask.sum())
+    # Clip to Home/Away
+    df.loc[~df["venue"].isin(["Home","Away"]), "venue"] = pd.NA
+
+    # gw
+    if "gw_orig" not in df.columns:
+        raise KeyError("Missing 'gw_orig' (gameweek). Add an alias to ALIASES if your column is named differently.")
+    df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
+
+    # strings
+    for c in ["player_id","team_id","fbref_id","fpl_id","player","team","pos"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    # 3) Numeric coercions
+    _ensure_numeric(df, NUMERIC_BASE)
+
+    # Derive save_pct if missing/NaN and ingredients present
+    if "save_pct" in df.columns:
+        need = df["save_pct"].isna()
+    else:
+        df["save_pct"] = np.nan
+        need = pd.Series(True, index=df.index)
+    can = need & df["saves"].notna() & df["sot_against"].notna() & (df["sot_against"] > 0)
+    df.loc[can, "save_pct"] = (df.loc[can, "saves"] / df.loc[can, "sot_against"]).clip(0, 1.0)
+    stats["derived_save_pct"] = int(can.sum())
+
+    # days_since_last if missing
+    if "days_since_last" not in df.columns or df["days_since_last"].isna().any():
+        # recompute entirely for safety
+        df = df.sort_values(["player_id","date_played","gw_orig"])
+        grp = df.groupby("player_id", sort=False)["date_played"]
+        dsl = grp.diff().dt.days
+        df["days_since_last"] = dsl
+        # For first obs per player or NaT diffs → fallback 7 (neutral)
+        fill_mask = df["days_since_last"].isna()
+        stats["filled_days_since_last"] = int(fill_mask.sum())
+        df.loc[fill_mask, "days_since_last"] = 7.0
+    df["days_since_last"] = pd.to_numeric(df["days_since_last"], errors="coerce")
+
+    # is_active default 1 if missing
+    if "is_active" not in df.columns:
+        df["is_active"] = 1.0
+    df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1.0)
+
+    # FDR fill for future fixtures (optional)
+    if fill_missing_fdr is not None:
+        for col in ["fdr_home","fdr_away"]:
+            if col not in df.columns:
+                df[col] = fill_missing_fdr
+                stats["filled_fdr"] += len(df)
+            else:
+                miss = df[col].isna()
+                if miss.any():
+                    df.loc[miss, col] = fill_missing_fdr
+                    stats["filled_fdr"] += int(miss.sum())
+
+    # Defaults for very rare events / optional cols (safe zeros)
+    safe_zero = ["pkatt","pk_scored","pk_won","own_goals","recoveries","blocks","tkl","int","clr",
+                 "gls","ast","shots","sot","xg","npxg","xag","saves","sot_against","yellow_crd","red_crd","gf","ga"]
+    for c in safe_zero:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # Deduplicate (rare but can happen with joins)
+    key_cols = [c for c in ["player_id","season","date_played","gw_orig"] if c in df.columns]
+    if key_cols:
+        before = len(df)
+        df = df.sort_values(key_cols).drop_duplicates(subset=key_cols, keep="last")
+        dropped = before - len(df)
+        if dropped:
+            logging.warning("Dropped %d duplicate rows on %s", dropped, key_cols)
+
+    return df.reset_index(drop=True), stats
+
 # ───────────────────────── Core build ─────────────────────────
 
 def build_player_form(
-    seasons: List[str], fixtures_root: Path, version_dir: Path,  # version_dir resolved once
-    window: int, tau: float, force: bool, prior_matches: int,
+    seasons: List[str],
+    fixtures_root: Path,
+    version_dir: Path,
+    window: int,
+    tau: float,
+    force: bool,
+    prior_matches: int,
+    fill_missing_fdr: Optional[float],
 ) -> None:
     frames = []
     for s in seasons:
         fp = fixtures_root / s / "player_minutes_calendar.csv"
         if not fp.is_file():
             logging.warning("%s • missing player_minutes_calendar.csv – skipped", s); continue
-        df = pd.read_csv(fp, parse_dates=["date_played"]); df["season"] = s; frames.append(df)
-    if not frames: raise FileNotFoundError("No seasons found under fixtures_root")
+        try:
+            df = pd.read_csv(fp, parse_dates=["date_played"], low_memory=False)
+        except Exception:
+            df = pd.read_csv(fp, low_memory=False)
+        df["season"] = s
+        frames.append(df)
+    if not frames:
+        raise FileNotFoundError("No seasons loaded from fixtures_root")
 
-    all_players = pd.concat(frames, ignore_index=True)
+    raw_all = pd.concat(frames, ignore_index=True)
+    # Coerce schema & derive critical fields
+    all_players, stats = _coerce_columns(raw_all, fill_missing_fdr=fill_missing_fdr)
 
-    missing = REQUIRED_BASE - set(all_players.columns)
-    if missing: raise KeyError(f"Missing required columns: {missing}")
+    # Keep only Home/Away rows for venue math; if unknown, we still carry but venue-z for those rows will be NaN
+    unknown_venue = all_players["venue"].isna().sum()
+    if unknown_venue:
+        logging.warning("Rows with unknown venue: %d (venue-z unavailable for those rows)", unknown_venue)
 
-    all_players = all_players.sort_values(["player_id","season","date_played","gw_orig"]).reset_index(drop=True)
-    for c in [c for c in NUMERIC_BASE if c in all_players.columns]:
-        all_players[c] = pd.to_numeric(all_players[c], errors="coerce")
-    for idcol in ["player_id","team_id","fbref_id","fpl_id"]:
-        if idcol in all_players.columns: all_players[idcol] = all_players[idcol].astype(str)
-
-    # ── NEW: Enforce position-consistent NaNs on raw columns (pre-derivations)
+    # Enforce GK/outfield raw NaNs to avoid leakage
     gk_only_raw   = ["saves","sot_against","save_pct"]
-    out_only_raw  = ["gls","ast","shots","sot","xg","npxg","xag",
-                     "pkatt","pk_scored","pk_won","blocks","tkl","int","own_goals","recoveries"]
-    # keep team outcome columns (gf, ga) for both
+    out_only_raw  = ["gls","ast","shots","sot","xg","npxg","xag","pkatt","pk_scored","pk_won",
+                     "blocks","tkl","int","own_goals","recoveries","clr"]
     is_gk_all = all_players["pos"].eq("GK")
     all_players.loc[~is_gk_all, [c for c in gk_only_raw if c in all_players.columns]] = np.nan
     all_players.loc[ is_gk_all, [c for c in out_only_raw if c in all_players.columns]] = np.nan
-    # ─────────────────────────────────────────────────────────────
 
+    # Season loop (priors use last season)
     seasons = sorted(seasons)
     for season in seasons:
         parts = season.split("-"); last_season = None
@@ -291,9 +451,11 @@ def build_player_form(
             y0 = int(parts[0]); last_season = f"{y0-1}-{y0}"
 
         priors = _compute_last_season_priors(all_players, last_season)
-        cur = all_players[all_players["season"] == season].copy()
+        cur = all_players[all_players["season"] == season].sort_values(
+            ["player_id","date_played","gw_orig"]
+        ).copy()
 
-        # Per-90 build (already respects applies_to; we also pre-NaN'ed raw above)
+        # Per-90 base
         for cfg in METRICS.values():
             mask_app = _applicable_mask(cur["pos"], cfg["applies_to"])
             for raw in cfg["raw"]:
@@ -301,7 +463,7 @@ def build_player_form(
                 cur[col] = np.where(cur["minutes"] > 0, cur[raw] * 90.0 / cur["minutes"], np.nan)
                 cur.loc[~mask_app, col] = np.nan
 
-        # Rolling per player
+        # Rolling features per player (past-only)
         out_rows: List[pd.DataFrame] = []
         for pid, g in cur.groupby("player_id", sort=False):
             g = g.sort_values(["date_played","gw_orig"]).copy()
@@ -320,12 +482,13 @@ def build_player_form(
                     base = f"{mkey}_{raw}_p90"
                     g[f"{base}_roll"] = roll; g[f"{base}_home_roll"] = rh; g[f"{base}_away_roll"] = ra
 
+            # GK save% posterior rolling
             if is_gk:
                 p0, s0 = _get_savepct_prior(priors, str(pid))
                 post, post_h, post_a = _rolling_past_only_binomial_savepct(
                     saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
                     venues=g["venue"].astype(str).to_numpy(), window=window, tau=tau,
-                    prior_p=p0, prior_shots=s0
+                    prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
                 )
                 g["gk_save_pct_p90_roll"] = post
                 g["gk_save_pct_p90_home_roll"] = post_h
@@ -339,19 +502,17 @@ def build_player_form(
 
         feat = pd.concat(out_rows, ignore_index=True)
 
-        # Z-scores
+        # Z-scores (overall + venue-conditional), sign flips for defensive negatives
         overall_cols = [c for c in feat.columns if c.endswith("_roll") and "_home_" not in c and "_away_" not in c]
         for c in overall_cols:
             z = _z_by_season_gw(feat, c)
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
             feat[c + "_z"] = (-z if flip else z)
-        home_cols = [c for c in feat.columns if c.endswith("_home_roll")]
-        for c in home_cols:
+        for c in [c for c in feat.columns if c.endswith("_home_roll")]:
             z = _z_by_season_gw_venue(feat, c, "Home")
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
             feat[c + "_z"] = (-z if flip else z)
-        away_cols = [c for c in feat.columns if c.endswith("_away_roll")]
-        for c in away_cols:
+        for c in [c for c in feat.columns if c.endswith("_away_roll")]:
             z = _z_by_season_gw_venue(feat, c, "Away")
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
             feat[c + "_z"] = (-z if flip else z)
@@ -383,6 +544,7 @@ def build_player_form(
                                 "home": "season,gw_orig (Home only)",
                                 "away": "season,gw_orig (Away only)"},
                 "features": sorted([c for c in feat.columns if c.endswith(("_roll","_roll_z"))]),
+                "coercion_stats": stats,
             }
             (out_dir_season / "player_form.meta.json").write_text(json.dumps(meta, indent=2))
             logging.info("%s • %s (%d rows) written", season, OUTPUT_FILE, len(feat))
@@ -391,7 +553,7 @@ def build_player_form(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", help="e.g. 2024-2025; omit for batch")
+    ap.add_argument("--season", help="e.g. 2024-2025; omit for batch over all folders under --fixtures-root")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
     ap.add_argument("--version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
@@ -400,13 +562,18 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only)")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
     ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
+    ap.add_argument("--fill-missing-fdr", type=float, default=None, help="If set, fill missing fdr_home/fdr_away with this value (e.g., 3.0 for neutral).")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(format="%(levelname)s: %(message)s", level=args.log_level.upper())
 
-    seasons = [args.season] if args.season else sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
+    # seasons list
+    if args.season:
+        seasons = [args.season]
+    else:
+        seasons = sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
     if not seasons:
         logging.error("No season folders in %s", args.fixtures_root); return
     seasons = sorted(seasons)
@@ -429,6 +596,7 @@ def main() -> None:
         tau=args.tau,
         force=args.force,
         prior_matches=args.prior_matches,
+        fill_missing_fdr=args.fill_missing_fdr,
     )
 
     if args.write_latest:

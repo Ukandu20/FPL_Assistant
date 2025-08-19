@@ -1,204 +1,330 @@
-# prices_registry_builder.py
 #!/usr/bin/env python3
 """
-Builds per-season player price/state registry from FPL snapshots and deadlines.
+prices_registry_builder.py
+
+Build a per-season player price registry combining:
+  • GW0 (preseason) prices from the current season's PMC (earliest observed per player)
+  • If the current season PMC is missing/empty:
+      - GW0 price = player's mean price from previous season's PMC
+      - players absent in previous season -> initial_price = null
+  • GW≥1 prices from player_minutes_calendar.csv (PMC):
+      - pick the earliest observed fixture price in that GW per player
+      - carry-forward last known price when the player has no PMC row in a GW
 
 Outputs:
-  • registry/prices/<SEASON>.json  (nested, deterministic)
-  • registry/prices_parquet/<SEASON>.parquet  (flat, fast joins)
+  • registry/prices/<SEASON>.json                 (nested, deterministic)
+  • registry/prices_parquet/<SEASON>.parquet      (flat, fast joins)
 
-Assumptions:
-  • Input snapshots contain multiple timestamps ("asof") per GW so we can pick
-    the last snapshot <= official deadline. If none exists (scrape lag), we
-    pick the earliest snapshot > deadline and WARN.
-  • Columns expected (rename via CLI if needed):
-      season (str like '2024-2025')
-      gw (int)
-      player_id (your canonical ID; NOT FPL element id)
-      now_cost (int in tenths)  OR price (float in £)
-      status (e.g., 'a','d','i','u')
-      team_hex (canonical)
-      team (short code)
-      fpl_pos in {'GK','DEF','MID','FWD'}
-      asof (ISO8601 or pandas-parsable datetime in UTC)
-
-Overrides:
-  • set_active, set_price, set_team_hex, set_team
-  • fpl_pos overrides are IGNORED by design (no reclass mid-season).
-
-Author: you
+Notes:
+  • PMC prices are tied to MATCH TIME (not FPL deadline).
+  • Per-GW entries carry a `source`: "pmc" (observed) or "carry" (forward-filled).
 """
 from __future__ import annotations
-import argparse, json, logging
+import argparse
+import json
+import logging
+import re
 from pathlib import Path
-from typing import Dict, Any, Tuple
-import pandas as pd
+from typing import Dict, Any, Tuple, Optional, List, Set
+
 import numpy as np
+import pandas as pd
 
-def _read_json(p: Path) -> dict:
-    return json.loads(p.read_text("utf-8"))
+# ------------------------- Helpers -------------------------
 
-def _write_json(p: Path, obj: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
+SEASON_RX = re.compile(r"^\d{4}-\d{4}$")
 
-def _coerce_price(series: pd.Series) -> pd.Series:
-    # If ints like 54 → £5.4; if already floats, pass through.
-    if pd.api.types.is_integer_dtype(series):
-        return (series.astype(float) / 10.0).round(1)
-    return series.astype(float).round(1)
+def _write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
-def _status_to_active(s: pd.Series) -> pd.Series:
-    # Active if available or doubt at deadline.
-    return s.astype(str).str.lower().isin({"a","d"})
+def _canon_date(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_convert(None)
+    return dt.dt.floor("D")
 
-def _pick_at_deadline(df: pd.DataFrame, deadline_ts: pd.Timestamp) -> pd.DataFrame:
-    """Pick the last snapshot ≤ deadline; if none, first > deadline (WARN)."""
-    before = df[df["asof"] <= deadline_ts]
-    if not before.empty:
-        return before.sort_values("asof").tail(1)
-    after = df[df["asof"] > deadline_ts]
-    if after.empty:
-        # Totally missing; return empty and let caller handle.
-        return after
-    logging.warning("No snapshot ≤ deadline %s for group; using earliest after (%s)",
-                    deadline_ts, after["asof"].min())
-    return after.sort_values("asof").head(1)
+def _discover_seasons(fixtures_root: Path, fpl_root: Path) -> List[str]:
+    cand: Set[str] = set()
+    if fixtures_root.exists():
+        cand |= {p.name for p in fixtures_root.iterdir() if p.is_dir()}
+    if fpl_root.exists():
+        cand |= {p.name for p in fpl_root.iterdir() if p.is_dir()}
+    return sorted(s for s in cand if SEASON_RX.match(s))
 
-def build_registry(
+def _prev_season(season: str) -> Optional[str]:
+    m = re.match(r"^(\d{4})-(\d{4})$", season)
+    if not m: return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return f"{a-1}-{b-1}"
+
+# ------------------------- Loaders -------------------------
+
+def load_pmc(pmc_fp: Path) -> pd.DataFrame:
+    """
+    player_minutes_calendar.csv must include (at minimum):
+        player_id, gw_orig, date_played, price
+    """
+    if not pmc_fp.exists():
+        # Return empty with correct header to keep downstream sane
+        cols = ["player_id","gw_orig","date_played","price","team_id","team","fpl_pos"]
+        return pd.DataFrame(columns=cols)
+    df = pd.read_csv(pmc_fp, low_memory=False)
+    req = {"player_id","gw_orig","date_played","price"}
+    missing = req - set(df.columns)
+    if missing:
+        raise ValueError(f"{pmc_fp} missing required columns: {missing}")
+
+    df = df.copy()
+    df["player_id"]   = df["player_id"].astype(str)
+    df["gw_orig"]     = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
+    df["date_played"] = _canon_date(df["date_played"])
+    df["price"]       = pd.to_numeric(df["price"], errors="coerce").round(1)
+
+    # Standardize metadata columns
+    if "team_id" not in df.columns:
+        df["team_id"] = np.nan
+    if "team" not in df.columns:
+        df["team"] = np.nan
+    if "fpl_pos" not in df.columns and "pos" in df.columns:
+        df["fpl_pos"] = df["pos"]
+    elif "fpl_pos" not in df.columns:
+        df["fpl_pos"] = np.nan
+
+    return df
+
+# ------------------------- Core Builder -------------------------
+
+def build_registry_from_pmc(
     season: str,
-    snapshots_path: Path,
-    deadlines_json: Path,
-    overrides_json: Path | None,
+    fixtures_root: Path,
+    fpl_root: Path,              # unused but kept for symmetry/CLI
     out_json: Path,
     out_parquet: Path,
-    players_master: Path | None = None,
-) -> Tuple[dict, pd.DataFrame]:
-    dl = _read_json(deadlines_json)
-    assert dl.get("season") == season, f"Deadlines season mismatch {dl.get('season')} != {season}"
-    tz = dl.get("tz", "UTC")
-    deadlines = {int(d["gw"]): pd.Timestamp(d["deadline_utc"]).tz_convert(None) if pd.Timestamp(d["deadline_utc"]).tzinfo else pd.Timestamp(d["deadline_utc"])
-                 for d in dl["deadlines"]}
+    force: bool = False,
+) -> Tuple[dict, pd.DataFrame] | Tuple[None, None]:
+    """
+    GW0 from current season PMC earliest observation.
+    If current PMC missing/empty: GW0 from previous season PMC mean per player.
+    GW≥1 from PMC (earliest per GW) + carry-forward.
+    """
+    # Skip logic
+    if out_json.exists() and out_parquet.exists() and not force:
+        logging.info("%s • outputs exist — skip (use --force to overwrite)", season)
+        return None, None
 
-    ov = _read_json(overrides_json)["overrides"] if overrides_json and overrides_json.exists() else {}
+    # ---- Paths
+    season_dir = fixtures_root / season
+    pmc_fp     = season_dir / "player_minutes_calendar.csv"
 
-    # Load snapshots (Parquet or CSV). Expect flat table with 'asof'.
-    snaps = pd.read_parquet(snapshots_path) if snapshots_path.suffix.lower() in (".parquet", ".pq") else pd.read_csv(snapshots_path)
-    required = {"season","gw","player_id","status","team_hex","team","fpl_pos","asof"}
-    if "price" not in snaps.columns and "now_cost" not in snaps.columns:
-        raise ValueError("Snapshots must have 'price' (float £) or 'now_cost' (int tenths).")
-    missing = required - set(snaps.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    # Coerce
-    snaps = snaps.copy()
-    snaps["season"] = snaps["season"].astype(str)
-    snaps = snaps[snaps["season"] == season]
-    snaps["gw"] = snaps["gw"].astype(int)
-    snaps["asof"] = pd.to_datetime(snaps["asof"], utc=True).dt.tz_localize(None)
-    if "price" not in snaps.columns:
-        snaps["price"] = _coerce_price(snaps["now_cost"])
+    # ---- Load current PMC
+    pmc = load_pmc(pmc_fp)
+
+    # ---- Derive GW list from PMC
+    if not pmc.empty and pmc["gw_orig"].notna().any():
+        gws = sorted(int(g) for g in pmc["gw_orig"].dropna().unique().tolist() if g > 0)
     else:
-        snaps["price"] = snaps["price"].astype(float).round(1)
-    snaps["active"] = _status_to_active(snaps["status"])
-    snaps["fpl_pos"] = snaps["fpl_pos"].str.upper()
+        gws = []
 
-    # Select per (player_id, gw) the row at deadline.
-    picks = []
-    for gw, gdf in snaps.groupby("gw"):
-        if gw not in deadlines:
-            logging.warning("GW %s not present in deadlines; skipping", gw)
-            continue
-        dl_ts = deadlines[gw]
-        def _pick(group: pd.DataFrame) -> pd.DataFrame:
-            return _pick_at_deadline(group, dl_ts)
-        gsel = gdf.groupby("player_id", group_keys=False).apply(_pick)
-        gsel = gsel.assign(deadline_id=gw, deadline_ts=dl_ts)
-        picks.append(gsel)
-    if not picks:
-        raise RuntimeError("No data selected at deadlines. Check snapshots and deadlines.json.")
-    sel = pd.concat(picks, ignore_index=True)
+    # ---- Initial (GW0) price map
+    # Case A: current PMC present → initial = earliest observed price in *this* season per player
+    initial_price: Dict[str, float] = {}
+    if not pmc.empty:
+        earliest_any = (pmc.dropna(subset=["price"])
+                          .sort_values(["player_id","date_played","gw_orig"])
+                          .drop_duplicates("player_id", keep="first"))
+        initial_price = dict(zip(earliest_any["player_id"], earliest_any["price"]))
+        logging.info("[%s] Initial prices from current PMC for %d players", season, len(initial_price))
+    else:
+        # Case B: current PMC missing/empty → fallback to previous season mean per player
+        prev = _prev_season(season)
+        prev_pmc_fp = fixtures_root / prev / "player_minutes_calendar.csv" if prev else None
+        if prev and prev_pmc_fp and prev_pmc_fp.exists():
+            prev_df = load_pmc(prev_pmc_fp)
+            prev_mean = (prev_df.dropna(subset=["price"])
+                               .groupby("player_id", as_index=True)["price"]
+                               .mean()
+                               .round(1))
+            initial_price = prev_mean.to_dict()
+            logging.warning("[%s] PMC empty; GW0 seeded from previous season mean for %d players", season, len(initial_price))
+        else:
+            logging.warning("[%s] PMC empty and no previous season available — registry will be empty", season)
+            initial_price = {}
 
-    # Apply overrides (season-scoped, GW-level)
-    def apply_ov(row):
-        pid = str(row["player_id"])
-        g = str(int(row["gw"]))
-        o = ov.get(pid, {}).get("gw", {}).get(g, None)
-        if not o: return row
-        if "set_active" in o:
-            row["active"] = bool(o["set_active"])
-        if "set_price" in o:
-            row["price"] = float(o["set_price"])
-        if "set_team_hex" in o:
-            row["team_hex"] = str(o["set_team_hex"])
-        if "set_team" in o:
-            row["team"] = str(o["set_team"])
-        if "set_fpl_pos" in o:
-            logging.warning("Ignoring set_fpl_pos override for %s GW%s (no reclass mid-season).", pid, g)
-        return row
-    sel = sel.apply(apply_ov, axis=1)
+    # ---- Per-GW price from PMC (earliest per GW)
+    per_gw_df = pd.DataFrame(columns=["player_id","gw_orig","price","team_id","team","fpl_pos","source"])
+    if not pmc.empty:
+        pmc_valid = pmc.dropna(subset=["gw_orig","date_played","price"]).copy()
+        if not pmc_valid.empty:
+            earliest_gw = (pmc_valid.sort_values(["player_id","gw_orig","date_played"])
+                                     .drop_duplicates(["player_id","gw_orig"], keep="first"))
+            earliest_gw["source"] = "pmc"
+            per_gw_df = earliest_gw[["player_id","gw_orig","price","team_id","team","fpl_pos","source"]].copy()
 
-    # Validation
-    if players_master and players_master.exists():
-        pm = _read_json(players_master)
-        bad = [pid for pid in sel["player_id"].astype(str).unique() if pid not in pm]
-        if bad:
-            logging.warning("Validation: %d player_ids in season not found in players_master.json (first 10 shown): %s", len(bad), bad[:10])
-    if (~sel["price"].between(3.5, 15.5)).any():
-        raise ValueError("Found price outside [3.5,15.5]. Inspect input/overrides.")
-    if (~sel["fpl_pos"].isin({"GK","DEF","MID","FWD"})).any():
-        bad = sel.loc[~sel["fpl_pos"].isin({"GK","DEF","MID","FWD"}), ["player_id","fpl_pos"]].drop_duplicates().head(10)
-        raise ValueError(f"Invalid fpl_pos detected, sample:\n{bad}")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+
+    # If no GWs at all (season PMC empty): write initial-only from previous season means
+    if not gws:
+        nested: Dict[str, Any] = {"schema": "prices.v2", "season": season, "players": {}}
+        for pid in sorted(initial_price.keys()):
+            nested["players"][pid] = {"initial_price": float(initial_price[pid]), "gw": {}}
+        _write_json(out_json, nested)
+        pd.DataFrame(columns=["season","player_id","gw","price","source","team_hex","team","fpl_pos"]).to_parquet(out_parquet, index=False)
+        logging.info("✅ %s • initial-only registry written (no PMC GWs)", season)
+        return nested, pd.DataFrame()
+
+    # ---------------- Grid build for GW≥1 ----------------
+
+    # Players in this season = those who appear in current PMC at least once
+    season_player_ids = sorted(pmc["player_id"].dropna().astype(str).unique().tolist())
+    grid = pd.MultiIndex.from_product([season_player_ids, gws], names=["player_id","gw"])
+    grid_df = pd.DataFrame(index=grid).reset_index()
+
+    # Merge earliest PMC prices per GW
+    if not per_gw_df.empty:
+        tmp = per_gw_df.rename(columns={"gw_orig":"gw"})
+        tmp["player_id"] = tmp["player_id"].astype(str)
+        tmp["gw"]        = tmp["gw"].astype(int)
+        grid_df = grid_df.merge(tmp, on=["player_id","gw"], how="left")
+
+    # Seed metadata from each player's earliest observed row (across the season)
+    earliest_meta = (pmc.sort_values(["player_id","date_played","gw_orig"])
+                       .drop_duplicates("player_id", keep="first"))
+    meta_keep = ["player_id"] + [c for c in ["team_id","team","fpl_pos"] if c in earliest_meta.columns]
+    earliest_meta = earliest_meta[meta_keep].rename(columns={"team_id":"team_id_init","team":"team_init","fpl_pos":"fpl_pos_init"})
+    grid_df = grid_df.merge(earliest_meta, on="player_id", how="left")
+
+    # Seed initial price from current season earliest (if present for this player)
+    grid_df["init_price"] = grid_df["player_id"].map(initial_price)
+
+    # Vectorized forward-fill per player (no groupby.apply)
+    grid_df = grid_df.sort_values(["player_id","gw"]).copy()
+    grid_df["price_ffill"] = grid_df["price"].combine_first(grid_df["init_price"])
+    grid_df["price_ffill"] = grid_df.groupby("player_id", group_keys=False)["price_ffill"].ffill()
+
+    # Source attribution
+    grid_df["source"] = np.where(grid_df["price"].notna(), "pmc",
+                          np.where(grid_df["price_ffill"].notna(), "carry", np.nan))
+
+    # Forward-fill metadata per player from *_init
+    for m, m_init in [("team_id","team_id_init"), ("team","team_init"), ("fpl_pos","fpl_pos_init")]:
+        if m_init in grid_df.columns:
+            grid_df[m] = grid_df.get(m, pd.Series(index=grid_df.index, dtype="object")).combine_first(grid_df[m_init])
+            grid_df[m] = grid_df.groupby("player_id", group_keys=False)[m].ffill()
 
     # Build nested JSON
-    sel["asof_iso"] = pd.to_datetime(sel["asof"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    initial = sel[sel["gw"] == 1].set_index("player_id")["price"].to_dict()
-    nested: Dict[str, Any] = {"schema": "prices.v1", "deadline_source": "official_fpl", "season": season, "players": {}}
-    for pid, pdf in sel.sort_values(["player_id","gw"]).groupby("player_id"):
+    nested: Dict[str, Any] = {"schema": "prices.v2", "season": season, "players": {}}
+    for pid, gpdf in grid_df.groupby("player_id"):
+        # initial: earliest observed in THIS season; if missing (shouldn't for present players), fall back to first ffilled
+        init_p = float(initial_price.get(pid)) if pid in initial_price else (
+            float(gpdf["price_ffill"].iloc[0]) if len(gpdf) and pd.notna(gpdf["price_ffill"].iloc[0]) else float("nan")
+        )
         gw_map = {}
-        for _, r in pdf.iterrows():
+        for _, r in gpdf.iterrows():
             gw_map[str(int(r["gw"]))] = {
-                "price": float(r["price"]),
-                "team_hex": r["team_hex"],
-                "team": r["team"],
-                "fpl_pos": r["fpl_pos"],
-                "active": bool(r["active"]),
-                "asof": r["asof_iso"],
-                "deadline_id": int(r["deadline_id"])
+                "price": float(r["price_ffill"]) if pd.notna(r["price_ffill"]) else None,
+                "source": r.get("source", None),
+                "team_hex": None if pd.isna(r.get("team_id", np.nan)) else str(r["team_id"]),
+                "team":     None if pd.isna(r.get("team",    np.nan)) else str(r["team"]),
+                "fpl_pos":  None if pd.isna(r.get("fpl_pos", np.nan)) else str(r["fpl_pos"]),
             }
-        nested["players"][str(pid)] = {
-            "initial_price": float(initial.get(pid, list(gw_map.values())[0]["price"])),
-            "gw": gw_map
-        }
+        nested["players"][str(pid)] = {"initial_price": init_p, "gw": gw_map}
 
-    # Write JSON deterministically
     _write_json(out_json, nested)
 
-    # Parquet mirror (flat)
-    flat = sel[["player_id","gw","price","team_hex","team","fpl_pos","active","asof","deadline_ts"]].copy()
+    # Flat Parquet mirror (use team_hex naming for consistency)
+    flat = grid_df[["player_id","gw","price_ffill","source","team_id","team","fpl_pos"]].rename(
+        columns={"price_ffill":"price", "team_id":"team_hex"}
+    ).copy()
     flat["season"] = season
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     flat.to_parquet(out_parquet, index=False)
+
+    miss_after = int(flat["price"].isna().sum())
+    if miss_after:
+        sample_nan = flat.loc[flat["price"].isna(), ["player_id","gw"]].head(12).to_dict("records")
+        logging.warning("[%s] %d player-gw entries still NaN after carry-forward (sample: %s)",
+                        season, miss_after, sample_nan)
+    logging.info("✅ %s • wrote %s and %s", season, out_json, out_parquet)
     return nested, flat
+
+# ------------------------- Batch Runner & CLI -------------------------
+
+def run_batch(
+    seasons: List[str],
+    fixtures_root: Path,
+    fpl_root: Path,
+    out_dir_json: Path,
+    out_dir_parquet: Path,
+    force: bool,
+) -> None:
+    ok, fail = 0, 0
+    for season in seasons:
+        try:
+            out_json    = out_dir_json / f"{season}.json"
+            out_parquet = out_dir_parquet / f"{season}.parquet"
+            build_registry_from_pmc(
+                season=season,
+                fixtures_root=fixtures_root,
+                fpl_root=fpl_root,
+                out_json=out_json,
+                out_parquet=out_parquet,
+                force=force,
+            )
+            ok += 1
+        except Exception:
+            logging.exception("%s • registry build failed", season)
+            fail += 1
+    logging.info("Batch summary: %d ok, %d failed", ok, fail)
+    if fail:
+        raise SystemExit(1)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", required=True)
-    ap.add_argument("--snapshots", required=True, type=Path, help="Parquet/CSV with multi-snapshot rows and 'asof'")
-    ap.add_argument("--deadlines", required=True, type=Path)
-    ap.add_argument("--overrides", type=Path, default=None)
-    ap.add_argument("--players-master", type=Path, default=None)
-    ap.add_argument("--out-json", type=Path, default=None)
-    ap.add_argument("--out-parquet", type=Path, default=None)
+    ap.add_argument("--season", type=str, help="Single season like 2024-2025")
+    ap.add_argument("--seasons", type=str, help="Comma-separated list of seasons")
+    ap.add_argument("--all", action="store_true", help="Process all seasons found under fixtures-root and/or fpl-root")
+    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
+    ap.add_argument("--fpl-root", type=Path, default=Path("data/processed/fpl"))
+    ap.add_argument("--out-json-dir", type=Path, default=Path("data/registry/prices"))
+    ap.add_argument("--out-parquet-dir", type=Path, default=Path("data/registry/prices_parquet"))
+    ap.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
 
-    season = args.season
-    out_json = args.out_json or Path(f"registry/prices/{season}.json")
-    out_parquet = args.out_parquet or Path(f"registry/prices_parquet/{season}.parquet")
-    build_registry(season, args.snapshots, args.deadlines, args.overrides, out_json, out_parquet, args.players_master)
-    logging.info("✅ Wrote %s and %s", out_json, out_parquet)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
+                        format="%(levelname)s: %(message)s")
+
+    # Determine seasons to process
+    if args.all:
+        seasons = _discover_seasons(args.fixtures_root, args.fpl_root)
+        if not seasons:
+            logging.error("No seasons discovered under %s or %s", args.fixtures_root, args.fpl_root)
+            raise SystemExit(1)
+    elif args.seasons:
+        seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
+    elif args.season:
+        seasons = [args.season]
+    else:
+        # Default to 'all' if nothing is specified
+        seasons = _discover_seasons(args.fixtures_root, args.fpl_root)
+        if not seasons:
+            logging.error("No seasons discovered; specify --season or --all")
+            raise SystemExit(1)
+
+    # Ensure output dirs exist
+    args.out_json_dir.mkdir(parents=True, exist_ok=True)
+    args.out_parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    run_batch(
+        seasons=seasons,
+        fixtures_root=args.fixtures_root,
+        fpl_root=args.fpl_root,
+        out_dir_json=args.out_json_dir,
+        out_dir_parquet=args.out_parquet_dir,
+        force=args.force,
+    )
 
 if __name__ == "__main__":
     main()
