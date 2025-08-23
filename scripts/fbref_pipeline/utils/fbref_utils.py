@@ -30,7 +30,6 @@ def safe_write(df: pd.DataFrame, path: Path) -> None:
     """Write CSV + Snappy Parquet, creating parents as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path.with_suffix(".csv"), index=True)
-    df.to_parquet(path.with_suffix(".parquet"), index=True, compression="snappy")
     logging.getLogger("fbref").debug("saved %s", path.with_suffix("").name)
 
 def seasons_from_league(league: str) -> list[str]:

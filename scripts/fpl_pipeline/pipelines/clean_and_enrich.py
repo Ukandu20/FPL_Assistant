@@ -1,193 +1,381 @@
-#!/usr/bin/env python3
-"""
-fpl_clean_pipeline.py  –  STEP 7  (enrich with player metadata)
-────────────────────────────────────────────────────────────────────────────
-    • lower-case first/second names
-    • rename now_cost → price
-    • drop rows with element_type == 'am'
-    • cast numeric columns (except *date* / *time*)
-    • enrich each matched row with:
-        player_id, name, nation, born, position
-    • keep enriched rows in season/cleaned_players.csv
-    • move still-unmatched rows to _unwanted/cleaned_players_unmatched.csv
-"""
-
+#clean_and_enrich.py
 from __future__ import annotations
-import argparse, json, logging, unicodedata, re
+
+import argparse
+import json
+import logging
+import re
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+from unidecode import unidecode
 
+# Prefer rapidfuzz; fallback to fuzzywuzzy
+try:
+    from rapidfuzz import fuzz as rf_fuzz
+    _USE_RAPIDFUZZ = True
+except Exception:
+    try:
+        from fuzzywuzzy import fuzz as fw_fuzz  # type: ignore
+        _USE_RAPIDFUZZ = False
+    except Exception:
+        fw_fuzz = None
+        _USE_RAPIDFUZZ = False
 
-# ───────────────────────── helper: canonical key ────────────────────────
+# ───────────────────────── Canonicalisation & helpers ─────────────────────────
+
+NAME_SUFFIX_RE = re.compile(r"_[0-9]+$")  # foo_123 → foo
+FPL_POS_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+FBREF_TO_FPL_POS = {"GK": "GKP", "DF": "DEF", "MF": "MID", "FW": "FWD"}
+
 def canonical(s: str) -> str:
-    """accent-fold, strip punctuation, collapse spaces, lower-case."""
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    s = re.sub(r"[^\w\s]", " ", s)
-    return " ".join(s.lower().split())
+    """Lowercase, accent-fold, treat separators as spaces, strip punctuation, squeeze."""
+    s = s or ""
+    s = (
+        s.replace("|", " ")
+         .replace("_", " ")
+         .replace("-", " ")
+    )
+    s = NAME_SUFFIX_RE.sub("", s)
+    s = unidecode(s).lower()
+    s = re.sub(r"[^\w\s]", " ", s)     # punctuation → space
+    s = " ".join(s.split())            # squeeze
+    return s
 
+def season_longform(s: str) -> str:
+    """'2019-20' → '2019-2020'; '19-20' → '2019-2020'; pass-through if already long."""
+    s = s.strip()
+    if re.fullmatch(r"\d{4}-\d{2}", s):
+        start = int(s[:4])
+        end   = int(str(start)[:2] + s[-2:])
+        return f"{start}-{end}"
+    if re.fullmatch(r"\d{2}-\d{2}", s):
+        start = 2000 + int(s[:2])
+        end   = 2000 + int(s[-2:])
+        return f"{start}-{end}"
+    return s
 
-# ───────────────── master & override look-ups ───────────────────────────
-def load_master(master_fp: Path) -> Tuple[Dict[str, dict], Dict[str, str]]:
-    """Returns pid→record  and  canonical(first second)→pid."""
-    raw = json.loads(master_fp.read_text("utf-8"))
-    records = raw.values() if isinstance(raw, dict) else raw
-    pid2rec, key2pid = {}, {}
+def season_shortform(long_s: str) -> str:
+    """'2019-2020' → '2019-20'."""
+    if re.fullmatch(r"\d{4}-\d{4}", long_s):
+        start = long_s[:4]
+        end   = long_s[-2:]
+        return f"{start}-{end}"
+    return long_s
+
+def read_json_flex(p: Path) -> dict:
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return json.loads(p.read_text(encoding=enc))
+        except Exception:
+            pass
+    return json.loads(p.read_text())
+
+def read_csv_flex(p: Path) -> pd.DataFrame:
+    last: Optional[Exception] = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(p, encoding=enc)
+        except Exception as e:
+            last = e
+    raise last or RuntimeError(f"Failed to read {p}")
+
+def write_json_utf8(p: Path, obj) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+def write_csv_utf8(p: Path, df: pd.DataFrame) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False, encoding="utf-8")
+
+# ───────────────────────── Master & overrides ─────────────────────────
+
+def load_fbref_master(master_path: Path) -> Tuple[Dict[str, dict], Dict[str, str]]:
+    """
+    Return:
+      pid2rec: player_id -> full master record
+      key2pid: canonical(full name) -> player_id
+    """
+    data = read_json_flex(master_path)
+    if isinstance(data, list):
+        records = data
+    else:
+        records = []
+        for pid, rec in data.items():
+            rec = dict(rec)
+            rec["player_id"] = rec.get("player_id") or pid
+            records.append(rec)
+
+    pid2rec: Dict[str, dict] = {}
+    key2pid: Dict[str, str] = {}
     for rec in records:
         pid = rec.get("player_id") or rec.get("id")
         if not pid:
             continue
         pid2rec[pid] = rec
-        key2pid[canonical(f"{rec.get('first_name','')} {rec.get('second_name','')}")] = pid
-    logging.info("Loaded %d players from master", len(pid2rec))
+        master_name = rec.get("name") or ""
+        if master_name:
+            key2pid[canonical(master_name)] = pid
+    logging.info("FBref master: %d players, %d canonical keys", len(pid2rec), len(key2pid))
     return pid2rec, key2pid
 
-
-def load_overrides(fp: Path | None) -> Dict[str, str]:
+def load_overrides(path: Optional[Path]) -> Dict[str, str]:
     """
-    Accepts flat file  { "first | second": "pid", ... }  or
-            nested      { "alias": {"id": "pid"}, ... }
-    Returns canonical(first second) → pid.
+    Overrides map: canonical("first | last") -> player_id
+    Keys may include spaces around '|'; we normalise them away.
     """
-    if not fp or not fp.is_file():
+    if not path or not path.is_file():
         return {}
-    raw = json.loads(fp.read_text("utf-8"))
+    raw = read_json_flex(path)
     out: Dict[str, str] = {}
-    for key, val in raw.items():
-        if isinstance(val, dict):
-            pid = val.get("id")
-            alias = val.get("name", key)
-        else:
-            pid = val
-            alias = key
-        if not pid:
-            continue
-        out[canonical(alias.replace("|", " "))] = pid
-    logging.info("Loaded %d override aliases", len(out))
+    for k, v in raw.items():
+        key = canonical(k.replace(" | ", " ").replace("|", " "))
+        if isinstance(v, str):
+            out[key] = v
+        elif isinstance(v, dict) and v.get("id"):
+            out[key] = str(v["id"])
+    logging.info("Overrides loaded: %d entries", len(out))
     return out
 
+# ───────────────────────── Matching ─────────────────────────
 
-# ───────────────────────── helper: numeric cast ─────────────────────────
-def cast_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    mask_excl = df.columns.str.contains("date", case=False) | \
-                df.columns.str.contains("time", case=False)
-    for col in df.columns[~mask_excl]:
-        df[col] = pd.to_numeric(df[col], errors="ignore")
-    return df
+def _token_variants(key: str) -> List[str]:
+    toks = key.split()
+    n = len(toks)
+    vs: List[str] = []
+    if n >= 2:
+        if n > 2:
+            for i in range(n - 1):
+                vs.append(" ".join(toks[i:i+2]))      # sliding bigrams
+        vs.append(f"{toks[0]} {toks[-1]}")            # first + last
+        vs.append(" ".join(toks[1:]))                 # drop first
+        vs.append(" ".join(toks[:-1]))                # drop last
+    # "last, first" → "first last" handled at canonical() time if commas removed,
+    # but if raw contained a comma, canonical would have removed it. Variants cover enough.
+    return list(dict.fromkeys(vs))
 
+def _fuzzy_best(name: str, keys: List[str], threshold: int) -> Optional[str]:
+    if not keys:
+        return None
+    if _USE_RAPIDFUZZ:
+        best_key, best_score = None, -1
+        for k in keys:
+            sc = rf_fuzz.token_set_ratio(name, k)
+            if sc > best_score:
+                best_key, best_score = k, sc
+        return best_key if best_score >= threshold else None
+    if fw_fuzz is None:
+        return None
+    best_key, best_score = None, -1
+    for k in keys:
+        sc = fw_fuzz.token_set_ratio(name, k)
+        if sc > best_score:
+            best_key, best_score = k, sc
+    return best_key if best_score >= threshold else None
 
-# ───────────────────────── per-season handler ───────────────────────────
-def handle_season(season_raw: Path,
-                  season_out: Path,
+def resolve_player_id(raw_name: str,
+                      key2pid: Dict[str, str],
+                      overrides: Dict[str, str],
+                      threshold: int = 85) -> Optional[str]:
+    """Return player_id or None."""
+    key = canonical(raw_name)
+
+    # 1) overrides (strongest)
+    if key in overrides:
+        return overrides[key]
+
+    # 2) exact canonical hit
+    if key in key2pid:
+        return key2pid[key]
+
+    # 3) token variants
+    for v in _token_variants(key):
+        if v in overrides:
+            return overrides[v]
+        if v in key2pid:
+            return key2pid[v]
+
+    # 4) fuzzy last resort
+    best = _fuzzy_best(key, list(key2pid.keys()), threshold)
+    if best:
+        return key2pid[best]
+    return None
+
+# ───────────────────────── Enrichment ─────────────────────────
+
+def build_display_name(row: pd.Series) -> str:
+    # Prefer concatenated first+second; fallback to web_name; else any existing 'name'
+    fn = str(row.get("first_name") or "").strip()
+    sn = str(row.get("second_name") or "").strip()
+    if fn or sn:
+        return f"{fn} {sn}".strip()
+    wn = str(row.get("web_name") or "").strip()
+    if wn:
+        return wn
+    for c in ["name", "player", "player_name", "Player Name"]:
+        if c in row and str(row[c]).strip():
+            return str(row[c]).strip()
+    return ""
+
+def get_career_season(rec: dict, season_long: str) -> Optional[dict]:
+    """
+    Try long form first (e.g., '2019-2020'); then short ('2019-20').
+    """
+    career = rec.get("career") or {}
+    if season_long in career:
+        return career[season_long]
+    short = season_shortform(season_long)
+    if short in career:
+        return career[short]
+    return None
+
+def enrich_season(season_dir: Path,
+                  out_root: Path,
                   pid2rec: Dict[str, dict],
-                  master_key2pid: Dict[str, str],
-                  override_key2pid: Dict[str, str]):
-    src = season_raw / "cleaned_players.csv"
-    if not src.exists():
-        logging.warning("%s: cleaned_players.csv missing – skipped", season_raw.name)
+                  key2pid: Dict[str, str],
+                  overrides: Dict[str, str],
+                  threshold: int,
+                  fail_if_unmatched_pct: float) -> None:
+    season = season_dir.name
+    season_full = season_longform(season)
+
+    in_csv  = season_dir / "season" / "cleaned_players.csv"
+    if not in_csv.is_file():
+        logging.warning("[%s] missing input: %s", season, in_csv)
         return
 
-    df = pd.read_csv(src, engine="python")
+    df = read_csv_flex(in_csv)
+    if df.empty:
+        logging.warning("[%s] empty CSV: %s", season, in_csv)
+        return
 
-    # 1️⃣ lower-case first/second names
-    for col in ("first_name", "second_name"):
-        if col in df.columns:
-            df[col] = df[col].str.lower()
+    # Normalise "name"
+    if "name" not in df.columns:
+        df["name"] = df.apply(build_display_name, axis=1)
+    else:
+        df["name"] = df["name"].astype(str)
 
-    # 2️⃣ rename now_cost → price
-    if "now_cost" in df.columns:
-        df = df.rename(columns={"now_cost": "price"})
+    # Resolve player_id
+    df["player_id"] = df["name"].apply(lambda nm: resolve_player_id(nm, key2pid, overrides, threshold))
 
-    # 3️⃣ drop 'am' rows
-    if "element_type" in df.columns:
-        mask_am = df["element_type"].str.lower() == "am"
-        df = df[~mask_am].reset_index(drop=True)
+    # Join FBref truth
+    nations, borns, fb_positions, fb_teams, fplpos_from_master, master_names, has_career = [], [], [], [], [], [], []
+    for pid in df["player_id"]:
+        if not pid or pid not in pid2rec:
+            nations.append(None); borns.append(None)
+            fb_positions.append(None); fb_teams.append(None)
+            fplpos_from_master.append(None); master_names.append(None); has_career.append(False)
+            continue
 
-    # 4️⃣ numeric cast
-    df = cast_numeric(df)
+        rec = pid2rec[pid]
+        nations.append(rec.get("nation"))
+        borns.append(rec.get("born"))
+        master_names.append(rec.get("name") or None)
 
-    # 5️⃣ enrich or mark unmatched
-    enriched_rows, unmatched_rows = [], []
-    n_master, n_override = 0, 0
-
-    for _, row in df.iterrows():
-        fn, sn = row.get("first_name", ""), row.get("second_name", "")
-        key = canonical(f"{fn} {sn}")
-        pid = None
-        source = ""
-
-        if key in master_key2pid:
-            pid = master_key2pid[key]
-            n_master += 1
-            source = "master"
-        elif key in override_key2pid:
-            pid = override_key2pid[key]
-            n_override += 1
-            source = "override"
-
-        if pid:
-            rec = pid2rec.get(pid, {})
-            new_row = row.copy()
-            new_row["player_id"] = pid
-            new_row["name"]      = rec.get("name", f"{fn} {sn}")
-            new_row["nation"]    = rec.get("nation", "")
-            new_row["born"]      = rec.get("born", "")
-            # position may be season-specific; fall back to master record
-            season_rec = rec.get("career", {}).get(season_raw.name)
-            new_row["position"]  = season_rec["position"] if season_rec else rec.get("position", "")
-            enriched_rows.append(new_row)
+        srec = get_career_season(rec, season_full)
+        if srec:
+            has_career.append(True)
+            fb_teams.append(srec.get("team") or srec.get("short") or srec.get("team_short"))
+            fb_positions.append(srec.get("position") or srec.get("pos"))
+            fplpos_from_master.append(srec.get("fpl_position") or srec.get("fpl_pos"))
         else:
-            unmatched_rows.append(row)
+            has_career.append(False)
+            fb_teams.append(None)
+            fb_positions.append(None)
+            fplpos_from_master.append(None)
 
-    # 6️⃣ write outputs
-    season_dir = season_out / "season"
-    season_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(enriched_rows).to_csv(season_dir / "cleaned_players.csv", index=False)
+    df["nation"]   = nations
+    df["born"]     = borns
+    df["position"] = fb_positions
+    df["team"]     = fb_teams
 
-    if unmatched_rows:
-        unwanted_dir = season_out / "_unwanted"
-        unwanted_dir.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(unmatched_rows).to_csv(
-            unwanted_dir / "cleaned_players_unmatched.csv", index=False
-        )
+    # fpl_pos precedence: master > element_type > from FBref position
+    if "element_type" in df.columns:
+        fpl_pos_from_fpl = df["element_type"].map(FPL_POS_MAP).astype("string")
+    else:
+        fpl_pos_from_fpl = pd.Series([None] * len(df), dtype="string")
+    fbref_to_fpl = df["position"].map(lambda p: FBREF_TO_FPL_POS.get(str(p).upper(), None) if p else None).astype("string")
+    df["fpl_pos"] = pd.Series(fplpos_from_master, dtype="string").fillna(fpl_pos_from_fpl).fillna(fbref_to_fpl)
 
-    logging.info(
-        "%s • matched(master=%d, override=%d) • unmatched=%d • final rows=%d",
-        season_raw.name, n_master, n_override, len(unmatched_rows), len(enriched_rows)
-    )
+    # Names should be FBref canonical names where matched
+    df["name"] = pd.Series(master_names, dtype="string").fillna(df["name"].astype("string"))
 
+    # Review partitions
+    unmatched_ids = df[df["player_id"].isna()].copy()
+    # "no season entry" = player_id matched but FBref has no career record for this season
+    no_season_mask = df["player_id"].notna() & (~pd.Series(has_career, index=df.index))
+    no_season_rows = df[no_season_mask].copy()
 
-# ─────────────────────────────── main ───────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--raw-root",  type=Path, required=True, help="data/raw/fpl")
-    ap.add_argument("--proc-root", type=Path, required=True, help="data/processed/fpl")
-    ap.add_argument("--master",    type=Path, required=True, help="master_fpl_players.json")
-    ap.add_argument("--overrides", type=Path, help="optional overrides.json")
-    ap.add_argument("--log-level", default="INFO")
+    # Write enriched file (keep all rows; downstream can filter if needed)
+    out_csv = out_root / season / "season" / "cleaned_players.csv"
+    write_csv_utf8(out_csv, df)
+    logging.info("[%s] wrote enriched players: %s (rows=%d)", season, out_csv, len(df))
+
+    # Write unmatched IDs (CSV)
+    if len(unmatched_ids):
+        review_dir = out_root / season / "_manual_review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        miss_csv = review_dir / f"missing_ids_{season}.csv"
+        tmp = unmatched_ids[["name"]].copy()
+        tmp["canonical"]   = tmp["name"].map(canonical)
+        tmp["suggestions"] = tmp["canonical"].map(lambda c: " | ".join(_token_variants(c)[:4]))
+        write_csv_utf8(miss_csv, tmp)
+        logging.warning("[%s] unmatched rows=%d → %s", season, len(unmatched_ids), miss_csv)
+
+    # Write missing season career entries (CSV)
+    if len(no_season_rows):
+        review_dir = out_root / season / "_manual_review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        miss_season_csv = review_dir / f"missing_season_{season}.csv"
+        cols = ["player_id", "name", "nation", "born"]
+        write_csv_utf8(miss_season_csv, no_season_rows[cols])
+        logging.warning("[%s] no-career-entry rows=%d → %s", season, len(no_season_rows), miss_season_csv)
+
+    # Guardrail for unmatched percentage
+    total = len(df)
+    pct_unmatched = 100.0 * len(unmatched_ids) / max(total, 1)
+    if pct_unmatched > fail_if_unmatched_pct:
+        raise SystemExit(f"[{season}] Unmatched {pct_unmatched:.2f}% > {fail_if_unmatched_pct:.2f}% threshold")
+
+# ───────────────────────── CLI ─────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Enrich FPL season players with FBref metadata (names are FBref canonical).")
+    ap.add_argument("--raw-root", type=Path, required=True, help="Processed FPL root with <season>/season/cleaned_players.csv")
+    ap.add_argument("--proc-root", type=Path, required=True, help="Output root (usually same as --raw-root)")
+    ap.add_argument("--fbref-master", type=Path, required=True, help="FBref master players JSON (source of truth)")
+    ap.add_argument("--overrides", type=Path, default=None, help="Manual overrides JSON (e.g., 'first | last': 'pid')")
+    ap.add_argument("--threshold", type=int, default=85, help="Fuzzy minimum (0-100)")
+    ap.add_argument("--fail-if-unmatched", type=float, default=10.0, help="Fail run if unmatched percentage exceeds this value")
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
 
-    logging.basicConfig(level=args.log_level.upper(),
-                        format="%(asctime)s %(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-    pid2rec, master_key2pid = load_master(args.master)
-    override_key2pid        = load_overrides(args.overrides)
+    pid2rec, key2pid = load_fbref_master(args.fbref_master)
+    overrides = load_overrides(args.overrides)
 
-    for season_dir in sorted(args.raw_root.iterdir()):
-        if season_dir.is_dir():
-            logging.info("Season %s …", season_dir.name)
-            handle_season(
-                season_dir,
-                args.proc_root / season_dir.name,
-                pid2rec,
-                master_key2pid,
-                override_key2pid
-            )
+    seasons = [d for d in sorted(args.raw_root.iterdir()) if d.is_dir()]
+    if not seasons:
+        logging.warning("No seasons under %s", args.raw_root)
+        return
 
+    for season_dir in seasons:
+        logging.info("Season %s …", season_dir.name)
+        enrich_season(
+            season_dir=season_dir,
+            out_root=args.proc_root,
+            pid2rec=pid2rec,
+            key2pid=key2pid,
+            overrides=overrides,
+            threshold=args.threshold,
+            fail_if_unmatched_pct=args.fail_if_unmatched
+        )
 
 if __name__ == "__main__":
     main()

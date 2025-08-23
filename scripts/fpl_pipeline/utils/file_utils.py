@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-enrich_players_csv.py  –  FINAL VERSION  🚀
+scripts.fpl_pipeline.utils.file_utils
+
+intended use:
+
 
 Adds player_id, name, nation, born(year), team & position to every
 season-wide  players.csv  in the raw FPL dump, writing results to

@@ -41,6 +41,9 @@ from scripts.fpl_pipeline.analysis.gw_data_collector import collect_gw, merge_gw
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+def _with_sep(path: str) -> str:
+    return path if path.endswith(os.sep) else path + os.sep
+
 def _write_csv_atomic(df: pd.DataFrame, out_path: str) -> None:
     """Write CSV atomically so reruns overwrite cleanly."""
     _ensure_dir(os.path.dirname(out_path))
@@ -281,14 +284,21 @@ def create_fixture_metadata_per_team(base_dir: str) -> None:
 
 def fixtures(base_dir: str) -> None:
     data = get_fixtures_data()
-    parse_fixtures(data, base_dir)  # provided by your helpers
+    parse_fixtures(data, _with_sep(base_dir))  # provided by your helpers
 
 def parse_data(season_input: Optional[str], fresh: bool) -> None:
     # 1) Normalize season folder name
     season = _normalize_season_fmt(season_input)
     base_dir = _season_root(season)
-    players_dir = os.path.join(base_dir, "players")
-    gws_dir = os.path.join(base_dir, "gws")
+    base_dir_sep = _with_sep(base_dir) 
+
+    season_dir = base_dir
+    players_dir = os.path.join(season_dir, "players")
+    players_dir_sep  = _with_sep(players_dir)
+
+    
+    gws_dir = os.path.join(season_dir, "gws")
+    gws_dir_sep      = _with_sep(gws_dir)
 
     _ensure_dir(base_dir)
     _ensure_dir(players_dir)
@@ -303,7 +313,7 @@ def parse_data(season_input: Optional[str], fresh: bool) -> None:
     data = get_data()
 
     print("Parsing summary data …")
-    parse_players(data["elements"], base_dir)
+    parse_players(data["elements"], base_dir_sep)
 
     # Current GW (if available)
     gw_num = 0
@@ -312,27 +322,27 @@ def parse_data(season_input: Optional[str], fresh: bool) -> None:
             gw_num = int(event["id"])
 
     print("Cleaning summary data …")
-    clean_players(os.path.join(base_dir, "players_raw.csv"), base_dir)
+    clean_players(os.path.join(base_dir, "players_raw.csv"), base_dir_sep)
 
     print("Getting fixtures data …")
-    fixtures(base_dir)
+    fixtures(base_dir_sep)
 
     print("Getting teams data …")
-    parse_team_data(data["teams"], base_dir)
+    parse_team_data(data["teams"], base_dir_sep)
 
     print("Writing fixture metadata (fixture-level & per-team) …")
     create_fixture_metadata(base_dir)
     create_fixture_metadata_per_team(base_dir)
 
     print("Extracting player ids …")
-    id_players(os.path.join(base_dir, "players_raw.csv"), base_dir)
-    player_ids = get_player_ids(base_dir)
+    id_players(os.path.join(base_dir, "players_raw.csv"), base_dir_sep)
+    player_ids = get_player_ids(base_dir_sep)
 
     print("Extracting player-specific data …")
     for pid, name in player_ids.items():
         player_data = get_individual_player_data(pid)
-        parse_player_history(player_data.get("history_past", []), players_dir, name, pid)
-        parse_player_gw_history(player_data.get("history", []), players_dir, name, pid)
+        parse_player_history(player_data.get("history_past", []), players_dir_sep, name, pid)
+        parse_player_gw_history(player_data.get("history", []), players_dir_sep, name, pid)
 
     # Expected points snapshot for current GW (if any)
     if gw_num > 0:
@@ -347,10 +357,10 @@ def parse_data(season_input: Optional[str], fresh: bool) -> None:
             w.writerows(xp_rows)
 
         print("Collecting GW scores …")
-        collect_gw(gw_num, players_dir, gws_dir, base_dir)
+        collect_gw(gw_num, players_dir_sep, gws_dir_sep, base_dir_sep)
 
         print("Merging GW scores …")
-        merge_gw(gw_num, gws_dir)
+        merge_gw(gw_num, gws_dir_sep)
 
     print("✅ Done.")
 

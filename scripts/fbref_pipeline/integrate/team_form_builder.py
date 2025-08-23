@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
-r"""team_form_builder.py  – schema v2.0 (future-season ready, adds auto-version & latest pointer)
+r"""team_form_builder.py  – schema v2.4 (trusts precomputed home/away ids)
 
 Inputs (per season):
   data/processed/fixtures/<SEASON>/fixture_calendar.csv
-  Required columns:
-    fpl_id, fbref_id, gw_orig, gw_played, date_sched, date_played,
-    days_since_last_game, team, team_id, home, away, home_id, away_id,
-    status, sched_missing, venue, gf, ga, xga, xg, poss, result,
-    is_promoted, is_relegated, fdr_home, fdr_away
+  Required (base) columns (values may contain NaNs for future fixtures):
+    fpl_id, fbref_id, team_id, team, gw_orig, date_played, date_sched,
+    gf, ga, xg, xga, poss, result, home_id, away_id
+  Optional identity columns:
+    opponent_id, is_home, is_away, venue
+
+Behavior changes from v2.3:
+• We DO NOT compute home_id/away_id here. We validate them and only
+  infer is_home/venue/opponent_id if missing.
+• If --strict-ids is set, any inconsistency between team_id vs home/away ids aborts.
 
 Outputs (per season):
   data/processed/features/<version>/<SEASON>/team_form.csv
   data/processed/features/<version>/<SEASON>/team_form.meta.json
 
-Design:
-• Past-only rolling means (no current-row leakage).
-• Multi-season priors: last ≤3 seasons (newer weighted more). Robust fallbacks for brand-new seasons.
-• Promoted teams (no history): fallback to league means (prev seasons) → global defaults if needed.
-• Venue splits with shrinkage λ = n/(n+τ).
-• Z-scores computed within (season, gw_orig); z=0 when std==0.
-• FDR computed once per fixture (symmetric): consistent across both rows.
-• Auto-versioning (--auto-version) and optional 'latest' pointer (--write-latest).
-"""
+Key rules (validation only, no reassignment of ids):
+• If team_id == home_id → is_home = 1, venue = "Home", opponent_id = away_id
+• If team_id == away_id → is_home = 0, venue = "Away", opponent_id = home_id
+• If both false but is_home/is_away/venue exists → use them to set venue + opponent_id
+• If still ambiguous → warn (or error with --strict-ids)
 
+Rolling stats:
+• Past-only means (no leakage), venue-aware shrinkage, multi-season priors
+• Symmetric FDR per fixture, merged back to both rows
+"""
 from __future__ import annotations
 import argparse, json, logging, datetime as dt, hashlib, os, re
 from pathlib import Path
@@ -32,24 +37,24 @@ from functools import reduce
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v2.0"
+SCHEMA_VERSION = "v2.4"
 
-# Raw metric columns expected in fixture_calendar.csv
+# ───────────────────────── config ─────────────────────────
+
 METRICS = {
-    "att": {"raw": ("gf", "xg")},     # team goals for, team xG (match totals)
-    "def": {"raw": ("ga", "xga")},    # team goals against, team xGA (match totals)
-    "pos": {"raw": ("poss",)},        # team possession (%) per match row
+    "att": {"raw": ("gf", "xg")},
+    "def": {"raw": ("ga", "xga")},
+    "pos": {"raw": ("poss",)},
 }
 
-REQUIRED = {
-    "fpl_id", "fbref_id", "team_id", "team", "venue", "gw_orig", "date_played",
-    "date_sched", "home_id", "away_id", "fdr_home", "fdr_away",
-    "gf","ga","xg","xga","poss","result",
+REQUIRED_BASE = {
+    "fpl_id", "fbref_id", "team_id", "team", "gw_orig",
+    "home_id", "away_id", "date_played", "date_sched",
+    "gf", "ga", "xg", "xga", "poss", "result",
 }
 
 OUTPUT_FILE = "team_form.csv"
 
-# Legacy FDR columns to purge pre-merge (idempotence)
 LEGACY_FDR = [
     "fdr_home","fdr_away",
     "fdr_att_home","fdr_def_home","fdr_att_away","fdr_def_away",
@@ -57,11 +62,9 @@ LEGACY_FDR = [
     "fdr_att_home_cont","fdr_def_home_cont","fdr_att_away_cont","fdr_def_away_cont",
 ]
 
-# Reasonable league-wide neutral defaults for cold starts (if no prior data exists)
 DEFAULT_MEANS = {"gf": 1.40, "xg": 1.45, "ga": 1.40, "xga": 1.45, "poss": 50.0}
 
-
-# ─────────────────────────── version helpers ───────────────────────────
+# ───────────────────────── version helpers ─────────────────────────
 
 def _resolve_version(features_root: Path, requested: Optional[str], auto: bool) -> str:
     if auto or (not requested) or (requested.lower() == "auto"):
@@ -71,11 +74,10 @@ def _resolve_version(features_root: Path, requested: Optional[str], auto: bool) 
         logging.info("Auto-version resolved to %s", ver)
         return ver
     if not re.fullmatch(r"v\d+", requested):
-        if requested.isdigit():
+        if requested and requested.isdigit():
             return f"v{requested}"
         raise ValueError(f"--version must be like v9 or a number; got {requested}")
     return requested
-
 
 def _write_latest_pointer(features_root: Path, version: str) -> None:
     latest = features_root / "latest"
@@ -92,8 +94,7 @@ def _write_latest_pointer(features_root: Path, version: str) -> None:
         (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
         logging.info("Wrote LATEST_VERSION.txt -> %s", version)
 
-
-# ─────────────────────────── I/O helpers ───────────────────────────
+# ───────────────────────── utils ─────────────────────────
 
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text("utf-8")) if p.is_file() else {}
@@ -102,19 +103,15 @@ def save_json(obj: dict, p: Path) -> None:
     p.write_text(json.dumps(obj, indent=2))
 
 def _meta_hash(df: pd.DataFrame) -> str:
-    """Stable short hash over a sample of output columns for lineage."""
     cols = sorted([c for c in df.columns if c.startswith(("att_","def_","fdr_","pos_"))])
-    sample = df[["season","fpl_id","team_id"] + cols].head(500).to_json(orient="split", index=False)
+    base = ["season","fpl_id","team_id","opponent_id"] if "opponent_id" in df.columns else ["season","fpl_id","team_id"]
+    sample = df[base + cols].head(500).to_json(orient="split", index=False)
     return hashlib.sha256(sample.encode("utf-8")).hexdigest()[:12]
-
-
-# ─────────────── Multi-season priors (last ≤3 seasons) ─────────────
 
 def _seasons_before(all_seasons: List[str], current: str, k: int = 3) -> List[str]:
     prior = [s for s in all_seasons if s < current]
     prior.sort()
     return prior[-k:]
-
 
 def _safe_means(frame: pd.DataFrame, cols: List[str]) -> Dict[str, float]:
     out = {}
@@ -124,7 +121,6 @@ def _safe_means(frame: pd.DataFrame, cols: List[str]) -> Dict[str, float]:
         out[c] = m
     return out
 
-
 def build_team_priors(
     cal_all: pd.DataFrame,
     season: str,
@@ -132,15 +128,10 @@ def build_team_priors(
     cols: List[str],
     beta: float = 0.7
 ) -> pd.DataFrame:
-    """
-    Return a DataFrame indexed by current-season team_id with prior means for `cols`.
-    Uses last ≤3 seasons with geometric weights; falls back to league/global defaults.
-    """
     prev_seasons = _seasons_before(all_seasons, season, k=3)
     cur_ids = cal_all.loc[cal_all["season"] == season, "team_id"].dropna().unique()
 
     if not prev_seasons:
-        # No history at all (brand-new dataset): use global defaults
         base = pd.DataFrame([DEFAULT_MEANS], index=[0])[cols]
         base = base.reindex(cur_ids).ffill().bfill()
         base.index = cur_ids
@@ -156,30 +147,136 @@ def build_team_priors(
         stacks.append(g)
 
     if not stacks:
-        # No usable prev rows → global defaults
         base = pd.DataFrame([DEFAULT_MEANS], index=[0])[cols]
         base = base.reindex(cur_ids).ffill().bfill()
         base.index = cur_ids
         return base
 
     prior = reduce(lambda a, b: a.add(b, fill_value=0.0), stacks)
-
-    # reindex to current season team ids
     prior = prior.reindex(cur_ids)
 
-    # league means from previous seasons as fallback
     league_prev = pd.concat([cal_all[cal_all["season"] == s] for s in prev_seasons], ignore_index=True)
     league_means = _safe_means(league_prev, cols)
     prior = prior.fillna(pd.Series(league_means))
 
-    # final fallback (should not happen, but safe)
     for c in cols:
         prior[c] = prior[c].fillna(DEFAULT_MEANS.get(c, 0.0))
 
     return prior
 
+# ───────────────────────── schema normalization ─────────────────────────
 
-# ───────── Rolling (past-only) with venue shrinkage + taper ─────────
+def _is_blank_series(s: pd.Series) -> pd.Series:
+    if s.dtype == 'O' or pd.api.types.is_string_dtype(s):
+        return s.isna() | s.str.strip().eq("") | s.str.lower().isin({"nan", "none", "<na>"})
+    return s.isna()
+
+def _coerce_poss(df: pd.DataFrame) -> pd.DataFrame:
+    df["poss"] = pd.to_numeric(df["poss"], errors="coerce")
+    if df["poss"].max(skipna=True) is not None and df["poss"].max(skipna=True) <= 1.5:
+        df["poss"] = df["poss"] * 100.0
+    df["poss"] = df["poss"].fillna(50.0)
+    return df
+
+def _require_base(df: pd.DataFrame, season: str) -> None:
+    missing_base = REQUIRED_BASE - set(df.columns)
+    if missing_base:
+        raise KeyError(f"{season}: fixture_calendar missing base columns: {missing_base}")
+
+def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) -> pd.DataFrame:
+    """
+    Trust given home_id/away_id. Do NOT rewrite them.
+    Infer is_home/venue/opponent_id if missing, and validate consistency.
+    """
+    df = frame.copy()
+
+    # Normalize id types
+    for c in ["team_id","opponent_id","home_id","away_id","fpl_id","fbref_id"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.lower()
+
+    # Try to infer is_home from ids
+    eq_home = df["team_id"] == df["home_id"]
+    eq_away = df["team_id"] == df["away_id"]
+
+    inferred_is_home = np.where(eq_home & ~eq_away, 1,
+                          np.where(eq_away & ~eq_home, 0, np.nan))
+    # Fallback to provided flags
+    if "is_home" in df.columns:
+        provided = pd.to_numeric(df["is_home"], errors="coerce")
+    elif "is_away" in df.columns:
+        provided = (pd.to_numeric(df["is_away"], errors="coerce") == 0).astype(float)
+    elif "venue" in df.columns:
+        provided = df["venue"].astype(str).str.lower().map({"home":1.0,"away":0.0})
+    else:
+        provided = pd.Series(np.nan, index=df.index, dtype=float)
+
+    is_home = pd.Series(inferred_is_home, dtype="Float64").where(~pd.isna(inferred_is_home), provided)
+    # If still NaN, log (or error in strict mode)
+    n_amb = int(is_home.isna().sum())
+    if n_amb:
+        msg = f"{season}: {n_amb} rows ambiguous is_home (ids/flags missing)."
+        if strict:
+            raise AssertionError(msg)
+        logging.warning(msg + " Setting venue='Home' by default for ambiguous rows.")
+        is_home = is_home.fillna(1.0)  # bias to Home to keep deterministic; change if you prefer 0
+
+    is_home = is_home.astype("Int8")
+    df["is_home"] = is_home
+    df["venue"] = np.where(is_home == 1, "Home", "Away")
+
+    # Validate consistency where we CAN compare
+    bad_home = (is_home == 1) & (~eq_home)
+    bad_away = (is_home == 0) & (~eq_away)
+    n_bad = int(bad_home.sum() + bad_away.sum())
+    if n_bad:
+        msg = f"{season}: {n_bad} rows where is_home disagrees with team_id vs home/away ids."
+        if strict:
+            raise AssertionError(msg)
+        logging.warning(msg + " Keeping given home_id/away_id; only fixing is_home/venue.")
+
+    # Ensure opponent_id present
+    if "opponent_id" not in df.columns or _is_blank_series(df["opponent_id"]).any():
+        mask = _is_blank_series(df.get("opponent_id", pd.Series(index=df.index, dtype=object)))
+        df.loc[mask, "opponent_id"] = np.where(df.loc[mask, "is_home"] == 1,
+                                               df.loc[mask, "away_id"], df.loc[mask, "home_id"]).astype(str)
+
+    return df
+
+def _load_all(fixtures_root: Path, seasons: List[str], strict_ids: bool) -> pd.DataFrame:
+    frames = []
+    for s in seasons:
+        fp = fixtures_root / s / "fixture_calendar.csv"
+        if not fp.is_file():
+            logging.warning("%s • missing fixture_calendar.csv – skipped", s)
+            continue
+        df = pd.read_csv(fp, parse_dates=["date_played","date_sched"])
+
+        _require_base(df, s)
+        df = _coerce_poss(df)
+
+        # TRUST provided home_id/away_id; infer only is_home/venue/opponent_id if needed
+        df = _validate_or_infer_from_ids(df, s, strict=strict_ids)
+
+        # id hygiene
+        for c in ["team_id","opponent_id","home_id","away_id","fpl_id","fbref_id"]:
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.lower()
+
+        # date_key: prefer played date, else scheduled date
+        dk = pd.to_datetime(df["date_played"], errors="coerce")
+        ds = pd.to_datetime(df["date_sched"], errors="coerce")
+        df["date_key"] = dk.fillna(ds)
+
+        frames.append(df.assign(season=s))
+
+    if not frames:
+        raise FileNotFoundError("No seasons could be loaded from fixtures_root")
+
+    all_df = pd.concat(frames, ignore_index=True)
+    return all_df.sort_values(["season","date_key","fpl_id","home_id","away_id"]).reset_index(drop=True)
+
+# ───────────────────────── rolling & FDR ─────────────────────────
 
 def rolling_past_only(
     team_df: pd.DataFrame,
@@ -192,7 +289,6 @@ def rolling_past_only(
     v   = pd.to_numeric(team_df[val_col], errors="coerce").to_numpy()
     ven = team_df["venue"].astype(str).to_numpy()
 
-    # guard: poss gaps → 50; other metric gaps → 0
     if np.isnan(v).any():
         v = np.where(np.isnan(v), 50.0 if val_col == "poss" else 0.0, v)
 
@@ -208,7 +304,6 @@ def rolling_past_only(
         cnt = i - lo
         base = 0.0 if cnt == 0 else (csum[i] - csum[lo]) / max(1, cnt)
 
-        # prior taper for first K matches
         if prior_val is not None and prior_matches > 0 and i < prior_matches:
             w = 1.0 - (i / max(1, prior_matches))
             base = (1 - w) * base + w * prior_val
@@ -227,16 +322,9 @@ def rolling_past_only(
 
     return roll, roll_h, roll_a
 
-
-# ────────────────────────── FDR (symmetric) ─────────────────────────
-
 def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFrame:
-    """
-    Compute FDR per fixture (home & away) using both teams' venue-specific z's.
-    Returns a frame keyed by (season, fpl_id, fbref_id) with fdr_* columns.
-    """
     need = [
-        "season","fpl_id","fbref_id","home_id","away_id","team_id",
+        "season","fpl_id","fbref_id","team_id","home_id","away_id",
         "att_xg_home_roll_z","att_xg_away_roll_z",
         "def_xga_home_roll_z","def_xga_away_roll_z",
     ]
@@ -244,7 +332,10 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
     if missing:
         raise KeyError(f"{season}: missing columns for symmetric FDR: {missing}")
 
-    home_rows = df[df["team_id"] == df["home_id"]][[
+    is_home_mask = (pd.to_numeric(df.get("is_home", 0), errors="coerce").fillna(0).astype(int) == 1) \
+                   if "is_home" in df.columns else (df["team_id"].astype(str) == df["home_id"].astype(str))
+
+    home_rows = df[is_home_mask][[
         "season","fpl_id","fbref_id","home_id","away_id",
         "att_xg_home_roll_z","def_xga_home_roll_z"
     ]].rename(columns={
@@ -252,7 +343,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
         "def_xga_home_roll_z":"home_def_xga_home_z",
     })
 
-    away_rows = df[df["team_id"] == df["away_id"]][[
+    away_rows = df[~is_home_mask][[
         "season","fpl_id","fbref_id","home_id","away_id",
         "att_xg_away_roll_z","def_xga_away_roll_z"
     ]].rename(columns={
@@ -266,11 +357,10 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
         how="inner"
     )
 
-    # Continuous difficulty components (venue-aware):
-    fixtures["fdr_att_home_cont"] = fixtures["away_def_xga_away_z"]   # ease to attack at home
-    fixtures["fdr_def_home_cont"] = fixtures["away_att_xg_away_z"]    # difficulty to defend at home
-    fixtures["fdr_att_away_cont"] = fixtures["home_def_xga_home_z"]   # ease to attack away
-    fixtures["fdr_def_away_cont"] = fixtures["home_att_xg_home_z"]    # difficulty to defend away
+    fixtures["fdr_att_home_cont"] = fixtures["away_def_xga_away_z"]
+    fixtures["fdr_def_home_cont"] = fixtures["away_att_xg_away_z"]
+    fixtures["fdr_att_away_cont"] = fixtures["home_def_xga_home_z"]
+    fixtures["fdr_def_away_cont"] = fixtures["home_att_xg_home_z"]
 
     fixtures["fdr_home_cont"] = (fixtures["fdr_att_home_cont"] + fixtures["fdr_def_home_cont"]) / 2.0
     fixtures["fdr_away_cont"] = (fixtures["fdr_att_away_cont"] + fixtures["fdr_def_away_cont"]) / 2.0
@@ -281,9 +371,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
 
     for col in ["fdr_att_home_cont","fdr_def_home_cont","fdr_home_cont",
                 "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont"]:
-        fixtures[col.replace("_cont","")] = (
-            fixtures.groupby("season")[col].transform(_bucket)
-        )
+        fixtures[col.replace("_cont","")] = fixtures.groupby("season")[col].transform(_bucket)
 
     keep = ["season","fpl_id","fbref_id",
             "fdr_att_home","fdr_def_home","fdr_home",
@@ -292,47 +380,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
             "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont"]
     return fixtures[keep]
 
-
-# ───────────────────── helpers to load all seasons ─────────────────
-
-def _coerce_poss(df: pd.DataFrame) -> pd.DataFrame:
-    # Possession may be in 0–1 or 0–100; coerce to 0–100 float; fill gaps with neutral 50
-    df["poss"] = pd.to_numeric(df["poss"], errors="coerce")
-    if df["poss"].max(skipna=True) is not None and df["poss"].max(skipna=True) <= 1.5:
-        df["poss"] = df["poss"] * 100.0
-    df["poss"] = df["poss"].fillna(50.0)
-    return df
-
-
-def _load_all(fixtures_root: Path, seasons: List[str]) -> pd.DataFrame:
-    frames = []
-    for s in seasons:
-        fp = fixtures_root / s / "fixture_calendar.csv"
-        if not fp.is_file():
-            logging.warning("%s • missing fixture_calendar.csv – skipped", s)
-            continue
-        df = pd.read_csv(fp, parse_dates=["date_played","date_sched"])
-        missing = REQUIRED - set(df.columns)
-        if missing:
-            raise KeyError(f"{s}: fixture_calendar missing columns: {missing}")
-        df = _coerce_poss(df)
-
-        # date_key: prefer actual played date, else scheduled date (future-season friendly)
-        dk = pd.to_datetime(df["date_played"], errors="coerce")
-        ds = pd.to_datetime(df["date_sched"], errors="coerce")
-        df["date_key"] = dk.fillna(ds)
-
-        frames.append(df.assign(season=s))
-
-    if not frames:
-        raise FileNotFoundError("No seasons could be loaded from fixtures_root")
-
-    all_df = pd.concat(frames, ignore_index=True)
-    # Stable sort: date_key → fpl_id → team_id
-    return all_df.sort_values(["season","date_key","fpl_id","team_id"]).reset_index(drop=True)
-
-
-# ───────────────────── per-season builder ──────────────────────────
+# ───────────────────────── per-season build ─────────────────────────
 
 def build_team_form(
     season: str,
@@ -344,7 +392,7 @@ def build_team_form(
     force: bool,
     all_seasons: List[str],
     prior_matches: int,
-    cal_all: pd.DataFrame,            # cached all seasons passed in
+    cal_all: pd.DataFrame,
 ) -> bool:
     cal_fp = fixtures_root / season / "fixture_calendar.csv"
     dst_dir = out_dir / out_version / season
@@ -352,7 +400,7 @@ def build_team_form(
     meta_fp = dst_dir / "team_form.meta.json"
 
     if dst_csv.exists() and not force:
-        logging.warning("%s exists; re-run with --force to ensure consistent priors across seasons", season)
+        logging.warning("%s exists; re-run with --force for consistent priors", season)
         return False
     if not cal_fp.is_file():
         logging.warning("%s • fixture_calendar missing – skipped", season)
@@ -363,11 +411,11 @@ def build_team_form(
         logging.warning("%s • no rows after load – skipped", season)
         return False
 
-    # Robust numeric coercion (future seasons may be NaN)
+    # Numeric coercion
     for c in ["gf","ga","xg","xga","poss"]:
         cal[c] = pd.to_numeric(cal[c], errors="coerce")
 
-    # Priors for this season (with robust fallbacks)
+    # Priors
     cols_att = list(METRICS["att"]["raw"])  # ["gf","xg"]
     cols_def = list(METRICS["def"]["raw"])  # ["ga","xga"]
     cols_pos = list(METRICS["pos"]["raw"])  # ["poss"]
@@ -375,7 +423,7 @@ def build_team_form(
     priors_def = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_def, beta=0.7)
     priors_pos = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_pos, beta=0.7)
 
-    # Rolling calculations per team (ordered by date_key; future-season safe)
+    # Rolling per team
     rows = []
     for tid, grp in cal.groupby("team_id", sort=False):
         tmp = grp.sort_values(["date_key","fpl_id"]).copy()
@@ -404,7 +452,7 @@ def build_team_form(
         tmp["def_xga_home_roll"] = xga_h
         tmp["def_xga_away_roll"] = xga_a
 
-        # POSSESSION
+        # POS
         ppos = float(priors_pos.loc[tid, cols_pos[0]]) if tid in priors_pos.index else DEFAULT_MEANS["poss"]
         poss_roll, poss_h, poss_a = rolling_past_only(tmp, cols_pos[0], decay_window, tau, ppos, prior_matches)
         tmp["pos_poss_roll"] = poss_roll
@@ -415,7 +463,7 @@ def build_team_form(
 
     df = pd.concat(rows, ignore_index=True)
 
-    # Z-scores with transform (no GroupBy leak). Group within (season, gw_orig).
+    # Z-scores within (season, gw_orig)
     for c in [
         "att_xg_home_roll","att_xg_away_roll",
         "def_xga_home_roll","def_xga_away_roll",
@@ -426,13 +474,13 @@ def build_team_form(
         std  = grp.transform("std").replace(0, np.nan)
         df[c + "_z"] = ((df[c] - mean) / std).fillna(0.0)
 
-    # (2) Idempotent: drop any pre-existing FDR columns to avoid _x/_y
+    # Drop legacy FDR cols before merge (idempotence)
     df = df.drop(columns=[c for c in LEGACY_FDR if c in df.columns], errors="ignore")
 
-    # Symmetric, fixture-level FDR
+    # Symmetric FDR per fixture
     fixtures_fdr = _compute_fixture_fdr_symmetric(df, season)
 
-    # Merge fixture-level FDR back to team rows (symmetry guaranteed)
+    # Merge back to team rows
     df = df.merge(
         fixtures_fdr,
         on=["season","fpl_id","fbref_id"],
@@ -440,18 +488,18 @@ def build_team_form(
         validate="many_to_one"
     )
 
-    # Symmetry assert (fail fast) – but only when fixtures are paired properly
+    # Symmetry sanity (non-fatal)
     try:
         chk = (df.groupby(["season","fpl_id"])[["fdr_home","fdr_away"]]
                  .nunique()
                  .rename(columns={"fdr_home":"n_home","fdr_away":"n_away"}))
         bad = chk[(chk["n_home"] != 1) | (chk["n_away"] != 1)]
         if len(bad):
-            raise AssertionError(f"[{season}] Symmetry breach in {len(bad)} fixtures. Example:\n{bad.head(3)}")
+            raise AssertionError(f"[{season}] FDR symmetry issue in {len(bad)} fixtures. Example:\n{bad.head(3)}")
     except Exception as e:
         logging.warning("%s • FDR symmetry check warning: %s", season, e)
 
-    # Ensure numeric types clean for model ingestion
+    # Numeric hygiene
     num_cols = [
         "att_gf_roll","att_xg_roll","att_gf_home_roll","att_gf_away_roll",
         "att_xg_home_roll","att_xg_away_roll",
@@ -467,6 +515,14 @@ def build_team_form(
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Persist/ensure opponent_id (without touching home/away ids)
+    if "opponent_id" not in df.columns:
+        df["opponent_id"] = np.where(df["team_id"] == df["home_id"], df["away_id"], df["home_id"]).astype(str)
+    else:
+        opp_blank = _is_blank_series(df["opponent_id"])
+        df.loc[opp_blank, "opponent_id"] = np.where(df.loc[opp_blank, "team_id"] == df.loc[opp_blank, "home_id"],
+                                                    df.loc[opp_blank, "away_id"], df.loc[opp_blank, "home_id"]).astype(str)
 
     # Write
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -497,8 +553,7 @@ def build_team_form(
     logging.info("%s • %s (%d rows) written", season, OUTPUT_FILE, len(df))
     return True
 
-
-# ─────────────────────── batch driver / CLI ───────────────────────
+# ───────────────────────── batch / CLI ─────────────────────────
 
 def run_batch(
     seasons: List[str],
@@ -509,9 +564,10 @@ def run_batch(
     tau: float,
     force: bool,
     prior_matches: int,
+    strict_ids: bool,
 ):
     all_seasons = sorted(seasons)
-    cal_all = _load_all(fixtures_root, all_seasons)
+    cal_all = _load_all(fixtures_root, all_seasons, strict_ids=strict_ids)
 
     for season in all_seasons:
         try:
@@ -530,7 +586,6 @@ def run_batch(
         except Exception:
             logging.exception("%s • unhandled error – skipped", season)
 
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", help="e.g. 2025-2026; omit for batch")
@@ -538,26 +593,21 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
     ap.add_argument("--version", default=None, help="Version folder (e.g., v9). Use with --auto-version to pick next.")
     ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
-    ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
+    ap.add_argument("--write-latest", action="store_true", help="Update 'latest' pointer to the new version.")
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only)")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
     ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
+    ap.add_argument("--strict-ids", action="store_true", help="Error on inconsistencies between ids and is_home.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(format="%(levelname)s: %(message)s", level=args.log_level.upper())
 
-    # seasons list
-    if args.season:
-        seasons = [args.season]
-    else:
-        seasons = sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
+    seasons = [args.season] if args.season else sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
     if not seasons:
-        logging.error("No season folders in %s", args.fixtures_root)
-        return
+        logging.error("No season folders in %s", args.fixtures_root); return
 
-    # resolve version dir once
     features_root = args.out_dir
     features_root.mkdir(parents=True, exist_ok=True)
     version = _resolve_version(features_root, args.version, args.auto_version)
@@ -574,11 +624,11 @@ def main() -> None:
         tau=args.tau,
         force=args.force,
         prior_matches=args.prior_matches,
+        strict_ids=args.strict_ids,
     )
 
     if args.write_latest:
         _write_latest_pointer(features_root, version)
-
 
 if __name__ == "__main__":
     main()

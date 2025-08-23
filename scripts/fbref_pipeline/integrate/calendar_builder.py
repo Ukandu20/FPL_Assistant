@@ -31,7 +31,7 @@ import numpy as np
 OUT_COLS = [
     # Fixture identity / join keys
     "fbref_id", "fpl_id", "gw_orig", "date_played",
-    "team_id", "team", "venue", "was_home", "fdr_home", "fdr_away",
+    "team_id", "opponent_id", "team", "venue", "was_home", "fdr_home", "fdr_away",
 
     # Player identity & availability
     "player_id", "player", "pos",
