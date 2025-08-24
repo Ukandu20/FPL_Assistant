@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""team_form_builder.py  – schema v2.4 (trusts precomputed home/away ids)
+r"""team_form_builder.py  – schema v2.5 (trusts precomputed home/away ids; independent versioning)
 
 Inputs (per season):
   data/processed/fixtures/<SEASON>/fixture_calendar.csv
@@ -9,10 +9,12 @@ Inputs (per season):
   Optional identity columns:
     opponent_id, is_home, is_away, venue
 
-Behavior changes from v2.3:
-• We DO NOT compute home_id/away_id here. We validate them and only
-  infer is_home/venue/opponent_id if missing.
-• If --strict-ids is set, any inconsistency between team_id vs home/away ids aborts.
+Changes (v2.5):
+• Fixtures remain PURE (no FDR injection). This file is the single source of truth for FDR.
+• Independent versioning + reuse flow:
+    --auto-version / --version vX / --reuse-version / --write-latest
+• Meta now includes build_no and data fingerprint; reuse increments build_no.
+• We DO NOT compute home_id/away_id. We only validate and infer flags/opponent_id if missing.
 
 Outputs (per season):
   data/processed/features/<version>/<SEASON>/team_form.csv
@@ -29,7 +31,7 @@ Rolling stats:
 • Symmetric FDR per fixture, merged back to both rows
 """
 from __future__ import annotations
-import argparse, json, logging, datetime as dt, hashlib, os, re
+import argparse, json, logging, datetime as dt, hashlib, os, re, shutil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from functools import reduce
@@ -37,7 +39,7 @@ from functools import reduce
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v2.4"
+SCHEMA_VERSION = "v2.5"
 
 # ───────────────────────── config ─────────────────────────
 
@@ -54,6 +56,7 @@ REQUIRED_BASE = {
 }
 
 OUTPUT_FILE = "team_form.csv"
+META_FILE = "team_form.meta.json"
 
 LEGACY_FDR = [
     "fdr_home","fdr_away",
@@ -93,6 +96,15 @@ def _write_latest_pointer(features_root: Path, version: str) -> None:
     except (OSError, NotImplementedError):
         (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
         logging.info("Wrote LATEST_VERSION.txt -> %s", version)
+
+def _copy_to_latest_dir(features_root: Path, version: str, season: str) -> None:
+    src = features_root / version / season
+    dst = features_root / "latest" / season
+    dst.mkdir(parents=True, exist_ok=True)
+    for fname in (OUTPUT_FILE, META_FILE):
+        fp = src / fname
+        if fp.exists():
+            shutil.copy2(fp, dst / fname)
 
 # ───────────────────────── utils ─────────────────────────
 
@@ -183,6 +195,13 @@ def _require_base(df: pd.DataFrame, season: str) -> None:
     if missing_base:
         raise KeyError(f"{season}: fixture_calendar missing base columns: {missing_base}")
 
+def _to_bool_mask(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(False, index=pd.RangeIndex(0))
+    if s.dtype == bool:
+        return s.fillna(False)
+    return s.astype(str).str.strip().str.lower().isin({"1","true","t","yes","y"})
+
 def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) -> pd.DataFrame:
     """
     Trust given home_id/away_id. Do NOT rewrite them.
@@ -219,7 +238,7 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
         if strict:
             raise AssertionError(msg)
         logging.warning(msg + " Setting venue='Home' by default for ambiguous rows.")
-        is_home = is_home.fillna(1.0)  # bias to Home to keep deterministic; change if you prefer 0
+        is_home = is_home.fillna(1.0)
 
     is_home = is_home.astype("Int8")
     df["is_home"] = is_home
@@ -324,7 +343,7 @@ def rolling_past_only(
 
 def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFrame:
     need = [
-        "season","fpl_id","fbref_id","team_id","home_id","away_id",
+        "season","fpl_id","fbref_id","team_id","home_id","away_id","date_played",
         "att_xg_home_roll_z","att_xg_away_roll_z",
         "def_xga_home_roll_z","def_xga_away_roll_z",
     ]
@@ -336,7 +355,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
                    if "is_home" in df.columns else (df["team_id"].astype(str) == df["home_id"].astype(str))
 
     home_rows = df[is_home_mask][[
-        "season","fpl_id","fbref_id","home_id","away_id",
+        "season","fpl_id","fbref_id","home_id","away_id","date_played",
         "att_xg_home_roll_z","def_xga_home_roll_z"
     ]].rename(columns={
         "att_xg_home_roll_z":"home_att_xg_home_z",
@@ -344,7 +363,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
     })
 
     away_rows = df[~is_home_mask][[
-        "season","fpl_id","fbref_id","home_id","away_id",
+        "season","fpl_id","fbref_id","home_id","away_id","date_played",
         "att_xg_away_roll_z","def_xga_away_roll_z"
     ]].rename(columns={
         "att_xg_away_roll_z":"away_att_xg_away_z",
@@ -353,7 +372,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
 
     fixtures = pd.merge(
         home_rows, away_rows,
-        on=["season","fpl_id","fbref_id","home_id","away_id"],
+        on=["season","fpl_id","fbref_id","home_id","away_id","date_played"],
         how="inner"
     )
 
@@ -373,7 +392,7 @@ def _compute_fixture_fdr_symmetric(df: pd.DataFrame, season: str) -> pd.DataFram
                 "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont"]:
         fixtures[col.replace("_cont","")] = fixtures.groupby("season")[col].transform(_bucket)
 
-    keep = ["season","fpl_id","fbref_id",
+    keep = ["season","fpl_id","fbref_id","home_id","away_id","date_played",
             "fdr_att_home","fdr_def_home","fdr_home",
             "fdr_att_away","fdr_def_away","fdr_away",
             "fdr_att_home_cont","fdr_def_home_cont","fdr_home_cont",
@@ -390,6 +409,7 @@ def build_team_form(
     decay_window: int,
     tau: float,
     force: bool,
+    reuse_version: bool,
     all_seasons: List[str],
     prior_matches: int,
     cal_all: pd.DataFrame,
@@ -397,10 +417,10 @@ def build_team_form(
     cal_fp = fixtures_root / season / "fixture_calendar.csv"
     dst_dir = out_dir / out_version / season
     dst_csv = dst_dir / OUTPUT_FILE
-    meta_fp = dst_dir / "team_form.meta.json"
+    meta_fp = dst_dir / META_FILE
 
-    if dst_csv.exists() and not force:
-        logging.warning("%s exists; re-run with --force for consistent priors", season)
+    if dst_csv.exists() and not (force or reuse_version):
+        logging.warning("%s exists; use --reuse-version for minor edits or --force to rebuild.", dst_csv)
         return False
     if not cal_fp.is_file():
         logging.warning("%s • fixture_calendar missing – skipped", season)
@@ -416,9 +436,9 @@ def build_team_form(
         cal[c] = pd.to_numeric(cal[c], errors="coerce")
 
     # Priors
-    cols_att = list(METRICS["att"]["raw"])  # ["gf","xg"]
-    cols_def = list(METRICS["def"]["raw"])  # ["ga","xga"]
-    cols_pos = list(METRICS["pos"]["raw"])  # ["poss"]
+    cols_att = list(METRICS["att"]["raw"])
+    cols_def = list(METRICS["def"]["raw"])
+    cols_pos = list(METRICS["pos"]["raw"])
     priors_att = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_att, beta=0.7)
     priors_def = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_def, beta=0.7)
     priors_pos = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_pos, beta=0.7)
@@ -477,13 +497,13 @@ def build_team_form(
     # Drop legacy FDR cols before merge (idempotence)
     df = df.drop(columns=[c for c in LEGACY_FDR if c in df.columns], errors="ignore")
 
-    # Symmetric FDR per fixture
+    # Symmetric FDR per fixture (returns one row per fixture)
     fixtures_fdr = _compute_fixture_fdr_symmetric(df, season)
 
-    # Merge back to team rows
+    # Merge back to team rows (keeps team-row schema for diagnostics/analysis)
     df = df.merge(
         fixtures_fdr,
-        on=["season","fpl_id","fbref_id"],
+        on=["season","fpl_id","fbref_id","home_id","away_id","date_played"],
         how="left",
         validate="many_to_one"
     )
@@ -526,9 +546,13 @@ def build_team_form(
 
     # Write
     dst_dir.mkdir(parents=True, exist_ok=True)
+    # If overwriting in-place (reuse), keep going; else if exists and not force, we already returned above.
     df.to_csv(dst_csv, index=False)
 
-    # Meta lineage
+    # Meta lineage (with build_no)
+    existing_meta = load_json(meta_fp)
+    build_no = int(existing_meta.get("build_no", 0)) + 1 if (reuse_version and meta_fp.exists()) else 1
+
     features_list = sorted(
         [c for c in df.columns if c.endswith(("_roll","_roll_z"))] +
         ["fdr_att_home","fdr_def_home","fdr_home",
@@ -540,6 +564,7 @@ def build_team_form(
         "schema": SCHEMA_VERSION,
         "build_ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "version": out_version,
+        "build_no": build_no,
         "window_matches": decay_window,
         "tau": tau,
         "prior_matches": prior_matches,
@@ -547,10 +572,16 @@ def build_team_form(
         "seasons_built": all_seasons,
         "hash": _meta_hash(df),
         "features": features_list,
+        "data_fingerprint": {
+            "rows": int(len(df)),
+            "fixtures_unique": int(fixtures_fdr.shape[0]),
+            "last_fixture_date": str(pd.to_datetime(df["date_played"]).max())
+        },
         "future_season_ready": True
     }
     save_json(meta, meta_fp)
     logging.info("%s • %s (%d rows) written", season, OUTPUT_FILE, len(df))
+
     return True
 
 # ───────────────────────── batch / CLI ─────────────────────────
@@ -563,15 +594,17 @@ def run_batch(
     decay_window: int,
     tau: float,
     force: bool,
+    reuse_version: bool,
     prior_matches: int,
     strict_ids: bool,
+    write_latest: bool,
 ):
     all_seasons = sorted(seasons)
     cal_all = _load_all(fixtures_root, all_seasons, strict_ids=strict_ids)
 
     for season in all_seasons:
         try:
-            build_team_form(
+            ok = build_team_form(
                 season=season,
                 fixtures_root=fixtures_root,
                 out_version=out_version,
@@ -579,10 +612,14 @@ def run_batch(
                 decay_window=decay_window,
                 tau=tau,
                 force=force,
+                reuse_version=reuse_version,
                 all_seasons=all_seasons,
                 prior_matches=prior_matches,
                 cal_all=cal_all,
             )
+            if ok and write_latest:
+                _write_latest_pointer(out_dir, out_version)
+                _copy_to_latest_dir(out_dir, out_version, season)
         except Exception:
             logging.exception("%s • unhandled error – skipped", season)
 
@@ -591,13 +628,23 @@ def main() -> None:
     ap.add_argument("--season", help="e.g. 2025-2026; omit for batch")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
+
+    # Versioning controls
     ap.add_argument("--version", default=None, help="Version folder (e.g., v9). Use with --auto-version to pick next.")
     ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
-    ap.add_argument("--write-latest", action="store_true", help="Update 'latest' pointer to the new version.")
+    ap.add_argument("--reuse-version", action="store_true",
+                    help="Overwrite in-place for minor/non-logic edits; increments build_no in meta.")
+    ap.add_argument("--write-latest", action="store_true",
+                    help="Update 'latest' pointer and copy outputs to features/latest/<SEASON>/")
+
+    # Rating params
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only)")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
     ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
-    ap.add_argument("--strict-ids", action="store_true", help="Error on inconsistencies between ids and is_home.")
+
+    # Behavior
+    ap.add_argument("--strict-ids", action="store_true", default=False,
+                    help="Error on inconsistencies between ids and is_home.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
@@ -623,12 +670,11 @@ def main() -> None:
         decay_window=args.window,
         tau=args.tau,
         force=args.force,
+        reuse_version=args.reuse_version,
         prior_matches=args.prior_matches,
         strict_ids=args.strict_ids,
+        write_latest=args.write_latest,
     )
-
-    if args.write_latest:
-        _write_latest_pointer(features_root, version)
 
 if __name__ == "__main__":
     main()

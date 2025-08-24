@@ -1,0 +1,380 @@
+FBref Pipeline — End-to-End Manual (Scrape ➜ team_form / players_form)
+
+This is the canonical, idempotent path from raw FBref scrapes to consolidated team_form (FDR source of truth) and players_form suitable for modeling. It documents required files, exact commands, outputs, and common failure modes.
+
+Single source of truth: team_form.csv defines FDR. The fixture calendar only mirrors it for convenience.
+
+0) Quick overview (what runs when)
+Data flow
+FBref scrape (match + season) ──► data/raw/fbref/<LEAGUE>/<SEASON>/
+                                      ├─ schedule.csv / team_match_* / player_match_*
+                                      └─ team_season_* / player_season_*
+          │
+          ▼
+All-in-one cleaner (IDs, venue, opp_id, promoted/relegated, position sync)
+scripts.fbref_pipeline.clean.clean_fbref_csvs
+          │
+          ▼
+Fixture calendar (FPL + FBref schedule) + (temporary FDR or latest team_form)
+scripts.fbref_pipeline.integrate.fixtures_meta_builder
+          │
+          ▼
+Team form (past-only rollups, symmetric FDR)  ←─── source of truth for FDR
+scripts.fbref_pipeline.integrate.team_form_builder
+          │
+          ├─ (Optional) Reinjection of FDR back into fixtures_meta
+          │
+          ▼
+Player minutes calendar (per-match player rows + optional FPL enrich) 
+scripts.fbref_pipeline.integrate.calendar_builder
+          │
+          ▼
+Players form (per-90, venue-aware, GK binomial save%)
+scripts.fbref_pipeline.integrate.player_form_builder
+
+
+Seasons are normalized as YYYY-YYYY+1 folders (e.g., 2025-2026).
+
+1) Prerequisites
+
+Python ≥ 3.10 (3.12 fine)
+
+Install libs:
+
+pip install pandas numpy soccerdata tqdm
+
+
+Registry/config files expected:
+
+data/config/teams.json
+(team name/alias → 3-letter code, e.g., "manchester city": "MCI")
+
+data/processed/registry/_id_lookup_teams.json
+(3-letter lowercase code → 8-char hex, e.g., "mci": "b11c2f05")
+
+Cleaner will read/write:
+
+data/processed/fbref/<LEAGUE>/<SEASON>/... (clean CSVs)
+
+data/processed/registry/
+_id_lookup_players.json, _id_lookup_teams.json,
+master_players.json, master_teams.json (FBref registries)
+
+FPL side (for joins/enrichments):
+
+data/processed/fpl/<SEASON>/season/teams.csv and fixtures.csv (for fixtures_meta join)
+
+(Optional for prices/xP) data/processed/fpl/<SEASON>/gws/merged_gws.csv
+
+(Optional) data/processed/registry/fpl/master_fpl.json, seasonal price JSONs
+
+2) Directory structure (after scrape)
+data/
+  raw/
+    fbref/ENG-Premier League/2025-2026/
+      schedule.csv
+      player_match/{summary.csv, keepers.csv, defense.csv, misc.csv}
+      team_match/{standard.csv, ...}
+      player_season_{...}.csv
+      team_season_{...}.csv
+  processed/
+    fbref/ENG-Premier League/2025-2026/
+      player_match/*.csv
+      team_match/*.csv          # includes schedule.csv after cleaning
+      player_season/*.csv + season_players.json
+      registry/{master_players.json, master_teams.json}
+    registry/
+      _id_lookup_players.json
+      _id_lookup_teams.json
+      fixtures/<SEASON>/fixture_calendar.csv
+      features/<VERSION>/<SEASON>/{team_form.csv, players_form.csv}
+
+3) Step-by-step commands
+
+PowerShell-friendly examples; tweak paths as needed.
+
+A) Scrape match-level (schedule, player_match, team_match)
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" `
+  --out-dir data/raw/fbref `
+  --seasons 2024-2025 2025-2026 `
+  --no-cache --delay 0.5 -v
+
+
+Player-match is scraped first to enable team-match fallback aggregation if native table is missing.
+
+If FBref blocks/omits, the scraper writes schema-only CSVs to keep downstream steps robust.
+
+B) Scrape season-level (player_season, team_season)
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" `
+  --out-dir data/raw/fbref `
+  --seasons 2024-2025 2025-2026 `
+  --no-cache --delay 0.5 -v
+
+C) Clean & normalize (IDs, venue, opp_id, promoted/relegated, positions)
+py -m scripts.fbref_pipeline.clean.clean_fbref_csvs `
+  --raw-dir data/raw `
+  --clean-dir data/processed `
+  --league "ENG-Premier League" `
+  --pos-map data/config/positions.json `
+  --team-map data/config/teams.json `
+  --workers 6 --force --log-level INFO
+
+
+What it guarantees:
+
+Headers flattened, numeric coercion, standardized team codes.
+
+Deterministic game_id (URL slug if present, else hashed date/home/away).
+
+team_id / player_id assigned & persisted in registries.
+
+is_home/is_away, opponent_id, is_promoted/is_relegated injected.
+
+position / fpl_pos majority-voted and synced into player_match.
+
+⚠ Ensure schedule.csv ends under
+data/processed/fbref/ENG-Premier League/<SEASON>/team_match/schedule.csv.
+
+D) Build fixture calendar (FPL × FBref schedule)
+
+(first pass may use neutral FDR until team_form exists)
+
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --fpl-root data/processed/fpl `
+  --fbref-league-dir "data/processed/fbref/ENG-Premier League" `
+  --team-map "data/processed/registry/_id_lookup_teams.json" `
+  --short-map "data/config/teams.json" `
+  --out-dir "data/processed/registry/fixtures" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --neutral-fdr 3.0 `
+  --force --log-level INFO
+
+
+Produces: registry/fixtures/<SEASON>/fixture_calendar.csv with:
+
+FPL + FBref alignment, home_id/away_id (derived earlier), venue, result, xG/xGA/poss, promoted/relegated.
+
+FDR: if team_form.csv exists in features/<version>/<SEASON>, merges it; else fills neutral (--neutral-fdr).
+
+E) Build team_form (FDR source of truth)
+# Add or overwrite inside an existing version (logic-stable)
+py -m scripts.fbref_pipeline.integrate.team_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest
+
+
+Past-only, venue-aware rolling means; symmetric FDR per fixture.
+
+Writes: features/v1/<SEASON>/team_form.csv (+ meta).
+
+Policy: If you change logic/hyper-params, bump version (--auto-version).
+If you’re just updating weeks or fixing data, keep v1 and use --force.
+
+F) (Optional but recommended) Re-inject latest FDR into fixtures
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --out-dir "data/processed/registry/fixtures" `
+  --force
+
+
+Ensures the calendar mirrors the current team_form FDR (for downstream joins).
+
+G) Build player_minutes calendar (per-match rows, optional price/xP)
+# With team FDR passthrough from fixture_calendar; optional FPL enrich
+py -m scripts.fbref_pipeline.integrate.calendar_builder `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --fbref-root "data/processed/fbref/ENG-Premier League" `
+  --fpl-root "data/processed/fpl" `
+  --features-root "data/processed/registry/features" `
+  --team-version latest `
+  --include-price `
+  --price-master "data/processed/registry/fpl/master_fpl.json" `
+  --force
+
+
+Produces: registry/fixtures/<SEASON>/player_minutes_calendar.csv with:
+
+Player identity, minutes, availability, venue, FDR (home/away) passthrough, and optional price/xP/points if provided.
+
+Omit --include-price to exclude price entirely.
+
+H) Build players_form (per-90, venue-aware, GK binomial)
+py -m scripts.fbref_pipeline.integrate.player_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest
+
+
+Separate z-score pools by position (GK vs Outfield), grouped by (season, gw_orig).
+
+Defensive metrics flipped so higher is better.
+
+Writes: features/v1/<SEASON>/players_form.csv (+ meta).
+
+4) Validation checklist (quick smoke tests)
+
+After cleaner
+
+team_match/schedule.csv present in processed tree.
+
+player_match/*.csv have player_id, team_id, game_id, is_home, opponent_id.
+
+After fixtures_meta
+
+fixture_calendar.csv row count ≈ FPL fixtures × 2 (teams).
+
+home_id/away_id filled; log shows missing fbref_id = 0 or small & explained.
+
+After team_form
+
+team_form.csv exists with fdr_home/_cont and fdr_away/_cont.
+
+Symmetry check logs no issues (or rare, investigated).
+
+After player_minutes calendar
+
+Reasonable coverage for minutes > 0 and venue flags.
+
+If --include-price, price coverage log ≥ e.g., 95% for played minutes.
+
+After players_form
+
+_roll and _roll_z columns present; GK save% only for GK, outfield features not populated for GK.
+
+5) Troubleshooting & common pitfalls
+
+Schedule path mismatch: fixtures_meta expects schedule under
+processed/fbref/<LEAGUE>/<SEASON>/team_match/schedule.csv. Fix cleaner rules if needed.
+
+Short-code maps: ensure data/config/teams.json covers aliases (e.g., “Man Utd”), and _id_lookup_teams.json keys are lowercase codes.
+
+FDR neutrality leak: if you build players before team_form, fixture calendar will carry neutral FDR. Prefer the sequence: fixtures (neutral) → team_form → fixtures (reinjection) → players → players_form.
+
+Rebuild semantics: to overwrite existing outputs within a version, pass --force. Use --auto-version only when changing logic.
+
+Fragmentation warnings (pandas): bulk-append new columns (already patched in your builders).
+
+6) Frequently used variants
+
+Process all seasons (no --season):
+
+Each step walks all season subfolders under its root.
+
+Weekly refresh (current season only):
+
+Scrape match-level for the current season.
+
+Clean current season (idempotent).
+
+Fixtures_meta (first pass OK).
+
+Team_form --version v1 --force.
+
+Fixtures_meta again (re-inject FDR).
+
+Calendar_builder (optionally --include-price).
+
+Player_form --version v1 --force.
+
+Add a new season to existing version:
+
+Use --version v1 without --force (only the new season writes).
+
+
+7) “Pushback” — 5 things to decide upfront
+
+Authoritative FDR read: Always consume FDR from team_form.csv (calendar mirrors it). Lock this rule in downstream code.
+
+Failure policy: Should fixtures_meta fail if no schedule, or write schema-only and continue? (Current behavior: continue with warnings.)
+
+Re-injection gate: Enforce a guard that players_form cannot run if fixtures carry neutral FDR (optional but safer).
+
+ID stability: Rely on FBref slugs when present; otherwise hashed date/home/away—ok for EPL but document that slugs win when available.
+
+DGWs: Z-scores are by (season, gw_orig) so DGW games share the pool—this is intended. If you want fixture-isolation later, we can add a switch.
+
+8) Minimal “golden run” (copy/paste)
+
+Scrape raw (match + season):
+
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" --out-dir data/raw/fbref `
+  --seasons 2025-2026 --no-cache --delay 0.5 -v
+
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" --out-dir data/raw/fbref `
+  --seasons 2025-2026 --no-cache --delay 0.5 -v
+
+
+Clean (IDs, venue, opp_id, flags):
+
+py -m scripts.fbref_pipeline.clean.clean_fbref_csvs `
+  --raw-dir data/raw --clean-dir data/processed `
+  --league "ENG-Premier League" `
+  --pos-map data/config/positions.json `
+  --team-map data/config/teams.json `
+  --workers 6 --force --log-level INFO
+
+
+Fixtures (pass 1 — neutral or latest):
+
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --fpl-root data/processed/fpl `
+  --fbref-league-dir "data/processed/fbref/ENG-Premier League" `
+  --team-map "data/processed/registry/_id_lookup_teams.json" `
+  --short-map "data/config/teams.json" `
+  --out-dir "data/processed/registry/fixtures" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --neutral-fdr 3.0 --force
+
+
+Team form (FDR truth):
+
+py -m scripts.fbref_pipeline.integrate.team_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest
+
+
+Fixtures (pass 2 — re-inject FDR):
+
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --out-dir "data/processed/registry/fixtures" `
+  --force
+
+
+Player minutes calendar:
+
+py -m scripts.fbref_pipeline.integrate.calendar_builder `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --fbref-root "data/processed/fbref/ENG-Premier League" `
+  --fpl-root "data/processed/fpl" `
+  --features-root "data/processed/registry/features" `
+  --team-version latest `
+  --include-price `
+  --price-master "data/processed/registry/fpl/master_fpl.json" `
+  --force
+
+
+Players form:
+
+py -m scripts.fbref_pipeline.integrate.player_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest

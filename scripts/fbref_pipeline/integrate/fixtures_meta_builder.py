@@ -2,8 +2,12 @@
 r"""fixtures_meta_builder.py – Batch-capable builder for **fixture_calendar.csv**
 ───────────────────────────────────────────────────────────────────────────────
 Adds **home** and **away** (three-letter short codes) to the final CSV,
-derives hex IDs (`home_id`, `away_id`) **from team_id/opponent_id + is_home/is_away**,
-and includes Fixture Difficulty Ratings (FDR) for both home and away teams.
+derives hex IDs (`home_id`, `away_id`) **from team_id/opponent_id + is_home/is_away**.
+
+This script now keeps fixtures **pure** (no FDR columns). If you want a
+denormalized calendar that includes Fixture Difficulty Ratings (FDR),
+use the `--attach-fdr <version|latest>` flag to write a view:
+features/<views-subdir>/<SEASON>/fixture_calendar_with_fdr__<version>.csv
 
 Batch rules
 • `--season` → single season; omit → loop over every folder in `--fpl-root`.
@@ -18,8 +22,7 @@ team, team_id, opponent_id,
 home, away, home_id, away_id,
 status, sched_missing,
 venue, gf, ga, xga, xg, result, poss,
-is_promoted, is_relegated,
-fdr_home, fdr_away
+is_promoted, is_relegated
 """
 from __future__ import annotations
 import argparse, json, logging
@@ -51,10 +54,109 @@ def normalise_date(series: pd.Series) -> pd.Series:
 def _to_bool_mask(s: pd.Series) -> pd.Series:
     """Convert various truthy encodings to boolean mask."""
     if s is None:
-        return pd.Series(False, index=s.index)
+        # Defensive: should not happen in this script; return empty False mask
+        return pd.Series(False, index=pd.RangeIndex(0))
     if s.dtype == bool:
         return s.fillna(False)
     return s.astype(str).str.strip().str.lower().isin({"1","true","t","yes","y"})
+
+def read_fixture_calendar(out_dir: Path, season: str) -> pd.DataFrame:
+    fp = out_dir / season / "fixture_calendar.csv"
+    return pd.read_csv(fp, parse_dates=["date_sched", "date_played"])
+
+# ─────────────── FDR view materializer (optional, behind a flag) ────────────
+
+def maybe_write_fdr_view(
+    calendar_df: pd.DataFrame,
+    season: str,
+    features_root: Path,
+    team_version: str,
+    views_subdir: str = "views"
+) -> None:
+    """
+    Materialize a denormalized view with FDRs:
+      features/<views-subdir>/<SEASON>/fixture_calendar_with_fdr__<team_version>.csv
+
+    Join strategy (robust):
+      A) If team_form.csv has per-fixture FDR with both IDs:
+         required columns: ['date_played','home_id','away_id','fdr_home','fdr_away']
+         join on ['date_played','home_id','away_id'].
+      B) Else if team_form.csv stores per-team FDR keyed by (fpl_id, team_id):
+         required columns: ['fpl_id','team_id','fdr_home','fdr_away']
+         do two one-to-one merges:
+            home: on ['fpl_id','home_id'] → fdr_home
+            away: on ['fpl_id','away_id'] → fdr_away
+      If neither schema is found, the function logs an error and returns.
+    """
+    # Resolve team_form path; allow 'latest' to be treated as a folder
+    tf_dir = Path(features_root) / team_version
+    tf_path = tf_dir / season / "team_form.csv"
+    if not tf_path.exists():
+        logging.warning("%s • team_form.csv not found at %s; skip FDR view",
+                        season, tf_path)
+        return
+
+    tf = pd.read_csv(tf_path, low_memory=False)
+
+    # Normalize date column if present under 'game_date'
+    if "game_date" in tf.columns and "date_played" not in tf.columns:
+        tf = tf.rename(columns={"game_date": "date_played"})
+
+    # Lowercase IDs for safe equality
+    for c in ("home_id", "away_id", "team_id"):
+        if c in tf.columns:
+            tf[c] = tf[c].astype("string").str.lower()
+
+    for c in ("home_id", "away_id"):
+        if c in calendar_df.columns:
+            calendar_df[c] = calendar_df[c].astype("string").str.lower()
+
+    # Strategy A: full fixture-level FDR present
+    need_A = {"date_played", "home_id", "away_id", "fdr_home", "fdr_away"}
+    # Strategy B: per-team keyed by (fpl_id, team_id)
+    need_B = {"fpl_id", "team_id", "fdr_home", "fdr_away"}
+
+    merged = None
+    if need_A.issubset(set(tf.columns)):
+        key = ["date_played", "home_id", "away_id"]
+        subset = tf[key + ["fdr_home", "fdr_away"]].drop_duplicates(key)
+        try:
+            merged = calendar_df.merge(
+                subset, on=key, how="left", validate="one_to_one"
+            )
+            logging.info("%s • FDR view join (A: date+ids) OK; null FDR rows=%d",
+                         season, int(merged["fdr_home"].isna().sum()))
+        except Exception:
+            logging.exception("%s • join (A) failed; falling back to (B) if possible", season)
+
+    if merged is None and need_B.issubset(set(tf.columns)) and "fpl_id" in calendar_df.columns:
+        tf_b = tf[["fpl_id", "team_id", "fdr_home", "fdr_away"]].copy()
+        tf_b["team_id"] = tf_b["team_id"].astype("string").str.lower()
+        # home side
+        left = calendar_df.merge(
+            tf_b[["fpl_id", "team_id", "fdr_home"]].rename(columns={"team_id": "home_id"}),
+            on=["fpl_id", "home_id"], how="left", validate="one_to_one"
+        )
+        # away side
+        merged = left.merge(
+            tf_b[["fpl_id", "team_id", "fdr_away"]].rename(columns={"team_id": "away_id"}),
+            on=["fpl_id", "away_id"], how="left", validate="one_to_one"
+        )
+        logging.info("%s • FDR view join (B: fpl_id+team_id) OK; null FDR rows=%d",
+                     season, int(merged["fdr_home"].isna().sum()))
+    if merged is None:
+        logging.error(
+            "%s • team_form.csv lacks required columns for join. "
+            "Expected either %s or %s.",
+            season, sorted(need_A), sorted(need_B)
+        )
+        return
+
+    out_dir = Path(features_root) / views_subdir / season
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"fixture_calendar_with_fdr__{team_version}.csv"
+    merged.to_csv(out_path, index=False)
+    logging.info("%s • wrote FDR view → %s", season, out_path)
 
 # ─────────────────── single-season builder ─────────────────────────────────
 
@@ -65,16 +167,21 @@ def build_fixture_calendar(
     team_map_fp: Path,
     short_map_fp: Path,
     out_dir: Path,
+    *,
+    attach_fdr: str | None,
     features_root: Path,
-    features_version: str,
+    views_subdir: str,
     teams_csv: Path | None = None,
-    neutral_fdr: float = 3.0,
     force: bool = False,
 ) -> bool:
     dst_dir = out_dir / season
     out_csv = dst_dir / "fixture_calendar.csv"
     if out_csv.exists() and not force:
         logging.info("%s • already done – skip (use --force)", season)
+        # Optionally still write the view if requested (in case team_form updated)
+        if attach_fdr:
+            cal = read_fixture_calendar(out_dir, season)
+            maybe_write_fdr_view(cal, season, features_root, attach_fdr, views_subdir)
         return False
     if not (fpl_csv.is_file() and fb_csv.is_file()):
         logging.warning("%s • missing fixture or schedule csv – skipped", season)
@@ -151,7 +258,7 @@ def build_fixture_calendar(
     cal["home_id"] = np.where(hmask, cal["team_id"], cal["opponent_id"])
     cal["away_id"] = np.where(hmask, cal["opponent_id"], cal["team_id"])
 
-    # enforce lowercase hex strings (keeps None if missing)
+    # enforce lowercase hex strings (keeps <NA> if missing)
     for c in ("home_id", "away_id"):
         cal[c] = cal[c].astype("string").str.lower()
 
@@ -161,34 +268,7 @@ def build_fixture_calendar(
         cal.groupby("team")["date_played"].diff().dt.days.fillna(0).astype(int)
     )
 
-    # ── Inject FDR from team_form (expects fdr_home/fdr_away per team_id) ──
-    tfp = features_root / features_version / season / "team_form.csv"
-    if tfp.is_file():
-        try:
-            tf = pd.read_csv(tfp, usecols=["fpl_id", "team_id", "fdr_home", "fdr_away"]).copy()
-            tf["team_id"] = tf["team_id"].astype(str).str.lower()
-
-            # home-side FDR
-            tf_home = tf[["fpl_id", "team_id", "fdr_home"]].rename(columns={"team_id": "home_id"})
-            cal = cal.merge(tf_home, on=["fpl_id", "home_id"], how="left")
-
-            # away-side FDR
-            tf_away = tf[["fpl_id", "team_id", "fdr_away"]].rename(columns={"team_id": "away_id"})
-            cal = cal.merge(tf_away, on=["fpl_id", "away_id"], how="left")
-        except Exception:
-            logging.exception("%s • team_form merge failed; using neutral FDR", season)
-            if "fdr_home" not in cal.columns: cal["fdr_home"] = np.nan
-            if "fdr_away" not in cal.columns: cal["fdr_away"] = np.nan
-    else:
-        logging.warning("%s • team_form.csv not found; skipping FDR injection", season)
-        cal["fdr_home"] = np.nan
-        cal["fdr_away"] = np.nan
-
-    # Neutral fallback for any missing FDRs
-    cal["fdr_home"] = pd.to_numeric(cal["fdr_home"], errors="coerce").fillna(neutral_fdr)
-    cal["fdr_away"] = pd.to_numeric(cal["fdr_away"], errors="coerce").fillna(neutral_fdr)
-
-    # ── select & order for output ──
+    # ── select & order for output (PURE schedule; no FDR here) ──
     out = cal[[
         "fpl_id", "game_id", "gw_orig", "gw_played",
         "date_sched", "date_played", "days_since_last_game",
@@ -197,23 +277,28 @@ def build_fixture_calendar(
         "status", "sched_missing", "venue",
         "gf", "ga", "xga", "xg", "result", "poss",
         "is_promoted", "is_relegated",
-        "fdr_home", "fdr_away"
     ]].rename(columns={"game_id": "fbref_id"})
 
-    # ── write ──
+    # ── write base calendar ──
     dst_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = dst_dir / "fixture_calendar.csv"
     out.to_csv(out_csv, index=False)
     logging.info("%s • fixture_calendar.csv (%d rows)", season, len(out))
 
+    # Diagnostics
     if not missing.empty:
         missing.to_csv(dst_dir / "_manual_fbref_match.csv", index=False)
-        # Also surface any rows where home/away_id could not be derived
-        null_ids = out[out["home_id"].isna() | out["away_id"].isna()]
-        if not null_ids.empty:
-            null_ids.to_csv(dst_dir / "_missing_home_away_ids.csv", index=False)
-            logging.warning("%s • %d rows lack home_id/away_id (see _missing_home_away_ids.csv)",
-                            season, len(null_ids))
         logging.warning("%s • %d rows lack fbref_id (see _manual_fbref_match.csv)", season, len(missing))
+    null_ids = out[out["home_id"].isna() | out["away_id"].isna()]
+    if not null_ids.empty:
+        null_ids.to_csv(dst_dir / "_missing_home_away_ids.csv", index=False)
+        logging.warning("%s • %d rows lack home_id/away_id (see _missing_home_away_ids.csv)",
+                        season, len(null_ids))
+
+    # ── optionally write an FDR-attached view ──
+    if attach_fdr:
+        maybe_write_fdr_view(out, season, features_root, attach_fdr, views_subdir)
+
     return True
 
 # ───────────────────── batch driver ─────────────────────────────────────────
@@ -225,27 +310,28 @@ def run_batch(
     team_map: Path,
     short_map: Path,
     out_dir: Path,
+    *,
+    attach_fdr: str | None,
     features_root: Path,
-    features_version: str,
-    neutral_fdr: float,
+    views_subdir: str,
     force: bool
 ):
     for season in seasons:
-        fpl_csv = fpl_root / season / "fixtures.csv"
+        fpl_csv = fpl_root / season / "season" / "fixtures.csv"
         fb_csv = fbref_league / season / "team_match" / "schedule.csv"
         teams_csv = fpl_root / season / "teams.csv"
         try:
             build_fixture_calendar(
-                season,
-                fpl_csv,
-                fb_csv,
-                team_map,
-                short_map,
-                out_dir,
-                features_root,
-                features_version,
+                season=season,
+                fpl_csv=fpl_csv,
+                fb_csv=fb_csv,
+                team_map_fp=team_map,
+                short_map_fp=short_map,
+                out_dir=out_dir,
+                attach_fdr=attach_fdr,
+                features_root=features_root,
+                views_subdir=views_subdir,
                 teams_csv=teams_csv,
-                neutral_fdr=neutral_fdr,
                 force=force,
             )
         except Exception:
@@ -260,29 +346,40 @@ def main():
     ap.add_argument("--fbref-league-dir", type=Path, default=Path("data/processed/fbref/ENG-Premier League"))
     ap.add_argument("--team-map", type=Path, default=Path("data/processed/registry/_id_lookup_teams.json"))
     ap.add_argument("--short-map", type=Path, default=Path("data/config/teams.json"))
-    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/fixtures"))
+    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/fixtures"))
     ap.add_argument("--features-root", type=Path, default=Path("data/processed/features"))
-    ap.add_argument("--features-version", default="v2")  # align with team_form_builder default
-    ap.add_argument("--neutral-fdr", type=float, default=3.0, help="Fallback FDR when team_form is missing")
+    ap.add_argument("--attach-fdr", default=None,
+                    help="If set (e.g., 'latest' or 'v7'), also write "
+                         "features/<views-subdir>/<SEASON>/fixture_calendar_with_fdr__<version>.csv")
+    ap.add_argument("--views-subdir", default="views",
+                    help="Subfolder under features/ to store materialized views (default: 'views').")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
-    seasons = [args.season] if args.season else sorted(d.name for d in args.fpl_root.iterdir() if d.is_dir())
+    if not args.fpl_root.exists():
+        logging.error("FPL root not found: %s", args.fpl_root); return
+    try:
+        season_dirs = [d.name for d in args.fpl_root.iterdir() if d.is_dir()]
+    except FileNotFoundError:
+        season_dirs = []
+
+    seasons = [args.season] if args.season else sorted(season_dirs)
     if not seasons:
         logging.error("No seasons found"); return
+
     run_batch(
-        seasons,
-        args.fpl_root,
-        args.fbref_league_dir,
-        args.team_map,
-        args.short_map,
-        args.out_dir,
-        args.features_root,
-        args.features_version,
-        args.neutral_fdr,
-        args.force,
+        seasons=seasons,
+        fpl_root=args.fpl_root,
+        fbref_league=args.fbref_league_dir,
+        team_map=args.team_map,
+        short_map=args.short_map,
+        out_dir=args.out_dir,
+        attach_fdr=args.attach_fdr,
+        features_root=args.features_root,
+        views_subdir=args.views_subdir,
+        force=args.force,
     )
 
 if __name__ == "__main__":

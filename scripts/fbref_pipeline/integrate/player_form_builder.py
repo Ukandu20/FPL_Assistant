@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-r"""player_form_builder.py – schema v1.6
+r"""player_form_builder.py – schema v1.7
 (per-90, causal, venue-aware, binomial save% using saves & sot_against, venue-conditional z-scores)
 
 Versioning:
-• Writes under data/processed/features/<version>/<SEASON>/players_form.csv
+• Writes under data/processed/registry/features/<version>/<SEASON>/players_form.csv
 • --auto-version chooses next vN if not specified, e.g., v7
 • --write-latest adds a 'latest' pointer (symlink if supported; else LATEST_VERSION.txt)
 
@@ -11,16 +11,11 @@ Outputs (per season):
   players_form.csv
   player_form.meta.json
 
-What’s new vs v1.5:
-  • Robust schema coercion:
-      - Tolerates alias column names (e.g., yellow_cards → yellow_crd, was_home → venue).
-      - Derives date_played from kickoff_time/date.
-      - Derives save_pct if missing (saves/sot_against).
-      - Derives days_since_last if missing.
-      - Defaults/zeros harmlessly for rare-event cols (pk_won, own_goals…).
-  • Optional FDR fill for future fixtures (--fill-missing-fdr).
-  • Safer dtypes for gw/date; duplicate guard.
-  • Better logging of fills and coverage.
+What’s new vs v1.6:
+  • Registry paths by default (fixtures + features under data/processed/registry/...).
+  • Pass-through of optional FPL enrichments: price/xp/total_points/bonus/bps/clean_sheets.
+  • Added alias + retention for opponent_id.
+  • Safer numeric coercion for enrichments (no zero-filling for price/xp/points by default).
 """
 
 from __future__ import annotations
@@ -31,7 +26,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v1.6"
+SCHEMA_VERSION = "v1.7"
 
 # ───────────────────────── Canonical schema ─────────────────────────
 
@@ -39,27 +34,30 @@ OUTPUT_FILE = "players_form.csv"
 
 # Canonical names & alias map (left = canonical)
 ALIASES: Dict[str, List[str]] = {
-    "player_id": ["player_id", "fbref_player_id", "fpl_player_id"],
+    "player_id": ["player_id", "fbref_player_id", "fpl_player_id", "id_player"],
     "player": ["player", "player_name", "name"],
-    "pos": ["pos", "position", "position_short"],
-    "fbref_id": ["fbref_id", "fbref_url_id"],
-    "fpl_id": ["fpl_id", "fpl_code", "fpl_player_id"],
-    "team_id": ["team_id", "team_code", "team_short_id"],
+    "pos": ["pos", "position", "position_short", "fpl_pos"],
+    "fbref_id": ["fbref_id", "fbref_url_id", "game_id", "fixture_id_fbref"],
+    "fpl_id": ["fpl_id", "fpl_code", "fpl_fixture_id", "fixture_id_fpl"],
+    "team_id": ["team_id", "team_code", "team_short_id", "squad_id", "team_hex"],
+    "opponent_id": ["opponent_id", "opp_id"],
     "team": ["team", "team_name", "squad", "club"],
-    "gw_orig": ["gw_orig", "gw", "gameweek", "round"],
+    "gw_orig": ["gw_orig", "gw", "gameweek", "round", "event"],
     "date_played": ["date_played", "kickoff_time", "match_date", "date"],
     "venue": ["venue", "was_home", "is_home", "home"],
-    "minutes": ["minutes", "mins"],
+    "minutes": ["minutes", "mins", "time_played"],
     "days_since_last": ["days_since_last", "days_rest", "rest_days"],
-    "is_active": ["is_active", "active", "in_squad"],
+    "is_active": ["is_active", "active", "in_squad", "appearance", "played"],
+
+    # outcomes/context
     "yellow_crd": ["yellow_crd", "yellow", "yellow_cards", "yc"],
     "red_crd": ["red_crd", "red", "red_cards", "rc"],
-    "gf": ["gf", "goals_for", "team_goals_for"],
+    "gf": ["gf", "goals_for", "team_goals_for", "goals_for_team"],
     "ga": ["ga", "goals_against", "team_goals_against", "conceded"],
     "fdr_home": ["fdr_home", "fdr_h", "fixture_difficulty_home"],
     "fdr_away": ["fdr_away", "fdr_a", "fixture_difficulty_away"],
 
-    # attacking
+    # attacking/creation
     "gls": ["gls", "goals"],
     "shots": ["shots", "sh", "shots_total"],
     "sot": ["sot", "shots_on_target", "shots_ot"],
@@ -69,11 +67,11 @@ ALIASES: Dict[str, List[str]] = {
     "xag": ["xag", "xa", "expected_assists"],
     "pkatt": ["pkatt", "pens_att", "pen_att", "penalties_att"],
     "pk_scored": ["pk_scored", "pens_scored", "pen_scored"],
-    "pk_won": ["pk_won", "pens_won", "pen_won"],
+    "pk_won": ["pk_won", "pens_won", "pen_won", "pkwon"],
 
     # defensive / misc
     "blocks": ["blocks", "blk"],
-    "tkl": ["tkl", "tackles"],
+    "tkl": ["tkl", "tackles", "tklw"],
     "int": ["int", "interceptions"],
     "clr": ["clr", "clearances"],
     "own_goals": ["own_goals", "og"],
@@ -83,9 +81,17 @@ ALIASES: Dict[str, List[str]] = {
     "saves": ["saves", "sv"],
     "sot_against": ["sot_against", "shots_on_target_against", "on_target_against", "sota"],
     "save_pct": ["save_pct", "save%", "sv_pct"],
+
+    # optional FPL enrichments carried through
+    "price": ["price", "now_cost", "value"],
+    "xp": ["xp", "xP", "ep_this", "expected_points", "exp_points", "xp_this"],
+    "total_points": ["total_points", "points"],
+    "bonus": ["bonus"],
+    "bps": ["bps"],
+    "clean_sheets": ["clean_sheets", "cs", "cs_count"],
 }
 
-# Numeric canonicals we’ll coerce
+# Numeric canonicals we’ll coerce (and often fill). Enrichments handled separately.
 NUMERIC_BASE = [
     "minutes","days_since_last","is_active","yellow_crd","red_crd",
     "gf","ga","shots","sot","fdr_home","fdr_away",
@@ -95,7 +101,10 @@ NUMERIC_BASE = [
     "own_goals","recoveries",
 ]
 
-# Metrics config (same semantics as v1.5)
+# Enrichment numerics we coerce but do NOT default-fill (leave NaN if absent)
+NUMERIC_ENRICH = ["price","xp","total_points","bonus","bps","clean_sheets"]
+
+# Metrics config (same semantics)
 METRICS = {
     "gls": {"raw": ("gls", "npxg", "shots", "sot"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
     "ast": {"raw": ("ast", "xag"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
@@ -154,6 +163,106 @@ def _z_by_season_gw_venue(df: pd.DataFrame, col: str, venue_value: str) -> pd.Se
     out.loc[mask] = z
     out.loc[~mask] = np.nan
     return out
+
+def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.DataFrame:
+    """
+    Compute all z-score columns in bulk, per (season, gw_orig), with position
+    partitioning: GK metrics use GK-only pool; outfield metrics use OUT-only pool.
+    Defensive metrics are sign-flipped per METRICS[*]["flip_sign"].
+    Also computes venue-conditional z-scores (Home/Away) within those pools.
+    """
+    def flip_needed(col: str) -> bool:
+        # col looks like: "{mkey}_{raw}_p90[_home|_away]_roll"
+        mkey = col.split("_", 1)[0]
+        cfg = metrics_cfg.get(mkey, None)
+        return bool(cfg and cfg.get("flip_sign", False))
+
+    def applies_to(col: str) -> str:
+        mkey = col.split("_", 1)[0]
+        cfg = metrics_cfg.get(mkey, None)
+        return cfg.get("applies_to", "OUT") if cfg else "OUT"
+
+    # Partition
+    pos_series = feat["pos"].astype(str).str.upper()
+    mask_gk  = pos_series.eq("GK")
+    mask_out = ~mask_gk
+
+    # Identify roll columns
+    overall_cols = [c for c in feat.columns if c.endswith("_roll") and "_home_" not in c and "_away_" not in c]
+    home_cols    = [c for c in feat.columns if c.endswith("_home_roll")]
+    away_cols    = [c for c in feat.columns if c.endswith("_away_roll")]
+
+    gk_overall  = [c for c in overall_cols if applies_to(c) == "GK"]
+    out_overall = [c for c in overall_cols if applies_to(c) != "GK"]
+    gk_home     = [c for c in home_cols if applies_to(c) == "GK"]
+    out_home    = [c for c in home_cols if applies_to(c) != "GK"]
+    gk_away     = [c for c in away_cols if applies_to(c) == "GK"]
+    out_away    = [c for c in away_cols if applies_to(c) != "GK"]
+
+    newcols = {}
+
+    # Helper to compute z for a subset mask + columns, grouped by (season, gw_orig)
+    def compute_z(mask: pd.Series, cols: List[str]) -> pd.DataFrame:
+        if not cols:
+            return pd.DataFrame(index=feat.index)
+        sub = feat.loc[mask, cols]
+        z = sub.groupby([feat.loc[mask, "season"], feat.loc[mask, "gw_orig"]])[cols] \
+               .transform(lambda col: (col - col.mean()) / (col.std(ddof=0) if col.std(ddof=0) != 0 else np.nan)) \
+               .fillna(0.0)
+        return z
+
+    # Overall (GK-only pool / OUT-only pool)
+    z_gk_overall  = compute_z(mask_gk, gk_overall)
+    z_out_overall = compute_z(mask_out, out_overall)
+
+    for c in gk_overall:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_gk] = z_gk_overall[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+    for c in out_overall:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_out] = z_out_overall[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+
+    # Home-only
+    mask_home = feat["venue"].astype(str).eq("Home")
+    mask_gk_home  = mask_gk & mask_home
+    mask_out_home = mask_out & mask_home
+    z_gk_home  = compute_z(mask_gk_home, gk_home)
+    z_out_home = compute_z(mask_out_home, out_home)
+
+    for c in gk_home:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_gk_home] = z_gk_home[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+    for c in out_home:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_out_home] = z_out_home[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+
+    # Away-only
+    mask_away = feat["venue"].astype(str).eq("Away")
+    mask_gk_away  = mask_gk & mask_away
+    mask_out_away = mask_out & mask_away
+    z_gk_away  = compute_z(mask_gk_away, gk_away)
+    z_out_away = compute_z(mask_out_away, out_away)
+
+    for c in gk_away:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_gk_away] = z_gk_away[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+    for c in out_away:
+        s = pd.Series(np.nan, index=feat.index, dtype=float)
+        s.loc[mask_out_away] = z_out_away[c]
+        newcols[c + "_z"] = -s if flip_needed(c) else s
+
+    # Append all z-columns at once (prevents fragmentation)
+    if newcols:
+        zdf = pd.DataFrame(newcols, index=feat.index)
+        feat = pd.concat([feat, zdf], axis=1)
+        feat = feat.copy()  # optional defrag
+    return feat
+
 
 def _applicable_mask(pos_series: pd.Series, applies_to: str) -> pd.Series:
     return pos_series.eq("GK") if applies_to == "GK" else ~pos_series.eq("GK")
@@ -316,16 +425,12 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
 
     # venue normalization
     if "venue" not in df.columns:
-        # Try flags from alias pass (was_home/is_home/home)
-        # If still missing, set Unknown (will limit venue z but OK)
         df["venue"] = pd.NA
-    # Convert booleans/0-1 to Home/Away if needed
     if df["venue"].dropna().isin([0,1,True,False]).any():
         mask = df["venue"].notna()
         home_like = df.loc[mask, "venue"].astype(str).isin(["1","True","true","TRUE"])
         df.loc[mask, "venue"] = np.where(home_like, "Home", "Away")
         stats["venue_from_flag"] += int(mask.sum())
-    # Clip to Home/Away
     df.loc[~df["venue"].isin(["Home","Away"]), "venue"] = pd.NA
 
     # gw
@@ -334,12 +439,13 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
     df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
 
     # strings
-    for c in ["player_id","team_id","fbref_id","fpl_id","player","team","pos"]:
+    for c in ["player_id","team_id","opponent_id","fbref_id","fpl_id","player","team","pos"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+            df[c] = df[c].astype(str).str.strip().str.lower() if c.endswith("_id") else df[c].astype(str).str.strip()
 
     # 3) Numeric coercions
     _ensure_numeric(df, NUMERIC_BASE)
+    _ensure_numeric(df, NUMERIC_ENRICH)
 
     # Derive save_pct if missing/NaN and ingredients present
     if "save_pct" in df.columns:
@@ -353,15 +459,13 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
 
     # days_since_last if missing
     if "days_since_last" not in df.columns or df["days_since_last"].isna().any():
-        # recompute entirely for safety
         df = df.sort_values(["player_id","date_played","gw_orig"])
         grp = df.groupby("player_id", sort=False)["date_played"]
         dsl = grp.diff().dt.days
         df["days_since_last"] = dsl
-        # For first obs per player or NaT diffs → fallback 7 (neutral)
         fill_mask = df["days_since_last"].isna()
         stats["filled_days_since_last"] = int(fill_mask.sum())
-        df.loc[fill_mask, "days_since_last"] = 7.0
+        df.loc[fill_mask, "days_since_last"] = 7.0  # neutral fallback
     df["days_since_last"] = pd.to_numeric(df["days_since_last"], errors="coerce")
 
     # is_active default 1 if missing
@@ -430,7 +534,6 @@ def build_player_form(
     # Coerce schema & derive critical fields
     all_players, stats = _coerce_columns(raw_all, fill_missing_fdr=fill_missing_fdr)
 
-    # Keep only Home/Away rows for venue math; if unknown, we still carry but venue-z for those rows will be NaN
     unknown_venue = all_players["venue"].isna().sum()
     if unknown_venue:
         logging.warning("Rows with unknown venue: %d (venue-z unavailable for those rows)", unknown_venue)
@@ -507,15 +610,15 @@ def build_player_form(
         for c in overall_cols:
             z = _z_by_season_gw(feat, c)
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat[c + "_z"] = (-z if flip else z)
+            feat = _bulk_add_zscores_by_pos_gw(feat)
         for c in [c for c in feat.columns if c.endswith("_home_roll")]:
             z = _z_by_season_gw_venue(feat, c, "Home")
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat[c + "_z"] = (-z if flip else z)
+            feat = _bulk_add_zscores_by_pos_gw(feat)
         for c in [c for c in feat.columns if c.endswith("_away_roll")]:
             z = _z_by_season_gw_venue(feat, c, "Away")
             flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat[c + "_z"] = (-z if flip else z)
+            feat = _bulk_add_zscores_by_pos_gw(feat)
 
         # Write
         out_dir_season = version_dir / season
@@ -553,9 +656,11 @@ def build_player_form(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", help="e.g. 2024-2025; omit for batch over all folders under --fixtures-root")
-    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
-    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
+    ap.add_argument("--season", help="e.g. 2025-2026; omit for batch over all folders under --fixtures-root")
+    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"),
+                    help="Root containing <SEASON>/player_minutes_calendar.csv")
+    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"),
+                    help="Root for versioned features output")
     ap.add_argument("--version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
     ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
     ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
