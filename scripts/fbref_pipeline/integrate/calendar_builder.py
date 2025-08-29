@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 """
-calendar_builder.py  –  Batch-capable builder for player_minutes_calendar.csv
+calendar_builder.py  –  Batch-capable builder for player_fixture_calendar.csv
 (Optionally include price via --include-price, reading master/seasonal JSONs or merged_gws)
 
 Creates one “skinny” file per season with:
@@ -40,7 +40,7 @@ import numpy as np
 # ───────────────────────────── Canonical output schema (price is optional) ─────────────────────────
 OUT_COLS = [
     # Fixture identity / join keys
-    "fbref_id", "fpl_id", "gw_orig", "date_played",
+    "fbref_id", "fpl_id", "gw_orig", "gw_played","date_sched","date_played",
     "team_id", "opponent_id", "team", "venue", "was_home", "fdr_home", "fdr_away",
 
     # Player identity & availability
@@ -67,11 +67,11 @@ OUT_COLS = [
 ]
 
 def write_empty_minutes_calendar(season_dir: Path, include_price: bool) -> None:
-    out_fp = season_dir / "player_minutes_calendar.csv"
+    out_fp = season_dir / "player_fixture_calendar.csv"
     season_dir.mkdir(parents=True, exist_ok=True)
     cols = [c for c in OUT_COLS if include_price or c != "price"]
     pd.DataFrame(columns=cols).to_csv(out_fp, index=False)
-    logging.info("%s • wrote EMPTY player_minutes_calendar.csv", season_dir.name)
+    logging.info("%s • wrote EMPTY player_fixture_calendar.csv", season_dir.name)
 
 # ───────────────────────────── Season key helpers ─────────────────────────────
 
@@ -85,6 +85,25 @@ def season_long_to_short(season: str) -> str:
         return f"{y1}-{y2}"
     return s
 
+# ───────────────────────────── Auto-detect seasonal prices (added) ─────────────────────────────
+
+def _autodetect_price_json(season_key: str) -> Optional[Path]:
+    """
+    Try to find a seasonal prices JSON without requiring --price-seasonal.
+    Candidates:
+      data/processed/registry/prices/<season>.json
+      data/processed/registry/prices/<short-season>.json  (e.g., 2025-26.json)
+    """
+    root = Path("data/processed/registry/prices")
+    candidates = [
+        root / f"{season_key}.json",
+        root / f"{season_long_to_short(season_key)}.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
 # ───────────────────────────── FDR attachment helpers ─────────────────────────
 
 def _read_calendar_base(season_dir: Path) -> pd.DataFrame:
@@ -95,19 +114,6 @@ def _read_calendar_base(season_dir: Path) -> pd.DataFrame:
         if c in df.columns:
             df[c] = df[c].astype(str).str.lower()
     return df
-
-def _try_read_fdr_view(features_root: Path, season: str, team_version: str, views_subdir: str="views") -> Optional[pd.DataFrame]:
-    view_fp = Path(features_root) / views_subdir / season / f"fixture_calendar_with_fdr__{team_version}.csv"
-    if not view_fp.exists():
-        return None
-    view = pd.read_csv(view_fp, parse_dates=["date_played"], low_memory=False)
-    for c in ["home_id","away_id"]:
-        if c in view.columns:
-            view[c] = view[c].astype("string").str.lower()
-    cols = ["date_played","home_id","away_id","fdr_home","fdr_away"]
-    if not set(cols).issubset(view.columns):
-        return None
-    return view[cols].drop_duplicates(["date_played","home_id","away_id"])
 
 def _try_read_team_form(features_root: Path, season: str, team_version: str) -> Optional[pd.DataFrame]:
     tf_fp = Path(features_root) / team_version / season / "team_form.csv"
@@ -124,12 +130,7 @@ def _attach_fdr(cal: pd.DataFrame, features_root: Path, season: str, team_versio
     cal = cal.copy()
     if all(c in cal.columns for c in ["fdr_home","fdr_away"]):
         return cal
-    view = _try_read_fdr_view(features_root, season, team_version, views_subdir)
-    if view is not None and {"home_id","away_id","date_played"}.issubset(cal.columns):
-        before = len(cal)
-        cal = cal.merge(view, on=["date_played","home_id","away_id"], how="left", validate="m:1")
-        assert len(cal) == before, "Row count changed after FDR view merge"
-        return cal
+
     tf = _try_read_team_form(features_root, season, team_version)
     if tf is None:
         return cal
@@ -208,7 +209,7 @@ def load_minutes(season_dir: Path, fbref_root: Path) -> pd.DataFrame:
     df = df.merge(df_misc,on=["fbref_id","player_id","team_id"], how="left")
 
     for col in ("sot_against","saves","save_pct"):
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     for c in ["player_id","team_id","fbref_id"]:
         df[c] = df[c].astype(str).str.lower()
@@ -445,7 +446,7 @@ def build_minutes_calendar(
     if missing:
         msg = f"{season_key} • missing inputs → " + ", ".join(missing)
         if create_empty:
-            logging.warning(msg + " — creating EMPTY player_minutes_calendar.csv")
+            logging.warning(msg + " — creating EMPTY player_fixture_calendar.csv")
             write_empty_minutes_calendar(season_dir, include_price)
             return
         else:
@@ -489,6 +490,15 @@ def build_minutes_calendar(
 
     # ── PRICE (optional) ────────────────────────────────────────────────────
     if include_price:
+        # >>> Auto-detect seasonal prices if not explicitly provided
+        if price_seasonal is None:
+            auto = _autodetect_price_json(season_key)
+            if auto:
+                logging.info("[%s] Auto-detected seasonal prices: %s", season_key, auto)
+                price_seasonal = auto
+            else:
+                logging.info("[%s] No seasonal price JSON auto-detected; will try master and merged_gws.", season_key)
+
         pframes: List[pd.DataFrame] = []
         # 1) seasonal JSON (highest priority)
         ps = load_prices_seasonal_by_gw(price_seasonal) if price_seasonal else None
@@ -660,7 +670,7 @@ def main() -> None:
                     help="If set with --include-price, drop rows where price is NaN after merges.")
     ap.add_argument("--season", help="e.g., 2025-2026; omit to process all seasons under fixtures-root")
     ap.add_argument("--create-empty", action="store_true",
-                    help="If inputs are missing, still write an empty player_minutes_calendar.csv")
+                    help="If inputs are missing, still write an empty player_fixture_calendar.csv")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
