@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-r"""team_form_builder.py  – schema v2.8 (prefer flags for sides, diagnostics, FDR 2–5, hybrid bucketing, EWMA)
+r"""team_form_builder.py – schema v2.10
+(Fix A merge, prefer flags, identity-mismatch CSV logging, FDR 2–5, hybrid bucketing, EWMA)
 
 Inputs (per season):
   data/processed/fixtures/<SEASON>/fixture_calendar.csv
@@ -9,16 +10,19 @@ Inputs (per season):
   Optional identity columns:
     opponent_id, is_home, is_away, venue
 
-Changes (v2.8):
-• Prefer using explicit is_home flags to split sides; fall back to id equality if flags unusable.
-• Rich diagnostics when 0 fixtures form (counts of home/away rows).
-• FDR difficulty buckets are 2..5 (5 = hardest). Hybrid bucketing (GW<cutoff uses fixed z; else season pct).
-• Stable join keys; relaxed merge fallback to (season,fpl_id) if unique.
-• EWMA option for rolling stats (past-only; no leakage). Priors for early weeks.
+Highlights (v2.10):
+• Prefer provided flags (is_home/venue) to split sides; fall back to id equality only for missing flags.
+• Log rows where provided is_home conflicts with team_id vs home/away ids into logs/identity_mismatches.csv.
+• FDR difficulty 2..5 (5 = hardest). Hybrid bucketing: GW < cutoff uses fixed-z; else season percentiles.
+• Fixture formation falls back to pairing by (season,fpl_id) when side IDs are inconsistent (guarded).
+• Merge-back Fix A: when using relaxed merge keys (season,fpl_id), drop RHS home_id/away_id to avoid suffixes.
+• NEW: Drop any left-side placeholder fdr_* before merge; coalesce any _x/_y after merge; always materialize plain columns.
+• EWMA option for rolling stats (past-only; no leakage) + priors for early weeks.
 
 Outputs (per season):
   data/processed/features/<version>/<SEASON>/team_form.csv
   data/processed/features/<version>/<SEASON>/team_form.meta.json
+  data/processed/features/<version>/<SEASON>/logs/identity_mismatches.csv  (if any)
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from functools import reduce
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v2.8"
+SCHEMA_VERSION = "v2.10"
 
 # ───────────────────────── config ─────────────────────────
 
@@ -48,6 +52,8 @@ REQUIRED_BASE = {
 
 OUTPUT_FILE = "team_form.csv"
 META_FILE = "team_form.meta.json"
+LOG_SUBDIR = "logs"
+BAD_ROWS_FILE = "identity_mismatches.csv"
 
 LEGACY_FDR = [
     "fdr_home","fdr_away",
@@ -57,6 +63,7 @@ LEGACY_FDR = [
 ]
 
 DEFAULT_MEANS = {"gf": 1.40, "xg": 1.45, "ga": 1.40, "xga": 1.45, "poss": 50.0}
+FDR_COLS = ["fdr_att_home","fdr_def_home","fdr_home","fdr_att_away","fdr_def_away","fdr_away"]
 
 # ───────────────────────── version helpers ─────────────────────────
 
@@ -189,7 +196,7 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
         if c in df.columns:
             df[c] = df[c].astype(str).str.lower()
 
-    # Provided flags (highest priority)
+    # Highest priority: provided flags
     if "is_home" in df.columns:
         provided = pd.to_numeric(df["is_home"], errors="coerce").astype("Float64")
     elif "is_away" in df.columns:
@@ -199,7 +206,7 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
     else:
         provided = pd.Series(pd.NA, index=df.index, dtype="Float64")
 
-    # Fallback: infer from id equality only where provided is NA
+    # Fallback: ids
     eq_home = df["team_id"] == df["home_id"]
     eq_away = df["team_id"] == df["away_id"]
     inferred = pd.Series(
@@ -209,7 +216,7 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
 
     is_home = provided.where(provided.notna(), inferred)
 
-    # If still NaN, warn (or error strictly) and default to Home
+    # If still NaN → warn (or strict) and default Home
     n_amb = int(is_home.isna().sum())
     if n_amb:
         msg = f"{season}: {n_amb} rows ambiguous is_home (flags/ids missing)."
@@ -222,10 +229,10 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
     df["is_home"] = is_home
     df["venue"] = np.where(is_home == 1, "Home", "Away")
 
-    # Validate consistency where comparable (non-fatal)
+    # Non-fatal validation (we log; we do not mutate ids)
     bad_home = (is_home == 1) & (df["team_id"] != df["home_id"])
     bad_away = (is_home == 0) & (df["team_id"] != df["away_id"])
-    n_bad = int(bad_home.sum() + bad_away.sum())
+    n_bad = int((bad_home | bad_away).sum())
     if n_bad:
         msg = f"{season}: {n_bad} rows where provided is_home disagrees with team_id vs home/away ids."
         if strict:
@@ -233,43 +240,6 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
         logging.warning(msg + " Keeping given home_id/away_id; trusting provided flags for venue.")
 
     # Ensure opponent_id present
-    if "opponent_id" not in df.columns or _is_blank_series(df["opponent_id"]).any():
-        mask = _is_blank_series(df.get("opponent_id", pd.Series(index=df.index, dtype=object)))
-        df.loc[mask, "opponent_id"] = np.where(df.loc[mask, "is_home"] == 1,
-                                               df.loc[mask, "away_id"], df.loc[mask, "home_id"]).astype(str)
-    return df
-
-    if "is_home" in df.columns:
-        provided = pd.to_numeric(df["is_home"], errors="coerce")
-    elif "is_away" in df.columns:
-        provided = (pd.to_numeric(df["is_away"], errors="coerce") == 0).astype(float)
-    elif "venue" in df.columns:
-        provided = df["venue"].astype(str).str.lower().map({"home":1.0,"away":0.0})
-    else:
-        provided = pd.Series(np.nan, index=df.index, dtype=float)
-
-    is_home = pd.Series(inferred_is_home, dtype="Float64").where(~pd.isna(inferred_is_home), provided)
-    n_amb = int(is_home.isna().sum())
-    if n_amb:
-        msg = f"{season}: {n_amb} rows ambiguous is_home (ids/flags missing)."
-        if strict:
-            raise AssertionError(msg)
-        logging.warning(msg + " Setting venue='Home' by default for ambiguous rows.")
-        is_home = is_home.fillna(1.0)
-
-    is_home = is_home.astype("Int8")
-    df["is_home"] = is_home
-    df["venue"] = np.where(is_home == 1, "Home", "Away")
-
-    bad_home = (is_home == 1) & (df["team_id"] != df["home_id"])
-    bad_away = (is_home == 0) & (df["team_id"] != df["away_id"])
-    n_bad = int(bad_home.sum() + bad_away.sum())
-    if n_bad:
-        msg = f"{season}: {n_bad} rows where is_home disagrees with team_id vs home/away ids."
-        if strict:
-            raise AssertionError(msg)
-        logging.warning(msg + " Keeping given home_id/away_id; only fixing is_home/venue.")
-
     if "opponent_id" not in df.columns or _is_blank_series(df["opponent_id"]).any():
         mask = _is_blank_series(df.get("opponent_id", pd.Series(index=df.index, dtype=object)))
         df.loc[mask, "opponent_id"] = np.where(df.loc[mask, "is_home"] == 1,
@@ -303,18 +273,6 @@ def _load_all(fixtures_root: Path, seasons: List[str], strict_ids: bool) -> pd.D
         raise FileNotFoundError("No seasons could be loaded from fixtures_root")
 
     all_df = pd.concat(frames, ignore_index=True)
-    # quick sanity: mismatched namespaces
-    try:
-        t = all_df.assign(tid=all_df["team_id"].astype(str),
-                          hid=all_df["home_id"].astype(str),
-                          aid=all_df["away_id"].astype(str))
-        ok = ((t["tid"]==t["hid"]) | (t["tid"]==t["aid"]))
-        bad = int((~ok).sum()); frac = 100.0*bad/max(1,len(t))
-        if bad:
-            logging.debug("Identity sanity: %d rows (%.1f%%) where team_id != home_id/away_id.", bad, frac)
-    except Exception:
-        pass
-
     return all_df.sort_values(["season","date_key","fpl_id","home_id","away_id"]).reset_index(drop=True)
 
 # ───────────────────────── rolling (classic + EWMA) ─────────────────────────
@@ -381,7 +339,7 @@ def ewma_past_only(team_df: pd.DataFrame, val_col: str, halflife: float, tau: fl
 # ───────────────────────── FDR difficulty (buckets 2..5) ─────────────────────────
 
 def _bucket_fixed_z(series: pd.Series) -> pd.Series:
-    # map standardized to 2..5 using quartiles: [-0.6745, 0, 0.6745]
+    # Quartile cutpoints on ~N(0,1): [-0.6745, 0, 0.6745] → map to {2,3,4,5}
     bins = np.array([-0.67448975, 0.0, 0.67448975], dtype=float)
     return (np.digitize(series.to_numpy(), bins, right=True) + 2).astype(int)
 
@@ -449,26 +407,42 @@ def _compute_fixture_fdr_difficulty(
         "def_xga_away_roll_z":"away_def_xga_away_z",
     })
 
+    # Strict pair by full side ids first
     fixtures = pd.merge(
         home_rows, away_rows,
         on=["season","fpl_id","home_id","away_id"],
-        how="inner",
-        validate="one_to_one",
+        how="inner", validate="one_to_one",
         suffixes=("_home","_away")
     )
 
+    # Fallback: relax to (season,fpl_id) if each side unique by fpl_id
     if fixtures.empty:
-        n_home = int(len(home_rows)); n_away = int(len(away_rows))
-        logging.warning("%s: 0 fixtures formed (home_rows=%d, away_rows=%d). "
-                        "Likely namespace mismatch (team_id vs home/away) or only one side present.",
-                        season, n_home, n_away)
-        return pd.DataFrame(columns=[
-            "season","fpl_id","home_id","away_id","date_played",
-            "fdr_att_home","fdr_def_home","fdr_home",
-            "fdr_att_away","fdr_def_away","fdr_away"
-        ])
+        h_sz = home_rows.groupby(["season","fpl_id"]).size().max()
+        a_sz = away_rows.groupby(["season","fpl_id"]).size().max()
+        if h_sz == 1 and a_sz == 1:
+            fixtures = pd.merge(
+                home_rows.drop(columns=["home_id","away_id"], errors="ignore"),
+                away_rows.drop(columns=["home_id","away_id"], errors="ignore"),
+                on=["season","fpl_id"], how="inner", validate="one_to_one",
+                suffixes=("_home","_away")
+            )
+            # reattach canonical ids (first observed pair per (season,fpl_id))
+            ids = (df[["season","fpl_id","home_id","away_id"]]
+                     .drop_duplicates()
+                     .sort_values(["season","fpl_id"])
+                     .drop_duplicates(["season","fpl_id"], keep="first"))
+            fixtures = fixtures.merge(ids, on=["season","fpl_id"], how="left")
+            logging.warning("%s: used relaxed pairing by (season,fpl_id); side IDs looked inconsistent.", season)
+        else:
+            logging.warning("%s: 0 fixtures formed (home_rows=%d, away_rows=%d). Likely namespace/side-id issue.",
+                            season, len(home_rows), len(away_rows))
+            return pd.DataFrame(columns=[
+                "season","fpl_id","home_id","away_id","date_played",
+                "fdr_att_home","fdr_def_home","fdr_home",
+                "fdr_att_away","fdr_def_away","fdr_away"
+            ])
 
-    # bring gw_orig (for hybrid) if present
+    # bring gw_orig if present (hybrid bucketing)
     if "gw_orig" in df.columns:
         gw_h = df.loc[is_home_mask, ["fpl_id","gw_orig"]].rename(columns={"gw_orig":"gw_home"})
         gw_a = df.loc[is_away_mask, ["fpl_id","gw_orig"]].rename(columns={"gw_orig":"gw_away"})
@@ -482,7 +456,7 @@ def _compute_fixture_fdr_difficulty(
     fixtures["date_played"] = fixtures["date_played_home"].combine_first(fixtures["date_played_away"])
     fixtures.drop(columns=["date_played_home","date_played_away"], inplace=True)
 
-    # Difficulty components (5 = harder; buckets later converted 2..5)
+    # Difficulty components (scores; later bucket to 2..5)
     home_att_diff = - fixtures["away_def_xga_away_z"]
     home_def_diff = + fixtures["away_att_xg_away_z"]
     fixtures["fdr_att_home_score"] = home_att_diff
@@ -556,9 +530,28 @@ def build_team_form(
         logging.warning("%s • no rows after load – skipped", season)
         return False
 
+    # Numeric coercion
     for c in ["gf","ga","xg","xga","poss"]:
         cal[c] = pd.to_numeric(cal[c], errors="coerce")
 
+    # ---- Identity mismatch logging (for manual review) ----
+    try:
+        bad_home = (cal["is_home"] == 1) & (cal["team_id"] != cal["home_id"])
+        bad_away = (cal["is_home"] == 0) & (cal["team_id"] != cal["away_id"])
+        bad_mask = (bad_home | bad_away)
+        n_bad = int(bad_mask.sum())
+        if n_bad:
+            log_dir = dst_dir / LOG_SUBDIR
+            log_dir.mkdir(parents=True, exist_ok=True)
+            cols = ["season","fpl_id","gw_orig","team","is_home","team_id","home_id","away_id","date_played","date_sched"]
+            bad_df = cal.loc[bad_mask, [c for c in cols if c in cal.columns]].copy()
+            out_fp = log_dir / BAD_ROWS_FILE
+            bad_df.to_csv(out_fp, index=False)
+            logging.warning("%s: wrote %d identity mismatch rows to %s", season, n_bad, out_fp)
+    except Exception as e:
+        logging.debug("%s: mismatch logging skipped: %s", season, e)
+
+    # Priors
     cols_att = list(METRICS["att"]["raw"])
     cols_def = list(METRICS["def"]["raw"])
     cols_pos = list(METRICS["pos"]["raw"])
@@ -566,11 +559,15 @@ def build_team_form(
     priors_def = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_def, beta=0.7)
     priors_pos = build_team_priors(cal_all=cal_all, season=season, all_seasons=all_seasons, cols=cols_pos, beta=0.7)
 
+    # Rolling per team
     rows = []
     for tid, grp in cal.groupby("team_id", sort=False):
         tmp = grp.sort_values(["date_key","fpl_id"]).copy()
+
         roll_fun = (lambda col, p: ewma_past_only(tmp, col, halflife, tau, p, prior_matches)) if use_ewma \
                    else (lambda col, p: rolling_past_only(tmp, col, decay_window, tau, p, prior_matches))
+
+        # ATT
         pgf = float(priors_att.loc[tid, cols_att[0]]) if tid in priors_att.index else DEFAULT_MEANS["gf"]
         pxg = float(priors_att.loc[tid, cols_att[1]]) if tid in priors_att.index else DEFAULT_MEANS["xg"]
         gf_roll, gf_h, gf_a = roll_fun(cols_att[0], pgf)
@@ -579,6 +576,7 @@ def build_team_form(
         tmp["att_gf_home_roll"] = gf_h; tmp["att_gf_away_roll"] = gf_a
         tmp["att_xg_home_roll"] = xg_h; tmp["att_xg_away_roll"] = xg_a
 
+        # DEF
         pga = float(priors_def.loc[tid, cols_def[0]]) if tid in priors_def.index else DEFAULT_MEANS["ga"]
         pxga= float(priors_def.loc[tid, cols_def[1]]) if tid in priors_def.index else DEFAULT_MEANS["xga"]
         ga_roll, ga_h, ga_a = roll_fun(cols_def[0], pga)
@@ -587,6 +585,7 @@ def build_team_form(
         tmp["def_ga_home_roll"] = ga_h; tmp["def_ga_away_roll"] = ga_a
         tmp["def_xga_home_roll"] = xga_h; tmp["def_xga_away_roll"] = xga_a
 
+        # POS
         ppos = float(priors_pos.loc[tid, cols_pos[0]]) if tid in priors_pos.index else DEFAULT_MEANS["poss"]
         poss_roll, poss_h, poss_a = roll_fun(cols_pos[0], ppos)
         tmp["pos_poss_roll"] = poss_roll; tmp["pos_poss_home_roll"] = poss_h; tmp["pos_poss_away_roll"] = poss_a
@@ -595,33 +594,52 @@ def build_team_form(
 
     df = pd.concat(rows, ignore_index=True)
 
+    # Z-scores within (season, gw_orig)
     for c in ["att_xg_home_roll","att_xg_away_roll","def_xga_home_roll","def_xga_away_roll",
               "pos_poss_home_roll","pos_poss_away_roll"]:
         grp = df.groupby(["season","gw_orig"])[c]
         mean = grp.transform("mean"); std = grp.transform("std").replace(0, np.nan)
         df[c + "_z"] = ((df[c] - mean) / std).fillna(0.0)
 
+    # Drop legacy FDR cols before merge (idempotence)
     df = df.drop(columns=[c for c in LEGACY_FDR if c in df.columns], errors="ignore")
 
+    # Fixture-level FDR difficulty (one row per fixture)
     fixtures_fdr = _compute_fixture_fdr_difficulty(
         df, season, w_att=w_att, w_def=w_def, bucket_mode=bucket_mode, hybrid_cutoff=hybrid_cutoff
     )
 
-    if fixtures_fdr.empty:
-        for col in ["fdr_att_home","fdr_def_home","fdr_home",
-            "fdr_att_away","fdr_def_away","fdr_away"]:
-            if col not in df.columns:
-                df[col] = np.nan
-        logging.warning("[%s] FDR: formed 0 fixtures (one side missing?) — columns initialized to NaN.", season)
-    else:
+    # -------- Merge-back (Fix A + anti-suffixing) --------
+    # Ensure RHS safe: don't carry date_played to avoid _x/_y later
+    if not fixtures_fdr.empty:
         fixtures_fdr = fixtures_fdr.drop(columns=["date_played"], errors="ignore")
+
+    # Drop any left-side placeholder fdr_* before merge to prevent _x/_y
+    df = df.drop(columns=[c for c in FDR_COLS if c in df.columns], errors="ignore")
+
+    if not fixtures_fdr.empty:
         merge_keys = ["season","fpl_id","home_id","away_id"]
         gp = fixtures_fdr.groupby(["season","fpl_id"]).size()
         if (gp.max() == 1):
+            # RELAXED: drop RHS ids to avoid suffixing; keys: (season,fpl_id)
+            fixtures_fdr = fixtures_fdr.drop(columns=["home_id","away_id"], errors="ignore")
             merge_keys = ["season","fpl_id"]
             logging.debug("[%s] Using relaxed merge keys %s (fixtures_fdr unique by season+fpl_id).", season, merge_keys)
+
         df = df.merge(fixtures_fdr, on=merge_keys, how="left", validate="many_to_one")
 
+    # Coalesce any accidental _x/_y into canonical names
+    for col in FDR_COLS:
+        x, y = f"{col}_x", f"{col}_y"
+        if x in df.columns or y in df.columns:
+            left = df[x] if x in df.columns else pd.Series(index=df.index, dtype="float")
+            right = df[y] if y in df.columns else pd.Series(index=df.index, dtype="float")
+            df[col] = right.combine_first(left)
+            df.drop(columns=[c for c in [x,y] if c in df.columns], inplace=True)
+        elif col not in df.columns:
+            df[col] = np.nan  # ensure materialized
+
+    # Clean any date_played suffixes if present
     if ("date_played_x" in df.columns) or ("date_played_y" in df.columns):
         dx = pd.to_datetime(df.get("date_played_x"), errors="coerce")
         dy = pd.to_datetime(df.get("date_played_y"), errors="coerce")
@@ -629,23 +647,26 @@ def build_team_form(
             df["date_played"] = dx.combine_first(dy)
         df = df.drop(columns=[c for c in ["date_played_x","date_played_y"] if c in df.columns])
 
+    # Coverage (now safe: columns guaranteed to exist)
     cov = df[["fdr_home","fdr_away"]].notna().mean().mean() * 100
     logging.info("[%s] FDR coverage: %.1f%%", season, cov)
 
+    # Optional quick validation (played fixtures only) – guard for constant inputs
     played = pd.to_datetime(df.get("date_played"), errors="coerce").notna()
     if played.any():
-        try:
-            from scipy.stats import spearmanr
-            s_home = pd.to_numeric(df.loc[played, "fdr_home"], errors="coerce")
-            t_home = pd.to_numeric(df.loc[played, "def_xga_home_roll_z"], errors="coerce") - \
-                     pd.to_numeric(df.loc[played, "att_xg_home_roll_z"], errors="coerce")
-            ok = s_home.notna() & t_home.notna()
-            if ok.any():
+        s_home = pd.to_numeric(df.loc[played, "fdr_home"], errors="coerce")
+        t_home = (pd.to_numeric(df.loc[played, "def_xga_home_roll_z"], errors="coerce")
+                  - pd.to_numeric(df.loc[played, "att_xg_home_roll_z"], errors="coerce"))
+        ok = s_home.notna() & t_home.notna()
+        if ok.sum() >= 3 and s_home[ok].nunique() > 1 and t_home[ok].nunique() > 1:
+            try:
+                from scipy.stats import spearmanr
                 r, _ = spearmanr(s_home[ok], t_home[ok], nan_policy="omit")
                 logging.info("[%s] Quick check (home side): Spearman(FDR, proxy target) = %.3f", season, r)
-        except Exception as e:
-            logging.debug("Validation skipped: %s", e)
+            except Exception as e:
+                logging.debug("Validation skipped: %s", e)
 
+    # Persist/ensure opponent_id using authoritative calendar ids (left side)
     if "opponent_id" not in df.columns:
         df["opponent_id"] = np.where(df["team_id"] == df["home_id"], df["away_id"], df["home_id"]).astype(str)
     else:
@@ -653,15 +674,16 @@ def build_team_form(
         df.loc[opp_blank, "opponent_id"] = np.where(df.loc[opp_blank, "team_id"] == df.loc[opp_blank, "home_id"],
                                                     df.loc[opp_blank, "away_id"], df.loc[opp_blank, "home_id"]).astype(str)
 
+    # Write
     dst_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(dst_csv, index=False)
 
+    # Meta
     existing_meta = load_json(meta_fp)
     build_no = int(existing_meta.get("build_no", 0)) + 1 if (reuse_version and meta_fp.exists()) else 1
 
     features_list = sorted(
-        [c for c in df.columns if c.endswith(("_roll","_roll_z"))] +
-        ["fdr_att_home","fdr_def_home","fdr_home","fdr_att_away","fdr_def_away","fdr_away"]
+        [c for c in df.columns if c.endswith(("_roll","_roll_z"))] + FDR_COLS
     )
     meta = {
         "schema": SCHEMA_VERSION,
@@ -683,6 +705,9 @@ def build_team_form(
             "rows": int(len(df)),
             "fixtures_unique": int(fixtures_fdr.shape[0]) if not fixtures_fdr.empty else 0,
             "last_fixture_date": str(pd.to_datetime(df.get("date_played")).max())
+        },
+        "logs": {
+            "identity_mismatches_csv": str((dst_dir / LOG_SUBDIR / BAD_ROWS_FILE).as_posix())
         },
         "future_season_ready": True
     }
