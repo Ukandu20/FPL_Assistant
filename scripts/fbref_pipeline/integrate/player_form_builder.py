@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-r"""player_form_builder.py – schema v1.7
-(per-90, causal, venue-aware, binomial save% using saves & sot_against, venue-conditional z-scores)
+r"""player_form_builder.py – schema v1.8
+(per-90, causal, venue-aware, EWMA/rolling window, binomial save% using saves & sot_against,
+position-weighted composite form scores)
 
 Versioning:
 • Writes under data/processed/registry/features/<version>/<SEASON>/players_form.csv
@@ -11,11 +12,14 @@ Outputs (per season):
   players_form.csv
   player_form.meta.json
 
-What’s new vs v1.6:
-  • Registry paths by default (fixtures + features under data/processed/registry/...).
-  • Pass-through of optional FPL enrichments: price/xp/total_points/bonus/bps/clean_sheets.
-  • Added alias + retention for opponent_id.
-  • Safer numeric coercion for enrichments (no zero-filling for price/xp/points by default).
+What's new vs v1.7:
+  • Added EWMA option (past-only; no leakage) mirroring team_form_builder semantics.
+  • Introduced position-weighted composite form scores (overall/home/away) with configurable
+    weights per group (ATT/CRE/DEF/GK) for GK/DEF/MID/FWD.
+  • Single-pass z-score engine (GK vs OUT pools) + venue-conditional z-scores.
+  • Reduced redundant z-score recomputation; fixed minor inefficiency.
+  • CLI parity: --ewma, --halflife, --pos-weights "GK:gk=1;DEF:def=.6,att=.2,cre=.2;MID:att=.4,cre=.4,def=.2;FWD:att=.6,cre=.3,def=.1".
+  • Meta JSON now records ewma params and pos-weights.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "v1.7"
+SCHEMA_VERSION = "v1.8"
 
 # ───────────────────────── Canonical schema ─────────────────────────
 
@@ -104,15 +108,34 @@ NUMERIC_BASE = [
 # Enrichment numerics we coerce but do NOT default-fill (leave NaN if absent)
 NUMERIC_ENRICH = ["price","xp","total_points","bonus","bps","clean_sheets"]
 
-# Metrics config (same semantics)
+# Metric families (same semantics)
+# mkey -> config; raw stats are per-90'd before rolling.
 METRICS = {
     "gls": {"raw": ("gls", "npxg", "shots", "sot"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
     "ast": {"raw": ("ast", "xag"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
     "def": {"raw": ("blocks", "tkl", "int", "own_goals", "recoveries", "clr"),
-            "applies_to": "OUT", "flip_sign": True, "bayes_alpha": {"own_goals": 6}},
+             "applies_to": "OUT", "flip_sign": True, "bayes_alpha": {"own_goals": 6}},
     "gk" : {"raw": ("saves", "sot_against"),
-            "applies_to": "GK", "flip_sign": True, "bayes_alpha": {}},
+             "applies_to": "GK", "flip_sign": True, "bayes_alpha": {}},
     "pens":{"raw": ("pk_won",), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {"pk_won": 6}},
+}
+
+# Composite groups built from z-scores of the above metric families
+# Each group consumes the z-scores of selected rolled series; internal weights are equal by default.
+GROUP_DEFINITION: Dict[str, List[Tuple[str, str]]] = {
+    # (mkey, raw)
+    "ATT": [("gls","gls"), ("gls","npxg"), ("gls","sot")],
+    "CRE": [("ast","ast"), ("ast","xag")],
+    "DEF": [("def","tkl"), ("def","int"), ("def","blocks"), ("def","recoveries")],  # own_goals already sign-flipped, excluded here
+    "GK":  [("gk","gk_save_pct_p90")],  # special case naming; see below
+}
+
+# Default position → group weights (sum to 1 per position). CLI can override.
+DEFAULT_POS_WEIGHTS = {
+    "GK":  {"GK": 1.00},
+    "DEF": {"DEF": 0.60, "ATT": 0.20, "CRE": 0.20},
+    "MID": {"ATT": 0.30, "CRE": 0.40, "DEF": 0.30},
+    "FWD": {"ATT": 0.60, "CRE": 0.30, "DEF": 0.10},
 }
 
 # ───────────────────────── Helpers ─────────────────────────
@@ -156,7 +179,7 @@ def _z_by_season_gw(df: pd.DataFrame, col: str) -> pd.Series:
 def _z_by_season_gw_venue(df: pd.DataFrame, col: str, venue_value: str) -> pd.Series:
     mask = df["venue"].eq(venue_value)
     out = pd.Series(np.nan, index=df.index, dtype=float)
-    grp = df.loc[mask].groupby(["season","gw_orig"])[col]
+    grp = df.loc[mask].groupby(["season","gw_orig"]) [col]
     mu  = grp.transform("mean")
     sd  = grp.transform("std").replace(0, np.nan)
     z   = ((df.loc[mask, col] - mu) / sd).fillna(0.0)
@@ -182,7 +205,6 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
         cfg = metrics_cfg.get(mkey, None)
         return cfg.get("applies_to", "OUT") if cfg else "OUT"
 
-    # Partition
     pos_series = feat["pos"].astype(str).str.upper()
     mask_gk  = pos_series.eq("GK")
     mask_out = ~mask_gk
@@ -201,73 +223,62 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
 
     newcols = {}
 
-    # Helper to compute z for a subset mask + columns, grouped by (season, gw_orig)
     def compute_z(mask: pd.Series, cols: List[str]) -> pd.DataFrame:
         if not cols:
             return pd.DataFrame(index=feat.index)
         sub = feat.loc[mask, cols]
-        z = sub.groupby([feat.loc[mask, "season"], feat.loc[mask, "gw_orig"]])[cols] \
-               .transform(lambda col: (col - col.mean()) / (col.std(ddof=0) if col.std(ddof=0) != 0 else np.nan)) \
-               .fillna(0.0)
+        # group by (season, gw_orig) using aligned index
+        keys = [feat.loc[mask, "season"], feat.loc[mask, "gw_orig"]]
+        def _tx(col: pd.Series) -> pd.Series:
+            mu = col.groupby(keys).transform("mean")
+            sd = col.groupby(keys).transform("std").replace(0, np.nan)
+            return ((col - mu) / sd).fillna(0.0)
+        z = sub.apply(_tx, axis=0)
         return z
 
-    # Overall (GK-only pool / OUT-only pool)
+    # Overall
     z_gk_overall  = compute_z(mask_gk, gk_overall)
     z_out_overall = compute_z(mask_out, out_overall)
-
     for c in gk_overall:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_gk] = z_gk_overall[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_gk] = z_gk_overall[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
     for c in out_overall:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_out] = z_out_overall[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_out] = z_out_overall[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
 
-    # Home-only
+    # Home
     mask_home = feat["venue"].astype(str).eq("Home")
-    mask_gk_home  = mask_gk & mask_home
-    mask_out_home = mask_out & mask_home
-    z_gk_home  = compute_z(mask_gk_home, gk_home)
-    z_out_home = compute_z(mask_out_home, out_home)
-
+    z_gk_home  = compute_z(mask_gk & mask_home, gk_home)
+    z_out_home = compute_z(mask_out & mask_home, out_home)
     for c in gk_home:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_gk_home] = z_gk_home[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_gk & mask_home] = z_gk_home[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
     for c in out_home:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_out_home] = z_out_home[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_out & mask_home] = z_out_home[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
 
-    # Away-only
+    # Away
     mask_away = feat["venue"].astype(str).eq("Away")
-    mask_gk_away  = mask_gk & mask_away
-    mask_out_away = mask_out & mask_away
-    z_gk_away  = compute_z(mask_gk_away, gk_away)
-    z_out_away = compute_z(mask_out_away, out_away)
-
+    z_gk_away  = compute_z(mask_gk & mask_away, gk_away)
+    z_out_away = compute_z(mask_out & mask_away, out_away)
     for c in gk_away:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_gk_away] = z_gk_away[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_gk & mask_away] = z_gk_away[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
     for c in out_away:
-        s = pd.Series(np.nan, index=feat.index, dtype=float)
-        s.loc[mask_out_away] = z_out_away[c]
+        s = pd.Series(np.nan, index=feat.index, dtype=float); s.loc[mask_out & mask_away] = z_out_away[c]
         newcols[c + "_z"] = -s if flip_needed(c) else s
 
-    # Append all z-columns at once (prevents fragmentation)
     if newcols:
         zdf = pd.DataFrame(newcols, index=feat.index)
         feat = pd.concat([feat, zdf], axis=1)
-        feat = feat.copy()  # optional defrag
+        feat = feat.copy()
     return feat
 
 
 def _applicable_mask(pos_series: pd.Series, applies_to: str) -> pd.Series:
-    return pos_series.eq("GK") if applies_to == "GK" else ~pos_series.eq("GK")
+    return pos_series.str.upper().eq("GK") if applies_to == "GK" else ~pos_series.str.upper().eq("GK")
 
-# Rolling mean with venue shrinkage + prior blending
+# Rolling mean with venue shrinkage + prior blending (hard window)
 def _rolling_past_only_bayes_mean(
     vals: np.ndarray, venues: np.ndarray, window: int, tau: float,
     prior_val: Optional[float], prior_matches: int, bayes_alpha: float = 0.0
@@ -301,6 +312,40 @@ def _rolling_past_only_bayes_mean(
         roll_a[i] = lam_a*mean_a + (1-lam_a)*base if not np.isnan(base) else np.nan
     return roll, roll_h, roll_a
 
+# EWMA variant (past-only, halflife)
+def _ewma_past_only_bayes_mean(
+    vals: np.ndarray, venues: np.ndarray, halflife: float, tau: float,
+    prior_val: Optional[float], prior_matches: int, bayes_alpha: float = 0.0
+) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
+    n = len(vals)
+    v = vals.copy(); v = np.where(np.isnan(v), 0.0, v)
+    ven = venues.astype(str)
+    alpha = 1 - 2 ** (-1.0 / max(halflife, 1e-9))
+    m_all = prior_val if prior_val is not None else 0.0
+    m_h = m_all; m_a = m_all
+    cnt_all = 0; cnt_h = 0; cnt_a = 0
+    roll  = np.full(n, np.nan); roll_h = np.full(n, np.nan); roll_a = np.full(n, np.nan)
+    for i in range(n):
+        lam_h = cnt_h/(cnt_h+tau) if (cnt_h+tau)>0 else 0.0
+        lam_a = cnt_a/(cnt_a+tau) if (cnt_a+tau)>0 else 0.0
+        roll[i]  = m_all
+        roll_h[i]= lam_h*m_h + (1-lam_h)*m_all
+        roll_a[i]= lam_a*m_a + (1-lam_a)*m_all
+        # update state with current obs
+        x = v[i]
+        m_all = (1-alpha)*m_all + alpha*x; cnt_all += 1
+        if ven[i] == "Home":
+            m_h = (1-alpha)*m_h + alpha*x; cnt_h += 1
+        else:
+            m_a = (1-alpha)*m_a + alpha*x; cnt_a += 1
+        if prior_val is not None and cnt_all <= prior_matches:
+            w = 1.0 - (cnt_all / max(1, prior_matches))
+            m_all = (1-w)*m_all + w*prior_val
+            m_h   = (1-w)*m_h   + w*prior_val
+            m_a   = (1-w)*m_a   + w*prior_val
+        # optional extra shrink to prior each step (alpha-like); skipped here; bayes_alpha retained for symmetry
+    return roll, roll_h, roll_a
+
 # Beta-binomial posterior save% with venue shrinkage
 def _rolling_past_only_binomial_savepct(
     saves: np.ndarray, shots: np.ndarray, venues: np.ndarray,
@@ -326,6 +371,43 @@ def _rolling_past_only_binomial_savepct(
         post_h[i] = lam_h*post_home + (1-lam_h)*post_overall
         post_a[i] = lam_a*post_away + (1-lam_a)*post_overall
     return post, post_h, post_a
+
+# EWMA version of the above (approximate sequential beta posterior with EMA on rates)
+def _ewma_binomial_savepct(
+    saves: np.ndarray, shots: np.ndarray, venues: np.ndarray,
+    halflife: float, tau: float, prior_p: float, prior_shots: float
+) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
+    n = len(saves)
+    post  = np.full(n, np.nan); post_h = np.full(n, np.nan); post_a = np.full(n, np.nan)
+    sv = np.nan_to_num(saves.astype(float), nan=0.0); st = np.nan_to_num(shots.astype(float), nan=0.0)
+    alpha = 1 - 2 ** (-1.0 / max(halflife, 1e-9))
+    ven = venues.astype(str)
+    # Start with prior as pseudo-rate
+    p_all = prior_p; p_h = prior_p; p_a = prior_p
+    cnt_all = 0; cnt_h = 0; cnt_a = 0
+    warmup_matches = int(prior_shots) if prior_shots is not None else 0
+    for i in range(n):
+        lam_h = cnt_h/(cnt_h+tau) if (cnt_h+tau)>0 else 0.0
+        lam_a = cnt_a/(cnt_a+tau) if (cnt_a+tau)>0 else 0.0
+        post[i]  = p_all
+        post_h[i]= lam_h*p_h + (1-lam_h)*p_all
+        post_a[i]= lam_a*p_a + (1-lam_a)*p_all
+        # Update estimate using observed save rate for this match if shots>0, else decay
+        x = sv[i]; N = st[i]
+        obs = (x / N) if N > 0 else p_all
+        p_all = (1-alpha)*p_all + alpha*obs; cnt_all += 1
+        if ven[i] == "Home":
+            p_h = (1-alpha)*p_h + alpha*obs; cnt_h += 1
+        else:
+            p_a = (1-alpha)*p_a + alpha*obs; cnt_a += 1
+        if cnt_all <= warmup_matches:
+                    # reuse prior_shots as a soft warm-up horizon to blend prior strongly
+            w = 1.0 - (cnt_all / max(1, warmup_matches))
+            p_all = (1-w)*p_all + w*prior_p
+            p_h   = (1-w)*p_h   + w*prior_p
+            p_a   = (1-w)*p_a   + w*prior_p
+    return post, post_h, post_a
+
 
 def _compute_last_season_priors(all_players: pd.DataFrame, last_season: Optional[str]) -> Dict[str, Dict[str, float]]:
     priors: Dict[str, Dict[str, float]] = {}
@@ -375,16 +457,21 @@ def _compute_last_season_priors(all_players: pd.DataFrame, last_season: Optional
     priors["_SAVE_PCT_"] = {"p0": p0_pos, "s0": s0_pos}
     return priors
 
+
 def _get_prior_p90(priors: Dict[str, Dict[str, float]], pid: str, raw: str, is_gk: bool) -> Optional[float]:
     key = f"{raw}_p90"
     v = priors.get(pid, {}).get(key)
-    if not pd.isna(v): return float(v)
+    if v is not None and not pd.isna(v):
+        return float(v)
     pos_key = "_POS_GK_" if is_gk else "_POS_OUT_"
     v2 = priors.get(pos_key, {}).get(key)
-    if not pd.isna(v2): return float(v2)
+    if v2 is not None and not pd.isna(v2):
+        return float(v2)
     v3 = priors.get("_GLOBAL_", {}).get(key)
-    if not pd.isna(v3): return float(v3)
+    if v3 is not None and not pd.isna(v3):
+        return float(v3)
     return None
+
 
 def _get_savepct_prior(priors: Dict[str, Dict[str, float]], pid: str) -> Tuple[float,float]:
     d = priors.get(pid, {})
@@ -394,6 +481,20 @@ def _get_savepct_prior(priors: Dict[str, Dict[str, float]], pid: str) -> Tuple[f
     return float(grp.get("p0", 0.70)), float(grp.get("s0", 80.0))
 
 # ───────────────────────── Schema coercion ─────────────────────────
+
+def _normalize_pos_label(s: pd.Series) -> pd.Series:
+    # Map various forms to {GK, DEF, MID, FWD}
+    m = {
+        "gk":"GK","goalkeeper":"GK",
+        "d":"DEF","def":"DEF","defender":"DEF",
+        "m":"MID","mid":"MID","midfielder":"MID",
+        "f":"FWD","fw":"FWD","fwd":"FWD","forward":"FWD","striker":"FWD",
+    }
+    x = s.astype(str).str.strip().str.lower().map(m).fillna(s.astype(str).str.upper())
+    # fallback: any non-GK and not one of DEF/MID/FWD → treat as OUT but preserve original
+    x = x.where(x.isin(["GK","DEF","MID","FWD"]), s.astype(str).str.upper())
+    return x
+
 
 def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tuple[pd.DataFrame, Dict[str,int]]:
     """
@@ -441,7 +542,9 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
     # strings
     for c in ["player_id","team_id","opponent_id","fbref_id","fpl_id","player","team","pos"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip().str.lower() if c.endswith("_id") else df[c].astype(str).str.strip()
+            df[c] = df[c].astype(str).str.strip()
+    if "pos" in df.columns:
+        df["pos"] = _normalize_pos_label(df["pos"])  # normalize to GK/DEF/MID/FWD if possible
 
     # 3) Numeric coercions
     _ensure_numeric(df, NUMERIC_BASE)
@@ -504,6 +607,113 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
 
     return df.reset_index(drop=True), stats
 
+# ───────────────────────── Composite helpers ─────────────────────────
+
+def _parse_pos_weights(s: Optional[str]) -> Dict[str, Dict[str, float]]:
+    if not s:
+        return DEFAULT_POS_WEIGHTS
+    # Format: "GK:gk=1;DEF:def=.6,att=.2,cre=.2;MID:att=.4,cre=.4,def=.2;FWD:att=.6,cre=.3,def=.1"
+    out: Dict[str, Dict[str, float]] = {"GK":{},"DEF":{},"MID":{},"FWD":{}}
+    for block in s.split(";"):
+        block = block.strip()
+        if not block: continue
+        if ":" not in block: continue
+        pos, rest = block.split(":", 1)
+        pos = pos.strip().upper()
+        if pos not in out: continue
+        wmap: Dict[str,float] = {}
+        for kv in rest.split(","):
+            kv = kv.strip()
+            if not kv or "=" not in kv: continue
+            g, val = kv.split("=", 1)
+            g = g.strip().upper()
+            try:
+                wmap[g] = float(val)
+            except Exception:
+                pass
+        if wmap:
+            # normalize to sum 1
+            ssum = sum(wmap.values())
+            if ssum > 0:
+                for k in list(wmap.keys()): wmap[k] = wmap[k]/ssum
+            out[pos] = wmap
+    # fill missing with defaults
+    for pos in out:
+        if not out[pos]:
+            out[pos] = DEFAULT_POS_WEIGHTS.get(pos, {})
+    return out
+
+def _parse_halflife_by_pos(s: Optional[str], default_hl: float) -> Dict[str, float]:
+    """
+    Parse --halflife-by-pos like 'GK:4,DEF:3.5,MID:3,FWD:2.5'.
+    Missing/invalid entries fall back to default_hl.
+    """
+    out = {"GK": default_hl, "DEF": default_hl, "MID": default_hl, "FWD": default_hl}
+    if not s:
+        return out
+    for kv in s.split(","):
+        kv = kv.strip()
+        if not kv or ":" not in kv:
+            continue
+        k, v = kv.split(":", 1)
+        k = k.strip().upper()
+        if k in out:
+            try:
+                out[k] = float(v)
+            except Exception:
+                pass
+    return out
+
+
+def _composite_from_groups(feat: pd.DataFrame, pos_weights: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+    df = feat.copy()
+
+    def _avg_of_cols(cols: List[str]) -> pd.Series:
+        if not cols: return pd.Series(np.nan, index=df.index)
+        arr = df[cols].astype(float)
+        return arr.mean(axis=1, skipna=True)
+
+    def zcol(mkey: str, raw: str, suffix: str) -> str:
+        # Normal rolled z columns are f"{mkey}_{raw}_p90{suffix}_roll_z" except the GK save% which we named 'gk_save_pct_p90'
+        return f"{mkey}_{raw}_p90{suffix}_roll_z"
+
+    # Build group-level z means (overall/home/away)
+    group_cols = {}
+    for grp, members in GROUP_DEFINITION.items():
+        for suffix, tag in [("", grp.lower()), ("_home", grp.lower()+"_home"), ("_away", grp.lower()+"_away")]:
+            cols = []
+            for (mkey, raw) in members:
+                # special-case GK save%
+                if grp == "GK" and raw == "gk_save_pct_p90":
+                    col = f"gk_save_pct_p90{suffix}_roll_z"  # produced by z-bulk on the rolled save% series
+                else:
+                    col = zcol(mkey, raw, suffix)
+                if col in df.columns:
+                    cols.append(col)
+            group_cols[(grp, suffix)] = cols
+            df[f"form_{tag}_z"] = _avg_of_cols(cols)
+
+    # Composite per position using weights
+    pos_norm = _normalize_pos_label(df["pos"]) if "pos" in df.columns else pd.Series("OUT", index=df.index)
+
+    def _score_row(i: int, suffix: str) -> float:
+        pos = pos_norm.iat[i]
+        w = pos_weights.get(pos, DEFAULT_POS_WEIGHTS.get(pos, {}))
+        total = 0.0; got = 0.0
+        for grp, weight in w.items():
+            col = f"form_{grp.lower()}{suffix}_z"
+            val = df.iloc[i][col] if col in df.columns else np.nan
+            if not pd.isna(val):
+                total += weight * float(val)
+                got += weight
+        if got == 0: return np.nan
+        return total  # weights already sum≈1
+
+    for suffix, label in [("", "form_score_z"), ("_home", "form_score_home_z"), ("_away", "form_score_away_z")]:
+        df[label] = [ _score_row(i, suffix) for i in range(len(df)) ]
+
+    return df
+
 # ───────────────────────── Core build ─────────────────────────
 
 def build_player_form(
@@ -515,12 +725,16 @@ def build_player_form(
     force: bool,
     prior_matches: int,
     fill_missing_fdr: Optional[float],
+    use_ewma: bool,
+    halflife: float,
+    pos_weights: Dict[str, Dict[str, float]],
+    halflife_by_pos: Dict[str, float],
 ) -> None:
     frames = []
     for s in seasons:
-        fp = fixtures_root / s / "player_minutes_calendar.csv"
+        fp = fixtures_root / s / "player_fixture_calendar.csv"
         if not fp.is_file():
-            logging.warning("%s • missing player_minutes_calendar.csv – skipped", s); continue
+            logging.warning("%s • missing player_fixture_calendar.csv – skipped", s); continue
         try:
             df = pd.read_csv(fp, parse_dates=["date_played"], low_memory=False)
         except Exception:
@@ -570,7 +784,10 @@ def build_player_form(
         out_rows: List[pd.DataFrame] = []
         for pid, g in cur.groupby("player_id", sort=False):
             g = g.sort_values(["date_played","gw_orig"]).copy()
-            is_gk = bool((g["pos"] == "GK").iloc[0]) if len(g) else False
+            pos_label = _normalize_pos_label(g["pos"]).mode().iat[0] if len(g) else "MID"
+            is_gk = (pos_label == "GK")
+            # Halflife can vary by position; fallback to global --halflife
+            hl = halflife_by_pos.get(pos_label, halflife)
 
             for mkey, cfg in METRICS.items():
                 applies_mask = _applicable_mask(g["pos"], cfg["applies_to"]).to_numpy()
@@ -578,21 +795,34 @@ def build_player_form(
                     col = f"{raw}_p90"; arr = np.where(applies_mask, g[col].to_numpy(), np.nan)
                     prior_val = _get_prior_p90(priors, str(pid), raw, is_gk)
                     alpha = float(cfg.get("bayes_alpha", {}).get(raw, 0.0))
-                    roll, rh, ra = _rolling_past_only_bayes_mean(
-                        vals=arr, venues=g["venue"].astype(str).to_numpy(),
-                        window=window, tau=tau, prior_val=prior_val, prior_matches=prior_matches, bayes_alpha=alpha
-                    )
+                    if use_ewma:
+                        roll, rh, ra = _ewma_past_only_bayes_mean(
+                            vals=arr, venues=g["venue"].astype(str).to_numpy(),
+                            halflife=hl, tau=tau, prior_val=prior_val, prior_matches=prior_matches, bayes_alpha=alpha
+                        )
+                    else:
+                        roll, rh, ra = _rolling_past_only_bayes_mean(
+                            vals=arr, venues=g["venue"].astype(str).to_numpy(),
+                            window=window, tau=tau, prior_val=prior_val, prior_matches=prior_matches, bayes_alpha=alpha
+                        )
                     base = f"{mkey}_{raw}_p90"
                     g[f"{base}_roll"] = roll; g[f"{base}_home_roll"] = rh; g[f"{base}_away_roll"] = ra
 
             # GK save% posterior rolling
             if is_gk:
                 p0, s0 = _get_savepct_prior(priors, str(pid))
-                post, post_h, post_a = _rolling_past_only_binomial_savepct(
-                    saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
-                    venues=g["venue"].astype(str).to_numpy(), window=window, tau=tau,
-                    prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
-                )
+                if use_ewma:
+                    post, post_h, post_a = _ewma_binomial_savepct(
+                        saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
+                        venues=g["venue"].astype(str).to_numpy(), halflife=hl, tau=tau,
+                        prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
+                    )
+                else:
+                    post, post_h, post_a = _rolling_past_only_binomial_savepct(
+                        saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
+                        venues=g["venue"].astype(str).to_numpy(), window=window, tau=tau,
+                        prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
+                    )
                 g["gk_save_pct_p90_roll"] = post
                 g["gk_save_pct_p90_home_roll"] = post_h
                 g["gk_save_pct_p90_away_roll"] = post_a
@@ -605,20 +835,11 @@ def build_player_form(
 
         feat = pd.concat(out_rows, ignore_index=True)
 
-        # Z-scores (overall + venue-conditional), sign flips for defensive negatives
-        overall_cols = [c for c in feat.columns if c.endswith("_roll") and "_home_" not in c and "_away_" not in c]
-        for c in overall_cols:
-            z = _z_by_season_gw(feat, c)
-            flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat = _bulk_add_zscores_by_pos_gw(feat)
-        for c in [c for c in feat.columns if c.endswith("_home_roll")]:
-            z = _z_by_season_gw_venue(feat, c, "Home")
-            flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat = _bulk_add_zscores_by_pos_gw(feat)
-        for c in [c for c in feat.columns if c.endswith("_away_roll")]:
-            z = _z_by_season_gw_venue(feat, c, "Away")
-            flip = any(c.startswith(f"{k}_") and METRICS[k]["flip_sign"] for k in METRICS)
-            feat = _bulk_add_zscores_by_pos_gw(feat)
+        # Z-scores (overall + venue-conditional), sign flips for defensive negatives — single bulk call
+        feat = _bulk_add_zscores_by_pos_gw(feat)
+
+        # Composite form (group z-averages + position-weighted score)
+        feat = _composite_from_groups(feat, pos_weights=pos_weights)
 
         # Write
         out_dir_season = version_dir / season
@@ -640,13 +861,22 @@ def build_player_form(
                 "tau": tau,
                 "prior_matches": prior_matches,
                 "per90": True,
+                "ewma": use_ewma,
+                "halflife": halflife if use_ewma else None,
+                "halflife_by_pos": halflife_by_pos if use_ewma else None,
                 "savepct_binomial": {"prior": "last_season (player) → GK_group → global",
-                                     "prior_p_default": 0.70, "prior_s_default": 80.0},
+                                     "prior_p_default": 0.70, "prior_s_default": 80.0,
+                                     "mode": "ewma" if use_ewma else "window"},
                 "rare_event_shrinkage_alpha": {"pk_won": 6, "own_goals": 6},
                 "zscore_mode": {"overall": "season,gw_orig",
-                                "home": "season,gw_orig (Home only)",
-                                "away": "season,gw_orig (Away only)"},
-                "features": sorted([c for c in feat.columns if c.endswith(("_roll","_roll_z"))]),
+                                  "home": "season,gw_orig (Home only)",
+                                  "away": "season,gw_orig (Away only)"},
+                "groups": {
+                    "definition": {k:[{"mkey":a,"raw":b} for (a,b) in v] for k,v in GROUP_DEFINITION.items()},
+                    "pos_weights": pos_weights,
+                },
+                "features": sorted([c for c in feat.columns if c.endswith(("_roll","_roll_z"))] +
+                                    [c for c in feat.columns if c.startswith("form_")]),
                 "coercion_stats": stats,
             }
             (out_dir_season / "player_form.meta.json").write_text(json.dumps(meta, indent=2))
@@ -658,15 +888,27 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", help="e.g. 2025-2026; omit for batch over all folders under --fixtures-root")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"),
-                    help="Root containing <SEASON>/player_minutes_calendar.csv")
+                    help="Root containing <SEASON>/player_fixture_calendar.csv")
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"),
                     help="Root for versioned features output")
+
+    # Versioning
     ap.add_argument("--version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
     ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
     ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
-    ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only)")
+
+    # Rolling params
+    ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only) for classic mode")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
     ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
+    ap.add_argument("--ewma", action="store_true", help="use EWMA past-only rolling instead of hard window")
+    ap.add_argument("--halflife", type=float, default=3.0, help="EWMA halflife in matches (global fallback)")
+    ap.add_argument("--halflife-by-pos", type=str, default=None,
+                    help="Override EWMA halflife per position, e.g. 'GK:4,DEF:3.5,MID:3,FWD:2.5' (falls back to --halflife)")
+    # Composite weights
+    ap.add_argument("--pos-weights", type=str, default=None,
+                    help="Per-position group weights; e.g. 'GK:gk=1;DEF:def=.6,att=.2,cre=.2;MID:att=.4,cre=.4,def=.2;FWD:att=.6,cre=.3,def=.1'")
+
     ap.add_argument("--fill-missing-fdr", type=float, default=None, help="If set, fill missing fdr_home/fdr_away with this value (e.g., 3.0 for neutral).")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
@@ -690,6 +932,9 @@ def main() -> None:
     version_dir = features_root / version
     version_dir.mkdir(parents=True, exist_ok=True)
 
+    pos_weights = _parse_pos_weights(args.pos_weights)
+    halflife_by_pos = _parse_halflife_by_pos(args.halflife_by_pos, args.halflife)
+
     logging.info("Processing seasons: %s", ", ".join(seasons))
     logging.info("Writing to version dir: %s", version_dir)
 
@@ -702,6 +947,10 @@ def main() -> None:
         force=args.force,
         prior_matches=args.prior_matches,
         fill_missing_fdr=args.fill_missing_fdr,
+        use_ewma=args.ewma,
+        halflife=args.halflife,
+        pos_weights=pos_weights,
+        halflife_by_pos=halflife_by_pos,
     )
 
     if args.write_latest:

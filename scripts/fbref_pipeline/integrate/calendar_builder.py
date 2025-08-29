@@ -1,34 +1,5 @@
 #!/usr/bin/env python3 
-"""
-calendar_builder.py  –  Batch-capable builder for player_fixture_calendar.csv
-(Optionally include price via --include-price, reading master/seasonal JSONs or merged_gws)
-
-Creates one “skinny” file per season with:
-    fbref_id, fpl_id, gw_orig, date_played,
-    team_id, player_id, minutes, is_active, is_starter, starter_source,
-    [price], xp, total_points, bonus, bps, clean_sheets
-    + rich per-player stats (xg, shots, tackles, saves, etc.)
-    + fixture context (team, opponent_id, venue, was_home, FDR)
-
-FDR: attached from features/<team-version>/... (prefer views/<SEASON>/fixture_calendar_with_fdr__<team-version>.csv,
-     else join team_form.csv). We do NOT mutate home/away ids.
-
-Price (when --include-price):
-- Priority: seasonal JSON > master_fpl JSON > merged_gws.csv
-- Join key: (player_id, gw_orig). merged_gws fallback uses its 'event' column.
-
-Usage:
-  python -m scripts.fbref_pipeline.integrate.calendar_builder --season 2025-2026 ^
-    --fixtures-root data/processed/registry/fixtures ^
-    --fbref-root "data/processed/fbref/ENG-Premier League" ^
-    --fpl-root data/processed/fpl ^
-    --features-root data/processed/registry/features ^
-    --team-version latest ^
-    --include-price ^
-    --price-master "data/processed/registry/fpl/master_fpl.json" ^
-    --price-seasonal "data/processed/registry/fpl/2025-2026_prices.json" ^
-    --force
-"""
+#calender_builder.py
 from __future__ import annotations
 import argparse, logging, json
 from pathlib import Path
