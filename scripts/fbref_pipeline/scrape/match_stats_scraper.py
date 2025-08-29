@@ -159,7 +159,7 @@ def main():
     p.add_argument("--out-dir", default="data/raw/fbref")
     p.add_argument("--seasons", nargs="*")
     p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--delay", type=float, default=5)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
