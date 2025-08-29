@@ -428,7 +428,7 @@ def build_minutes_calendar(
     force: bool = False,
     create_empty: bool = False,
 ) -> None:
-    out_fp = season_dir / "player_minutes_calendar.csv"
+    out_fp = season_dir / "player_fixture_calendar.csv"
     if out_fp.exists() and not force:
         logging.info("%s exists – skipping", out_fp.name)
         return

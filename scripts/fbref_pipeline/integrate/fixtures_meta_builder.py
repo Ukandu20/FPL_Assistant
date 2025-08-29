@@ -328,6 +328,17 @@ def build_fixture_calendar(
         cal.groupby("team")["date_played"].diff().dt.days.fillna(0).astype(int)
     )
 
+    # After you've built/merged `cal` and before selecting `out`:
+    if "gw_played" not in cal.columns:
+        cal["gw_played"] = np.nan
+
+    # Default: gw_played := gw_orig; keep any already-computed values
+    cal["gw_played"] = cal["gw_played"].fillna(cal["gw_orig"])
+
+    # Use nullable ints so NaNs stay NaN (if any remain)
+    
+
+
     # final flags
     cal["gw_played"] = cal.get("gw_played", cal.get("gw_orig"))
     cal["sched_missing"] = cal["game_id"].isna().astype("Int8")
@@ -345,7 +356,7 @@ def build_fixture_calendar(
 
     # guarantee integer 0/1 in CSV
     out["is_home"] = out["is_home"].astype("Int8")
-    out["gw_played"] = out["gw_played"].fillna(0).astype("Int8")
+    out["gw_played"] = out["gw_played"].astype("Int8")
     out["sched_missing"] = out["sched_missing"].astype("Int8")
 
     # ── write base calendar ──
