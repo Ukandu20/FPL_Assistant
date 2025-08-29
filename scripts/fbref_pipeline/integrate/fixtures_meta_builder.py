@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import List, Dict
 
 import pandas as pd
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 import numpy as np
 
 
@@ -53,12 +54,29 @@ def normalise_date(series: pd.Series) -> pd.Series:
     return series.dt.floor("D")
 
 def _to_bool_mask(s: pd.Series) -> pd.Series:
-    """Convert various truthy encodings to boolean mask."""
+    """Convert various truthy encodings to boolean mask (handles numeric floats like 1.0/0.0)."""
     if s is None:
         return pd.Series(False, index=pd.RangeIndex(0))
-    if s.dtype == bool:
+    if is_bool_dtype(s):
         return s.fillna(False)
-    return s.astype(str).str.strip().str.lower().isin({"1","true","t","yes","y"})
+    if is_numeric_dtype(s):
+        # 0, 0.0 -> False; any non-zero -> True
+        return s.fillna(0).astype(float).ne(0.0)
+    # string-like: accept common truthy tokens, including "1.0"
+    tokens_true = {"1","1.0","true","t","yes","y"}
+    return s.astype(str).str.strip().str.lower().isin(tokens_true)
+
+def _venue_to_is_home_int8(venue: pd.Series) -> pd.Series:
+    """Map FBref venue → is_home:Int8 (1=home, 0=away, <NA>=neutral/unknown)."""
+    v = venue.astype(str).str.strip().str.lower()
+    out = pd.Series(pd.NA, index=venue.index, dtype="Int8")
+    out[v.isin({"home","h"})] = 1
+    out[v.isin({"away","a"})] = 0
+    return out
+
+def _naeq(a: pd.Series, b: pd.Series) -> pd.Series:
+    """NA-safe equality: True if equal OR both NA."""
+    return (a == b) | (a.isna() & b.isna())
 
 def read_fixture_calendar(out_dir: Path, season: str) -> pd.DataFrame:
     fp = out_dir / season / "fixture_calendar.csv"
@@ -262,20 +280,43 @@ def build_fixture_calendar(
     else:
         cal["team_id"] = cal["team_id"].fillna(cal["team"].map(code2hex))
 
-    # ── Derive home_id/away_id from team_id/opponent_id + is_home/is_away ──
-    if "is_home" in cal.columns and cal["is_home"].notna().any():
-        hmask = _to_bool_mask(cal["is_home"].fillna(False))
-    elif "is_away" in cal.columns and cal["is_away"].notna().any():
-        hmask = ~_to_bool_mask(cal["is_away"].fillna(False))
+
+    # ── Derive home/away using IDs first, then venue, then legacy flags ──
+    # Expected hex from FPL short codes
+    cal["home_hex_expected"] = cal["home"].astype(str).map(code2hex).astype("string")
+    cal["away_hex_expected"] = cal["away"].astype(str).map(code2hex).astype("string")
+    # ID-based truth (most reliable): team row is home iff team_id == home_hex_expected
+    id_cmp_valid = cal["team_id"].notna() & cal["home_hex_expected"].notna()
+    is_home_by_ids = pd.Series(pd.NA, index=cal.index, dtype="Int8")
+    is_home_by_ids[id_cmp_valid] = cal.loc[id_cmp_valid, "team_id"].eq(
+        cal.loc[id_cmp_valid, "home_hex_expected"]
+    ).astype("Int8")
+    # Venue-based fallback
+    is_home_by_venue = _venue_to_is_home_int8(cal["venue"])
+    # Legacy flag fallback
+    if "is_home" in cal.columns:
+        is_home_flag = _to_bool_mask(cal["is_home"]).astype("Int8")
+    elif "is_away" in cal.columns:
+        is_home_flag = (~_to_bool_mask(cal["is_away"])).astype("Int8")
     else:
-        hmask = (cal["team"].astype(str).str.upper() == cal["home"].astype(str).str.upper())
+        is_home_flag = pd.Series(pd.NA, index=cal.index, dtype="Int8")
+    # Coalesce: IDs → venue → flag
+    cal["is_home"] = is_home_by_ids
+    need_fill = cal["is_home"].isna()
+    if need_fill.any():
+        cal.loc[need_fill, "is_home"] = is_home_by_venue.loc[need_fill]
+    need_fill = cal["is_home"].isna()
+    if need_fill.any():
+        cal.loc[need_fill, "is_home"] = is_home_flag.loc[need_fill]
+    cal["is_home"] = cal["is_home"].astype("Int8")
+    cal["is_away"] = (1 - cal["is_home"]).astype("Int8")
+    # Build mask and assign ids
+    hmask = (cal["is_home"] == 1)
 
     cal["home_id"] = np.where(hmask, cal["team_id"], cal["opponent_id"])
     cal["away_id"] = np.where(hmask, cal["opponent_id"], cal["team_id"])
 
-    # Force integer 0/1 semantics for home/away flags (authority = hmask)
-    cal["is_home"] = pd.Series(hmask, index=cal.index).astype("Int8")
-    cal["is_away"] = (1 - cal["is_home"]).astype("Int8")
+
 
     # enforce lowercase hex strings (keeps <NA> if missing)
     for c in ("home_id", "away_id"):
@@ -323,6 +364,22 @@ def build_fixture_calendar(
         null_ids.to_csv(dst_dir / "_missing_home_away_ids.csv", index=False)
         logging.warning("%s • %d rows lack home_id/away_id (see _missing_home_away_ids.csv)",
                         season, len(null_ids))
+    # NA-safe alignment audit (only on rows with all IDs present)
+    cal_ids_ok = cal[["team_id","opponent_id","home_id","away_id","is_home"]].dropna().copy()
+    bad_align = cal_ids_ok[
+        ((cal_ids_ok["is_home"]==1) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["team_id"]) |
+                                      ~_naeq(cal_ids_ok["away_id"], cal_ids_ok["opponent_id"]))) |
+        ((cal_ids_ok["is_home"]==0) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["opponent_id"]) |
+                                      ~_naeq(cal_ids_ok["away_id"], cal_ids_ok["team_id"])))
+    ]
+    if not bad_align.empty:
+        cols = ["home","away","team","venue","date_played","team_id","opponent_id","home_id","away_id","is_home"]
+        (dst_dir / "_home_alignment_audit.csv").write_text("")
+        cal.loc[bad_align.index, cols].to_csv(dst_dir / "_home_alignment_audit.csv", index=False)
+        logging.error("%s • %d rows fail home/away ID alignment (see _home_alignment_audit.csv)", season, len(bad_align))
+
+
+
 
     # ── reschedule audit (only where we *did* match) ──
     audit = out.loc[out["fbref_id"].notna() & out["date_sched"].notna() & out["date_played"].notna()].copy()
