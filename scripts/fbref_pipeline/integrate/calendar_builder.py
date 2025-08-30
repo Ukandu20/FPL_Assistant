@@ -575,6 +575,12 @@ def build_minutes_calendar(
     # ── Output (enforce canonical order; keep only known cols) ──────────────
     out_cols = [c for c in OUT_COLS if include_price or c != "price"]
     cols = [c for c in out_cols if c in merged.columns]
+        # Sort by gw_orig for deterministic, human-friendly CSV order.
+    if "gw_orig" in merged.columns:
+        # ensure numeric to prevent lexicographic order if strings slipped in
+        merged["gw_orig"] = pd.to_numeric(merged["gw_orig"], errors="coerce").astype("Int64")
+        # stable sort so any prior ordering (e.g., by player/date used for features) is preserved within GW
+        merged = merged.sort_values(["gw_orig"], kind="mergesort")
     merged[cols].to_csv(out_fp, index=False)
     logging.info("✅ %s written (%d rows)  | include_price=%s", out_fp.name, len(merged), include_price)
 
