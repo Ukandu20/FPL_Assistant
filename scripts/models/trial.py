@@ -2,13 +2,6 @@
 """
 minutes_model_builder.py – starter-aware minutes predictor with per-position heads
 
-New in 1.1.2:
-  • Fix: team_rot3 is leak-free (uses only prior XI changes).
-  • Autotune routes using the actual bench predictor (p_cameo * μ_cameo with caps).
-  • Taper controls added: --taper-lo, --taper-hi, --taper-min-scale.
-  • Guardrails can be disabled via --disable-pstart-caps.
-  • Extra diagnostics: raw/blended MAEs and started-band MAEs.
-
 New in 1.1.1:
   • FDR integration: join per-(season, GW, team|player) from features/<version>/<season>/(team|player)_form.csv
     via --form-root, --form-version, --form-source.
@@ -56,7 +49,7 @@ import joblib
 
 # ------------------------------- Versioning -----------------------------------
 
-code_version = "1.1.2"
+code_version = "1.1.1"
 
 def _ensure_version_dirs(base: Path, bump: bool, tag: Optional[str]) -> Tuple[Path, str]:
     versions_dir = base / "versions"
@@ -176,13 +169,14 @@ def attach_fdr(df: pd.DataFrame,
         if gw_tf_key is None:
             continue
 
-        # candidate FDR columns
+        # Gather candidate FDR columns
         has_split = {"fdr_home", "fdr_away"}.issubset(t.columns)
         possible = [c for c in ["fdr", "fixture_fdr", "team_fdr", "opp_fdr"] if c in t.columns]
         if not has_split and not possible:
             continue
 
         t["season"] = season
+        # minimize columns for merge
         keep_cols = {"season", gw_tf_key}
         if source == "team":
             keep_cols.add("team_id")
@@ -193,12 +187,14 @@ def attach_fdr(df: pd.DataFrame,
         keep_cols.update(possible)
         t = t[[c for c in keep_cols if c in t.columns]].copy()
 
+        # rename GW for merge
         t = t.rename(columns={gw_tf_key: "_gw_key"})
         s = df[df["season"] == season].copy().rename(columns={gw_df_key: "_gw_key"})
 
         on = ["season", "_gw_key"] + (["team_id"] if source == "team" else ["player_id"])
         s = s.merge(t, how="left", on=on)
 
+        # resolve to unified 'fdr'
         if has_split:
             s["fdr_home"] = pd.to_numeric(s["fdr_home"], errors="coerce")
             s["fdr_away"] = pd.to_numeric(s["fdr_away"], errors="coerce")
@@ -226,10 +222,7 @@ def make_features(df: pd.DataFrame,
                   days_cap: Optional[int],
                   use_log_days: bool,
                   use_fdr: bool,
-                  add_team_rotation: bool,
-                  taper_lo: float,
-                  taper_hi: float,
-                  taper_min_scale: float) -> pd.DataFrame:
+                  add_team_rotation: bool) -> pd.DataFrame:
 
     # Resolve working date column
     if "date_played" in df.columns:
@@ -237,6 +230,7 @@ def make_features(df: pd.DataFrame,
     elif "date_sched" in df.columns:
         date_used = df["date_sched"]
     else:
+        # fabricate neutral sequence if neither present to avoid errors
         date_used = pd.to_datetime("1970-01-01") + pd.to_timedelta(range(len(df)), unit="D")
 
     df = df.copy()
@@ -245,7 +239,7 @@ def make_features(df: pd.DataFrame,
     gw_key = _pick_gw_col(df.columns.tolist()) or "gw_orig"
     df = df.sort_values(["player_id", "season", "_date_used", gw_key])
 
-    # Ensure numeric FDR
+    # Ensure a numeric FDR column exists
     if use_fdr and "fdr" in df.columns:
         df["fdr"] = pd.to_numeric(df["fdr"], errors="coerce").fillna(0.0)
     else:
@@ -287,36 +281,37 @@ def make_features(df: pd.DataFrame,
     df["start_streak"] = prev_start.groupby(keys, sort=False).transform(_consecutive_ones).astype(int)
     df["bench_streak"] = prev_bench.groupby(keys, sort=False).transform(_consecutive_ones).astype(int)
 
-    # Leak-free team rotation (XI changes over last 3 fixtures prior to t)
+    # Team rotation (XI changes / 11 over last 3 fixtures), prefer gw_played
+    # Team rotation (XI changes / 11 over last 3 fixtures), prefer gw_played
     if add_team_rotation and {"team_id","player_id","season","is_starter"}.issubset(df.columns):
         try:
             def team_rot_rate(s: pd.DataFrame) -> pd.Series:
                 s = s.sort_values(["_date_used", gw_key])
-                # XI matrix per (season, GW, team)
+
+                # 1) Build XI matrix per (season, GW, team)
                 starters = s.pivot_table(index=["season", gw_key, "team_id"],
-                                         columns="player_id",
-                                         values="is_starter", aggfunc="max").fillna(0)
-                starters = starters.sort_index()
+                                        columns="player_id",
+                                        values="is_starter", aggfunc="max").fillna(0)
 
-                # Changes (L1) between consecutive XIs, per (season, team)
-                changes = starters.groupby(level=[0, 2]).apply(lambda x: x.diff().abs().sum(axis=1))
-                # shift so value at t uses up to t-1 information only
-                changes_prior = changes.groupby(level=[0, 2]).shift(1).fillna(0)
+                # 2) Compute per-season changes in XI to avoid cross-season jumps
+                changes = starters.groupby(level=0).apply(
+                    lambda x: x.diff().abs().sum(axis=1)
+                ).droplevel(0)  # index back to (season, GW, team_id)
 
-                # Rolling mean of prior 3 changes, normalized by 11
-                rot = changes_prior.groupby(level=[0, 2]).apply(
+                # 3) 3-match rolling mean of changes, normalized by 11
+                rot = changes.groupby(level=[0, 2]).apply(
                     lambda x: x.rolling(3, min_periods=1).mean() / 11.0
                 )
 
-                # Align back to rows of this team slice
+                # 4) Align back to the original rows of this team slice
                 idx = s.set_index(["season", gw_key, "team_id"]).index
                 vals = rot.reindex(idx).to_numpy()
                 return pd.Series(vals, index=s.index, name="team_rot3")
 
             df["team_rot3"] = (
                 df.groupby("team_id", group_keys=False)
-                  .apply(team_rot_rate, include_groups=False)
-                  .reindex(df.index)
+                .apply(team_rot_rate, include_groups=False)  # future-proof pandas
+                .reindex(df.index)
             )
             df["team_rot3"] = pd.to_numeric(df["team_rot3"], errors="coerce").fillna(0.0).clip(0, 1)
         except Exception:
@@ -324,17 +319,13 @@ def make_features(df: pd.DataFrame,
     else:
         df["team_rot3"] = 0.0
 
+
     pos_map = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
     df["pos_enc"] = df["pos"].map(pos_map).fillna(2).astype(int)
 
     df["minutes"] = df["minutes"].clip(0, 120)
     df["y60"] = (df["minutes"] >= 60).astype(int)
     df["y_played"] = (df["minutes"] > 0).astype(int)
-
-    # Store taper params for later use (as columns for convenience if needed downstream)
-    df["_taper_lo"] = taper_lo
-    df["_taper_hi"] = taper_hi
-    df["_taper_min_scale"] = taper_min_scale
 
     return df.drop(columns=["_date_used"], errors="ignore")
 
@@ -351,6 +342,7 @@ def chrono_split(df: pd.DataFrame, first_test_gw: int, first_test_season: str) -
     test  = df[test_mask].copy()
 
     if train.empty or test.empty:
+        # Fallback to date-based split if GW keys are insufficient
         if "date_played" in df.columns:
             boundary = df[(df["season"] == first_test_season) & (df[gw_key] == first_test_gw)]
             cutoff = pd.to_datetime(boundary["date_played"]).min()
@@ -696,17 +688,11 @@ def predict_with_model(model, X: pd.DataFrame, default_val: float = 0.0, clip_hi
         pred = np.clip(pred, 0, clip_hi)
     return np.clip(pred, 0, 120)
 
-def taper_start_minutes(pred_start: np.ndarray,
-                        p_start: np.ndarray,
-                        pos_series: pd.Series,
-                        lo: float,
-                        hi: float,
-                        min_scale: float) -> np.ndarray:
-    """Softly shrink non-GK start minutes when p_start is low."""
+def taper_start_minutes(pred_start: np.ndarray, p_start: np.ndarray, pos_series: pd.Series) -> np.ndarray:
     non_gk = (pos_series.values != "GK")
-    w = np.clip((p_start - lo) / max(1e-9, (hi - lo)), 0.0, 1.0)
+    w = np.clip((p_start - 0.2) / (0.6 - 0.2), 0.0, 1.0)
     out = pred_start.copy()
-    out[non_gk] = (min_scale + (1.0 - min_scale) * w[non_gk]) * out[non_gk]
+    out[non_gk] = (0.5 + 0.5 * w[non_gk]) * out[non_gk]
     return out
 
 def hybrid_route(p: np.ndarray, start_pred: np.ndarray, bench_pred: np.ndarray,
@@ -716,29 +702,35 @@ def hybrid_route(p: np.ndarray, start_pred: np.ndarray, bench_pred: np.ndarray,
 def per_position_bench_cap_from_train(pos_ser: pd.Series, caps_map: Dict[str, float]) -> np.ndarray:
     return pos_ser.map(caps_map).fillna(25.0).to_numpy()
 
-# --------- Autotune thresholds using actual bench predictor ---------
+# --------- Autotune thresholds (bench-aware) ---------
 
-def autotune_thresholds(
-    df_train: pd.DataFrame,
-    predict_p_start_fn,
-    predict_start_minutes_fn,
-    predict_bench_minutes_fn
-) -> Tuple[float, float]:
-    """Tune (t_lo, t_hi) against actual start/bench predictors on a tail validation split."""
-    fi, vi = chrono_tail_index(df_train, 0.15)
-    Xv = df_train.loc[vi]
-    yv = Xv["minutes"].to_numpy()
-    bench_mask = Xv["is_starter"].astype(int).eq(0).to_numpy()
+def autotune_thresholds(train: pd.DataFrame,
+                        predict_p_start_fn,
+                        reg_start,
+                        feat_reg: List[str],
+                        bench_cap_map: Optional[Dict[str, float]],
+                        use_taper: bool, use_pos_caps: bool) -> Tuple[float, float]:
+    fi, vi = chrono_tail_index(train, 0.15)
+    Xr = train.loc[vi, feat_reg].fillna(0)
+    yv = train.loc[vi, "minutes"].to_numpy()
+    bench_mask = train.loc[vi, "is_starter"].astype(int).eq(0).to_numpy()
 
-    p = predict_p_start_fn(Xv)
-    ps = predict_start_minutes_fn(Xv, p)     # uses taper if enabled
-    pb = predict_bench_minutes_fn(Xv)        # p_cameo * μ_cameo with caps
+    p = predict_p_start_fn(train.loc[vi])
+    ps = predict_with_model(reg_start, Xr, 60.0, 120)
+    if use_taper:
+        ps = taper_start_minutes(ps, p, train.loc[vi, "pos"])
+    # Bench path proxy
+    cameo_train = train[(train["is_starter"]==0) & (train["minutes"]>0)]
+    cameo_median = cameo_train.groupby("pos")["minutes"].median().to_dict() if len(cameo_train) else {"DEF":20,"MID":25,"FWD":20,"GK":1}
+    pb = 0.6 * train.loc[vi, "pos"].map(cameo_median).fillna(20).to_numpy()
+    if use_pos_caps and bench_cap_map is not None:
+        pb = np.minimum(pb, per_position_bench_cap_from_train(train.loc[vi, "pos"], bench_cap_map))
 
-    mix = p * ps + (1 - p) * pb
-    best = (1e9, 0.20, 0.80)
+    best = (1e9, 0.2, 0.8)
+    mix = p*ps + (1-p)*pb
     for t_lo in np.linspace(0.15, 0.30, 4):
         for t_hi in np.linspace(0.65, 0.80, 4):
-            pred = np.where(p >= t_hi, ps, np.where(p <= t_lo, pb, mix))
+            pred = hybrid_route(p, ps, pb, mix, float(t_lo), float(t_hi))
             mae_all = mean_absolute_error(yv, pred)
             mae_ben = mean_absolute_error(yv[bench_mask], pred[bench_mask]) if bench_mask.any() else mae_all
             J = mae_all + 0.5 * mae_ben
@@ -799,9 +791,6 @@ def main():
     ap.add_argument("--t-lo", type=float, default=0.20)
     ap.add_argument("--t-hi", type=float, default=0.80)
     ap.add_argument("--use-taper", action="store_true")
-    ap.add_argument("--taper-lo", type=float, default=0.20)
-    ap.add_argument("--taper-hi", type=float, default=0.60)
-    ap.add_argument("--taper-min-scale", type=float, default=0.50)
     ap.add_argument("--use-pos-bench-caps", action="store_true")
     ap.add_argument("--pos-thresholds", type=str, default="", help="Per-pos thresholds e.g. 'GK:0.15,0.55;DEF:0.25,0.70;MID:0.25,0.70;FWD:0.25,0.70'")
     ap.add_argument("--no-mix-gk", action="store_true", help="Disable GK soft mix (ambiguous → route to start)")
@@ -810,7 +799,6 @@ def main():
     ap.add_argument("--bench-cap", type=float, default=45.0, help="(legacy, unused if --use-pos-bench-caps set)")
     ap.add_argument("--pstart-cap10", type=float, default=0.05)
     ap.add_argument("--pstart-cap30", type=float, default=0.20)
-    ap.add_argument("--disable-pstart-caps", action="store_true", help="Disable the p_start-based minute caps guardrails")
 
     # P60 head
     ap.add_argument("--p60-mode", choices=["direct","structured"], default="direct")
@@ -845,18 +833,13 @@ def main():
         df["fdr"] = 0.0
 
     days_cap = None if (args.days_cap is not None and args.days_cap < 0) else args.days_cap
-    df = make_features(
-        df,
-        halflife_min=args.halflife_min,
-        halflife_start=args.halflife_start,
-        days_cap=days_cap,
-        use_log_days=args.use_log_days,
-        use_fdr=args.use_fdr,
-        add_team_rotation=args.add_team_rotation,
-        taper_lo=args.taper_lo,
-        taper_hi=args.taper_hi,
-        taper_min_scale=args.taper_min_scale
-    )
+    df = make_features(df,
+                       halflife_min=args.halflife_min,
+                       halflife_start=args.halflife_start,
+                       days_cap=days_cap,
+                       use_log_days=args.use_log_days,
+                       use_fdr=args.use_fdr,
+                       add_team_rotation=args.add_team_rotation)
 
     train, test = chrono_split(df, args.first_test_gw, first_test_season)
     train = train.dropna(subset=["min_lag1", "min_ewm_hl2"])
@@ -923,7 +906,7 @@ def main():
         p = np.where(~np.isnan(p_pos), blend * p_pos + (1.0 - blend) * p_glob, p_glob)
         return np.clip(p, 0, 1)
 
-    # Start minutes regressor (on starters)
+    # Start minutes regressor (unchanged)
     reg_start, _ = train_regressor(train[train["is_starter"] == 1], feat_reg, objective="regression_l2")
 
     # P60 head (direct)
@@ -953,42 +936,78 @@ def main():
         train, feat_cameo_min, min_rows=150
     )
 
-    # ---------- Prediction helpers shared by autotune & test ----------
+    # Autotune thresholds (bench-aware objective; uses proxy pb)
+    try:
+        t_lo_auto, t_hi_auto = autotune_thresholds(train, predict_p_start,
+                                                   reg_start, feat_reg,
+                                                   bench_cap_map=bench_caps if args.use_pos_bench_caps else None,
+                                                   use_taper=args.use_taper,
+                                                   use_pos_caps=args.use_pos_bench_caps)
+        # Keep user overrides if they provide per-pos thresholds
+        if not args.pos_thresholds:
+            args.t_lo, args.t_hi = t_lo_auto, t_hi_auto
+    except Exception:
+        pass
 
-    def predict_p60(df_in: pd.DataFrame) -> np.ndarray:
-        p = p60_direct.predict_proba(df_in[feat_p60].fillna(0))[:,1]
-        if p60_direct_calib is not None:
-            p = p60_direct_calib.transform(p)
-        return np.clip(p, 0, 1)
+    pos_thresholds = parse_pos_thresholds(args.pos_thresholds)
 
-    def predict_cameo_prob(df_in: pd.DataFrame) -> np.ndarray:
-        n = len(df_in)
-        p_c = np.zeros(n, dtype=float)
-        used = np.zeros(n, dtype=bool)
+    # ---------- Predict on TEST ----------
+    p_start = predict_p_start(test)
+
+    Xr = test[feat_reg]
+    pred_start = predict_with_model(reg_start, Xr, default_val=60.0, clip_hi=120)
+    if args.use_taper:
+        pred_start = taper_start_minutes(pred_start, p_start, test["pos"])
+
+    # p60 direct (+ optional single calibration)
+    p60 = p60_direct.predict_proba(test[feat_p60].fillna(0))[:,1]
+    if p60_direct_calib is not None:
+        p60 = p60_direct_calib.transform(p60)
+
+    # p_cameo
+    if len(cameo_models_by_pos) > 0:
+        p_cameo = np.zeros(len(test), dtype=float)
+        used = np.zeros(len(test), dtype=bool)
         for pos in ["GK","DEF","MID","FWD"]:
             if pos in cameo_models_by_pos:
                 m = cameo_models_by_pos[pos]
-                mask = (df_in["pos"] == pos).values
+                mask = (test["pos"] == pos).values
                 if mask.any():
-                    pv = m.predict_proba(df_in.loc[mask, feat_cameo].fillna(0))[:, 1]
+                    pv = m.predict_proba(test.loc[mask, feat_cameo].fillna(0))[:, 1]
                     iso = cameo_calibs_by_pos.get(pos)
                     if iso is not None:
                         pv = iso.transform(pv)
-                    p_c[mask] = pv
+                    p_cameo[mask] = pv
                     used[mask] = True
         if (~used).any() and cameo_global is not None:
-            pv = cameo_global.predict_proba(df_in.loc[~used, feat_cameo].fillna(0))[:, 1]
+            pv = cameo_global.predict_proba(test.loc[~used, feat_cameo].fillna(0))[:, 1]
             if cameo_global_calib is not None:
                 pv = cameo_global_calib.transform(pv)
-            p_c[~used] = pv
-        # force p_cameo=1.0 for positions with no DNPs in TRAIN benches
-        if single_class_bench:
-            for pos in single_class_bench:
-                m = (df_in["pos"].values == pos)
-                if m.any():
-                    p_c[m] = 1.0
-        return np.clip(p_c, 0, 1)
+            p_cameo[~used] = pv
+    else:
+        if cameo_global is not None:
+            p_cameo = cameo_global.predict_proba(test[feat_cameo].fillna(0))[:, 1]
+            if cameo_global_calib is not None:
+                p_cameo = cameo_global_calib.transform(p_cameo)
+        else:
+            cameo = train[(train["is_starter"] == 0)]
+            base = {"GK": 1.0, "DEF": 1.0, "MID": 1.0, "FWD": 1.0}
+            if not cameo.empty:
+                base.update(cameo.groupby("pos")["y_played"].mean().to_dict())
+            p_cameo = test["pos"].map(base).fillna(1.0).to_numpy()
 
+    # force p_cameo=1.0 for positions with no DNPs in TRAIN benches
+    single_class_bench = {p for p in ["GK","DEF","MID","FWD"]
+                          if not train[(train["is_starter"]==0) & (train["pos"]==p)].empty
+                          and train[(train["is_starter"]==0) & (train["pos"]==p)]["y_played"].nunique() < 2}
+    if single_class_bench:
+        for pos in single_class_bench:
+            m = (test["pos"].values == pos)
+            if m.any():
+                p_cameo[m] = 1.0
+    p_cameo = np.clip(p_cameo, 0, 1)
+
+    # μ_cameo: minutes given cameo (per-pos regressors with global fallback)
     def predict_cameo_minutes(df_in: pd.DataFrame) -> np.ndarray:
         Xc = df_in[feat_cameo_min].fillna(0)
         mu = np.zeros(len(df_in), dtype=float)
@@ -1004,61 +1023,30 @@ def main():
             used[mask] = True
         if (~used).any() and cameo_min_global is not None:
             mu[~used] = predict_with_model(cameo_min_global, Xc.loc[~used], default_val=15.0, clip_hi=None)
+        # Cameo minutes rarely exceed ~45; clip softly
         return np.clip(mu, 0, 60)
 
-    def predict_bench_minutes(df_in: pd.DataFrame) -> np.ndarray:
-        p_c = predict_cameo_prob(df_in)
-        mu_c = predict_cameo_minutes(df_in)
-        pred = p_c * mu_c
-        if args.use_pos_bench_caps:
-            pred = np.minimum(pred, per_position_bench_cap_from_train(df_in["pos"], bench_caps))
-        else:
-            pred = np.clip(pred, 0, args.bench_cap)
-        return pred
-
-    def predict_start_minutes(df_in: pd.DataFrame, p_s: Optional[np.ndarray] = None) -> np.ndarray:
-        Xr = df_in[feat_reg]
-        ps = predict_with_model(reg_start, Xr, default_val=60.0, clip_hi=120)
-        if args.use_taper:
-            if p_s is None:
-                p_s = predict_p_start(df_in)
-            ps = taper_start_minutes(ps, p_s, df_in["pos"], args.taper_lo, args.taper_hi, args.taper_min_scale)
-        return ps
-
-    # ---------- Autotune thresholds (using actual bench predictor) ----------
-    try:
-        t_lo_auto, t_hi_auto = autotune_thresholds(
-            train,
-            predict_p_start_fn=predict_p_start,
-            predict_start_minutes_fn=predict_start_minutes,
-            predict_bench_minutes_fn=predict_bench_minutes
-        )
-        # Keep user overrides if they provide per-pos thresholds
-        if not args.pos_thresholds:
-            args.t_lo, args.t_hi = t_lo_auto, t_hi_auto
-    except Exception:
-        pass
-
-    pos_thresholds = parse_pos_thresholds(args.pos_thresholds)
-
-    # ---------- Predict on TEST ----------
-    p_start = predict_p_start(test)
-    pred_start = predict_start_minutes(test, p_start)
-    p60 = predict_p60(test)
-    p_cameo = predict_cameo_prob(test)
     mu_cameo = predict_cameo_minutes(test)
+
+    # bench minutes via decomposition
     pred_bench_cameo = mu_cameo
-    pred_bench = predict_bench_minutes(test)
+    pred_bench = p_cameo * pred_bench_cameo
+
+    # apply caps
+    if args.use_pos_bench_caps:
+        pred_bench = np.minimum(pred_bench, per_position_bench_cap_from_train(test["pos"], bench_caps))
+    else:
+        pred_bench = np.clip(pred_bench, 0, args.bench_cap)
 
     # thresholds per-row
     tlo = np.full(len(test), args.t_lo, dtype=float)
     thi = np.full(len(test), args.t_hi, dtype=float)
-    if pos_thresholds:
-        for pos, (a, b) in pos_thresholds.items():
-            m = (test["pos"].values == pos)
-            if m.any():
-                tlo[m] = a
-                thi[m] = b
+    pos_thresholds = parse_pos_thresholds(args.pos_thresholds)
+    for pos, (a, b) in pos_thresholds.items():
+        m = (test["pos"].values == pos)
+        if m.any():
+            tlo[m] = a
+            thi[m] = b
 
     # soft mix
     mix_pred = p_start * pred_start + (1.0 - p_start) * pred_bench
@@ -1078,10 +1066,9 @@ def main():
             np.where(p_start[idx] <= tlo[idx], pred_bench[idx], mix_pred[idx])
         )
 
-    # Guardrails (optional)
-    if not args.disable_pstart_caps:
-        minutes_pred = np.where(p_start < args.pstart_cap10, np.minimum(minutes_pred, 10.0), minutes_pred)
-        minutes_pred = np.where(p_start < args.pstart_cap30, np.minimum(minutes_pred, 30.0), minutes_pred)
+    # Guardrails
+    minutes_pred = np.where(p_start < args.pstart_cap10, np.minimum(minutes_pred, 10.0), minutes_pred)
+    minutes_pred = np.where(p_start < args.pstart_cap30, np.minimum(minutes_pred, 30.0), minutes_pred)
     minutes_pred = np.clip(minutes_pred, 0, 120)
 
     # EV minute points
@@ -1097,29 +1084,22 @@ def main():
         "n_test": int(len(test)),
         "minutes_test_MAE": round(float(mean_absolute_error(y_true, minutes_pred)), 4),
     }
-    # Start gate metrics
     try:
         ys = test["is_starter"].astype(int)
         metrics["start_AUC_test"] = round(float(roc_auc_score(ys, p_start)), 4)
         metrics["start_Brier_test"] = round(float(brier_score_loss(ys, p_start)), 4)
     except Exception:
         pass
-    # Split MAEs + raw heads
     try:
         mask_s = test["is_starter"].astype(int).eq(1).to_numpy()
         mask_b = ~mask_s
         if mask_s.any():
             metrics["minutes_MAE_Started"] = round(float(mean_absolute_error(y_true[mask_s], minutes_pred[mask_s])), 4)
-            metrics["minutes_MAE_started_raw_head"] = round(float(mean_absolute_error(
-                y_true[mask_s], pred_start[mask_s])), 4)
         if mask_b.any():
             metrics["minutes_MAE_Benched"] = round(float(mean_absolute_error(y_true[mask_b], minutes_pred[mask_b])), 4)
-            metrics["minutes_MAE_benched_bench_head"] = round(float(mean_absolute_error(
-                y_true[mask_b], pred_bench[mask_b])), 4)
         metrics["bench_share"] = float(mask_b.mean())
     except Exception:
         pass
-    # P60 metrics
     try:
         y60_true = test["y60"].astype(int)
         metrics["p60_AUC_test"] = round(float(roc_auc_score(y60_true, p60)), 4)
@@ -1127,17 +1107,6 @@ def main():
     except Exception:
         pass
     metrics["ev_minutes_points_MAE"] = round(float(np.mean(np.abs(exp_min_points - true_pts))), 4)
-
-    # Calibration band diagnostics (started rows)
-    try:
-        for a, b in [(0.6,0.7),(0.7,0.8),(0.8,0.9),(0.9,1.0)]:
-            band = (p_start >= a) & (p_start < b)
-            band_s = band & test["is_starter"].astype(int).eq(1).to_numpy()
-            if band_s.any():
-                metrics[f"MAE_started_band_{a:.1f}_{b:.1f}"] = round(float(mean_absolute_error(
-                    y_true[band_s], minutes_pred[band_s])), 4)
-    except Exception:
-        pass
 
     # Persist CSV (include heads)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1147,7 +1116,7 @@ def main():
         "gw_played": test["gw_played"].values if "gw_played" in test.columns else np.nan,
         "date_played": test["date_played"].values if "date_played" in test.columns else test.get("date_sched"),
         "player_id": test["player_id"].values,
-        "player": test["player"].values if "player" in test.columns else np.nan,
+        "player": test["player"].values,  # you said always present
         "team_id": test["team_id"].values if "team_id" in test.columns else np.nan,
         "pos": test["pos"].values,
         "is_starter": test["is_starter"].values,
@@ -1178,7 +1147,7 @@ def main():
         "gw_played": test["gw_played"].values if "gw_played" in test.columns else np.nan,
         "date_played": test["date_played"].values if "date_played" in test.columns else test.get("date_sched"),
         "player_id": test["player_id"].values,
-        "player": test["player"].values if "player" in test.columns else np.nan,
+        "player": test["player"].values,
         "pos": test["pos"].values,
         "p_start": p_start,
         "p60": p60,
