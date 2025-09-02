@@ -523,8 +523,14 @@ def main():
 
     # Use the actual target_gws for naming and logging
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
-    out_path = out_dir / f"minutes_{args.future_season}_GW{gw_from_eff}_{gw_to_eff}_v1.csv"
+
+    # Ensure season subfolder exists: <out-dir>/<future-season>/
+    season_dir = (out_dir / f"{args.future_season}")
+    season_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
     out.to_csv(out_path, index=False)
+
     print(json.dumps({
         "rows": int(len(out)),
         "season": args.future_season,
@@ -535,6 +541,7 @@ def main():
         "out": str(out_path),
         "synthesized_rows": int(out.get("_is_synth", pd.Series([0]*len(out))).sum()) if "_is_synth" in out.columns else 0
     }, indent=2))
+
 
 if __name__ == "__main__":
     main()
