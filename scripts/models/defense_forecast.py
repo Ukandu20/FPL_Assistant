@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 r"""
 defense_forecast.py — leak-free forecaster for CS & DCP using trained defense heads
+Now with optional roster gating from master_teams.json.
 
 Inputs
 ------
@@ -24,6 +25,12 @@ Inputs
 
 • Team fixtures (for venue map if minutes CSV doesn’t provide it):
     - fixtures/<season>/<filename> (default: fixture_calendar.csv) with is_home and a GW column
+
+Roster gating (optional)
+------------------------
+• --teams-json points to master_teams.json with per-season rosters.
+• --league-filter narrows to a specific league label.
+• --require-on-roster forces a hard error if any rows are not on roster (else soft drop + audit CSV).
 
 Output
 ------
@@ -121,7 +128,7 @@ def _map_team_context(tf: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     elif "was_home" in t.columns:
         t["is_home"] = t["was_home"].astype(str).str.lower().isin(["1","true","yes"]).astype(int)
     else:
-        t["is_home"] = np.nan  # we'll align with minutes' is_home; duplicates will be deduped with this key too
+        t["is_home"] = np.nan
 
     # team_def_xga_venue[_z]
     if "venue" in t.columns and {"def_xga_home_roll","def_xga_away_roll"}.issubset(t.columns):
@@ -281,6 +288,77 @@ def _parse_k90(s: str) -> Dict[str, int]:
         out[k.strip().upper()] = int(v)
     return out
 
+# ---------- roster gating (same semantics as goals/assists) ----------
+
+def _norm_label(s: str) -> str:
+    return str(s or "").lower().replace("-", " ").replace("_", " ").strip()
+
+def _load_roster_pairs(teams_json: Optional[Path],
+                       season: str,
+                       league_filter: Optional[str]) -> Optional[set[tuple[str, str]]]:
+    """
+    Returns a set of allowed (team_id, player_id) pairs for the given season.
+    If teams_json is None / missing / invalid, returns None (no gating).
+    """
+    if not teams_json:
+        return None
+    p = Path(teams_json)
+    if not p.exists():
+        logging.warning("teams_json not found at %s — skipping roster gate.", p)
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        logging.warning("Failed to parse teams_json (%s): %s — skipping roster gate.", p, e)
+        return None
+
+    lf = _norm_label(league_filter) if league_filter else ""
+    allowed: set[tuple[str, str]] = set()
+
+    for team_id, obj in (data or {}).items():
+        season_info = (obj or {}).get("career", {}).get(season)
+        if not season_info:
+            continue
+        if lf:
+            if _norm_label(season_info.get("league", "")) != lf:
+                continue
+        players = season_info.get("players", []) or []
+        for pl in players:
+            pid = str(pl.get("id", "")).strip()
+            if pid:
+                allowed.add((str(team_id), pid))
+
+    if not allowed:
+        logging.warning("Roster map for %s produced 0 allowed pairs (league=%r).", season, league_filter)
+    return allowed or None
+
+def _apply_roster_gate(df: pd.DataFrame,
+                       allowed_pairs: Optional[set[tuple[str, str]]],
+                       season: str,
+                       where: str,
+                       out_artifacts_dir: Optional[Path] = None,
+                       require_on_roster: bool = False) -> pd.DataFrame:
+    """
+    Keep only rows with (team_id, player_id) inside allowed_pairs.
+    If require_on_roster is True and any rows are dropped, raise RuntimeError.
+    """
+    if allowed_pairs is None or df.empty:
+        return df
+    tid = df.get("team_id").astype(str)
+    pid = df.get("player_id").astype(str)
+    pairs = list(zip(tid.to_numpy(), pid.to_numpy()))
+    mask_ok = np.fromiter(((a, b) in allowed_pairs for (a, b) in pairs), count=len(pairs), dtype=bool)
+
+    dropped = int((~mask_ok).sum())
+    if dropped:
+        logging.info("Roster gate dropped %d %s row(s) not present on the %s roster.", dropped, where, season)
+        if out_artifacts_dir is not None:
+            out_artifacts_dir.mkdir(parents=True, exist_ok=True)
+            df.loc[~mask_ok].to_csv(out_artifacts_dir / f"roster_dropped_{where}.csv", index=False)
+        if require_on_roster:
+            raise RuntimeError(f"--require-on-roster set: {dropped} {where} rows are not on the {season} roster.")
+    return df.loc[mask_ok].copy()
+
 
 # ----------------------------- main -------------------------------------------
 
@@ -313,6 +391,12 @@ def main():
     ap.add_argument("--dump-lambdas", action="store_true", help="Include lambda_match column")
     ap.add_argument("--log-level", default="INFO")
 
+    # Roster gating
+    ap.add_argument("--teams-json", type=Path, help="Path to master_teams.json containing per-season rosters")
+    ap.add_argument("--league-filter", type=str, default="", help="Optional league name (e.g., 'ENG-Premier League')")
+    ap.add_argument("--require-on-roster", action="store_true",
+                    help="If set, error out when any scoring rows are not on the future-season roster")
+
     args = ap.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
 
@@ -323,6 +407,10 @@ def main():
     as_of_ts = (pd.Timestamp.now(tz=tz)
                 if str(args.as_of).lower() in ("now","auto","today")
                 else pd.Timestamp(args.as_of, tz=tz))
+
+    # Prepare season dirs for artifacts early (for roster audit dumps)
+    season_dir = args.out_dir / f"{args.future_season}"
+    artifacts_dir = season_dir / "artifacts"
 
     # --- Load artifacts ---
     cs_feats = _load_json(args.model_dir / "artifacts" / "cs_features_team.json")  # list[str]
@@ -344,7 +432,7 @@ def main():
         if p.exists():
             dcp_models[tag] = joblib.load(p)
     if not dcp_models:
-        raise FileNotFoundError("No DCP per-pos models found (expected dcp_DEF/MID/FWD_lmbm.joblib).")
+        raise FileNotFoundError("No DCP per-pos models found (expected dcp_DEF/MID/FWD_lgbm.joblib).")
 
     # --- Load registry up to as-of ---
     pf = _load_players_form(args.features_root, args.form_version, seasons_all)
@@ -359,7 +447,9 @@ def main():
     gw_sel = _gw_for_selection(minutes)
     avail_gws = sorted(pd.unique(gw_sel.dropna().astype(int)))
     gw_from_req = int(args.gw_from) if args.gw_from is not None else int(args.as_of_gw)
-    gw_to_req   = int(args.gw_to)   if args.gw_to   is not None else (gw_from_req + max(1, args.n_future) - 1)
+    gw_to_req = int(args.gw_to) if args.gw_to is not None else (gw_from_req + max(1, args.n_future) - 1)
+    # Fix: compute n_future safely
+    gw_to_req   = int(args.gw_to) if args.gw_to is not None else (gw_from_req + max(1, args.n_future) - 1)
     target_gws  = [g for g in avail_gws if gw_from_req <= g <= gw_to_req]
     if not target_gws:
         raise RuntimeError(f"No target GWs in [{gw_from_req}, {gw_to_req}] from minutes CSV. Available: {avail_gws}")
@@ -376,6 +466,23 @@ def main():
         logging.warning("Minutes had duplicate columns; dropping earlier duplicates: %s", set(dups))
         minutes = minutes.loc[:, ~minutes.columns.duplicated(keep="last")]
 
+    # --- Roster gating (authoritative filter for what we score) ---
+    allowed_pairs = _load_roster_pairs(
+        teams_json=args.teams_json,
+        season=args.future_season,
+        league_filter=(args.league_filter.strip() or None)
+    )
+    minutes = _apply_roster_gate(
+        minutes,
+        allowed_pairs=allowed_pairs,
+        season=args.future_season,
+        where="def_scoring",
+        out_artifacts_dir=artifacts_dir,
+        require_on_roster=args.require_on_roster
+    )
+    if minutes.empty:
+        raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
+
     # --- Venue / FDR merge ---
     gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
 
@@ -386,7 +493,6 @@ def main():
             vmap = (team_fix[["season","team_id",gw_key_t,"is_home"]]
                     .dropna(subset=[gw_key_t,"team_id"])
                     .drop_duplicates())
-            # map key to minutes' GW key without changing minutes column names
             vmap = vmap.rename(columns={gw_key_t: gw_key_m})
             minutes = minutes.merge(vmap, on=["season","team_id",gw_key_m], how="left", validate="many_to_one")
         else:
@@ -431,7 +537,6 @@ def main():
     team_rows["p_teamCS"] = p_team
 
     # --- Player last snapshot for DCP *_roll/EWM features (leak-free) ---
-    # Only keep columns that might appear in dcp_feats
     pull_cols = [c for c in dcp_feats if c not in ("venue_bin","fdr",
                                                    "team_possession_venue","opp_att_z_venue",
                                                    "team_def_xga_venue","team_def_xga_venue_z","team_att_z_venue")]
@@ -441,7 +546,7 @@ def main():
 
     # --- Build per-player future frame ---
     fut = minutes.copy()
-    # attach team CS probs & context (rename team_rows gw to minutes' gw key to avoid left-duplication)
+    # attach team CS probs & context
     team_rows_for_merge = team_rows.rename(columns={"gw_orig": gw_key_m})
     fut = fut.merge(
         team_rows_for_merge[["season", gw_key_m, "team_id", "p_teamCS",
@@ -526,7 +631,7 @@ def main():
         # Mixture probability and mixture mean
         prob_dcp = ps * p_s + (1.0 - ps) * pc * p_b
         expected_dc = ps * lam_s + (1.0 - ps) * pc * lam_b
-        lam_match = ps * lam_s + (1.0 - ps) * pc * lam_b  # same as expected mean
+        lam_match = ps * lam_s + (1.0 - ps) * pc * lam_b
 
     else:
         lam_match = lam90 * (m_pred / 90.0)
@@ -576,7 +681,6 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
 
-    season_dir = args.out_dir / f"{args.future_season}"
     season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
@@ -593,6 +697,11 @@ def main():
         "has_iso_cs": bool(iso_cs is not None),
         "dcp_models": list(dcp_models.keys()),
         "mixture_used": bool(have_mix),
+        "roster_gate": {
+            "enabled": bool(args.teams_json),
+            "league_filter": args.league_filter or None,
+            "require_on_roster": bool(args.require_on_roster),
+        }
     }
     print(json.dumps(diag, indent=2))
 
