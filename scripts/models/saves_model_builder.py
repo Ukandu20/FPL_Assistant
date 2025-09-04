@@ -1,490 +1,500 @@
 #!/usr/bin/env python3
 r"""
-saves_model_builder.py – v4.0
+saves_model_builder.py — TRAIN/TEST ONLY — v3.2.0
 
-Goalkeepers' saves model with future-season inference.
+Contract
+--------
+• Do NOT predict upcoming fixtures. Uses only players_form (played games).
+• TRAIN uses true minutes to form per-90 target.
+• TEST scales per-90 by minutes model's expected minutes (pred_minutes).
+• Split: --seasons (last = TEST) + --first-test-gw.
 
-New:
-  • --predict-season [--predict-gws 1,2,3] to predict without labels.
-  • Robust TARGET assembly with row ids (rid) for alignment.
-  • Minutes-join coverage CSV (missing_minutes_join.csv) using positional masking.
-  • Metrics (MAE) only in eval mode.
-
-Existing:
-  • Robust minutes merge (dynamic keys, normalized).
-  • No KeyError if minutes CSV lacks prob_* columns.
-  • Correct opponent feature: opp_att_z_venue = opponent's attack @ their venue.
-  • Team z features auto-built from team_form when needed.
-  • LGBM mean head for saves per-90, optional Poisson GLM head.
-  • Uses expected minutes on TARGET to convert per-90 -> per-match.
-  • Optional dropping of TARGET rows missing minutes.
-  • Drops minutes==0 from training to avoid DNP bias.
-
-Outputs:
-  data/models/saves/<model_version>/models/
-    - lgbm_saves_p90.txt
-    - poisson_saves_p90.joblib (optional)
-    - poisson_imputer.joblib (optional)
-  data/models/saves/<model_version>/features_used.txt
-  data/models/saves/<model_version>/artifacts/
-    - feature_importances.csv (best-effort)
-  data/models/saves/<model_version>/predictions/
-    - saves_predictions.csv
-    - missing_minutes_join.csv
+Outputs
+-------
+<model-out>/ (latest) and <model-out>/versions/<vN>/ (versioned):
+  - saves_predictions.csv  (no point predictions; only saves)
+  - metrics.json, meta.json
+  - artifacts/
+      feature_importances.csv
+      features_used.txt
+      missing_pred_minutes.csv (if any)
+  - models/
+      lgbm_saves_p90.txt
+      poisson_saves_p90.joblib (optional)
+      poisson_imputer.joblib (optional)
 """
 
 from __future__ import annotations
-import argparse
-import logging
-import re
+import argparse, json, logging, os, hashlib
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.linear_model import TweedieRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import TweedieRegressor
 from sklearn.metrics import mean_absolute_error
 import joblib
 
-# ───────────────────────────── IO helpers ─────────────────────────────
+CODE_VERSION = "3.2.0"
 
-def _find_seasons(features_dir: Path, version: str) -> List[str]:
-    base = features_dir / version
-    if not base.exists():
-        raise FileNotFoundError(f"{base} does not exist")
-    dirs = [d for d in base.iterdir() if d.is_dir()]
-    seasons = [d.name for d in dirs if re.match(r"^\d{4}-\d{4}$", d.name)]
-    if not seasons:
-        seasons = [d.name for d in dirs if (d / "players_form.csv").is_file()]
-    if not seasons:
-        raise FileNotFoundError(f"No season folders under {base}")
-    return sorted(seasons)
+# ------------------------------- Versioning -----------------------------------
 
-def _load_players(features_dir: Path, version: str, seasons: List[str]) -> pd.DataFrame:
+def _ensure_version_dirs(base: Path, bump: bool, tag: Optional[str]) -> Tuple[Path, str]:
+    versions_dir = base / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    latest_file = base / "latest_version.txt"
+
+    if tag:
+        vname = tag.strip()
+        vdir = versions_dir / vname
+        vdir.mkdir(parents=True, exist_ok=True)
+        latest_file.write_text(vname)
+        return vdir, vname
+
+    if latest_file.exists():
+        cur = latest_file.read_text().strip()
+        if cur and not bump:
+            vname = cur
+        else:
+            try:
+                nxt = int(cur[1:]) + 1 if cur.startswith("v") and cur[1:].isdigit() else 1
+            except Exception:
+                nxt = 1
+            vname = f"v{nxt}"
+    else:
+        vname = "v1"
+
+    vdir = versions_dir / vname
+    vdir.mkdir(parents=True, exist_ok=True)
+    latest_file.write_text(vname)
+    return vdir, vname
+
+def _write_meta(outdir: Path, args: argparse.Namespace) -> None:
+    try:
+        host = getattr(os, "uname", lambda: type("x",(object,),{"nodename":None})())().nodename
+    except Exception:
+        host = None
+    meta = {
+        "code_version": CODE_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "cmdline": " ".join(os.sys.argv),
+        "hostname": host,
+    }
+    (outdir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+# ------------------------------- I/O ------------------------------------------
+
+def _load_players(features_root: Path, form_version: str, seasons: List[str]) -> pd.DataFrame:
     frames = []
     for s in seasons:
-        fp = features_dir / version / s / "players_form.csv"
+        fp = features_root / form_version / s / "players_form.csv"
         if not fp.is_file():
-            logging.warning("Missing %s – skipped", fp)
-            continue
+            raise FileNotFoundError(f"Missing: {fp}")
         df = pd.read_csv(fp, parse_dates=["date_played"])
         df["season"] = s
         frames.append(df)
-    if not frames:
-        raise FileNotFoundError("No players_form.csv files loaded")
     df = pd.concat(frames, ignore_index=True)
 
-    need = {"season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes","saves"}
-    miss = need - set(df.columns)
+    needed = {"season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes","saves"}
+    miss = needed - set(df.columns)
     if miss:
-        raise KeyError(f"players_form missing required columns: {miss}")
-    return df
+        raise KeyError(f"players_form missing columns: {miss}")
 
-def _harmonize_keys(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "date_played" in out.columns:
-        out["date_played"] = pd.to_datetime(out["date_played"], errors="coerce").dt.date
-    for c in ("gw_orig","gw_played"):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
-    if "season" in out.columns:
-        out["season"] = out["season"].astype(str)
-    for c in ("player_id","team_id","game_id"):
-        if c in out.columns:
-            out[c] = out[c].astype(str).str.strip().str.lower()
-    return out
+    # GK only; players_form contains played fixtures only (no upcoming)
+    df = df[df["pos"].astype(str).str.upper().eq("GK")].copy()
 
-def _load_minutes_predictions(path: Optional[Path]) -> Optional[pd.DataFrame]:
-    if path is None:
-        logging.warning("No minutes predictions path provided.")
-        return None
-    if not path.is_file():
-        logging.warning("minutes_preds file not found at %s – skipping minutes merge", path)
-        return None
-    mp = pd.read_csv(path, parse_dates=["date_played"])
-    need = ["season","gw_orig","date_played","player_id","pred_exp_minutes"]
-    optional = [
-        "team_id","gw_played","game_id",
-        "prob_played1_cal","prob_played1_raw",
-        "prob_played60_cal","prob_played60_raw",
-        "pred_exp_minutes_med","pred_minutes_q0_1","pred_minutes_q0_5","pred_minutes_q0_9"
-    ]
-    cols = [c for c in (need + optional) if c in mp.columns]
-    if not set(need).issubset(cols):
-        missing = set(need) - set(cols)
-        logging.warning("minutes_preds missing columns %s – skipping", missing)
-        return None
-    mp = _harmonize_keys(mp[cols].copy())
-    key = ["season","gw_orig","date_played","player_id"]
-    mp = mp.sort_values(key).drop_duplicates(subset=key, keep="last")
-    return mp
+    # harmonize keys
+    for c in ("player_id","team_id"):
+        df[c] = df[c].astype(str).str.strip().str.lower()
+    df["season"] = df["season"].astype(str)
+    df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
 
-# ───────────────────────────── team z merge ─────────────────────────────
+    return df.sort_values(["season","date_played","gw_orig","player_id","team_id"]).reset_index(drop=True)
 
-def _merge_team_z(df_players: pd.DataFrame, team_form_dir: Path, version: str) -> pd.DataFrame:
-    """
-    Add team_def_z_venue (our defense @ our venue) and
-    opp_att_z_venue (opponent attack @ their venue), built from *_roll_z columns.
-    """
-    seasons = sorted(df_players["season"].astype(str).unique())
+def _load_team_form(features_root: Path, form_version: str, seasons: List[str]) -> Optional[pd.DataFrame]:
     frames = []
     for s in seasons:
-        fp = team_form_dir / version / s / "team_form.csv"
+        fp = features_root / form_version / s / "team_form.csv"
         if not fp.is_file():
             logging.warning("team_form missing for %s", s)
             continue
-        tf = pd.read_csv(fp, parse_dates=["date_played"])
-        tf["season"] = s
-        frames.append(tf)
-
+        t = pd.read_csv(fp, parse_dates=["date_played"])
+        t["season"] = s
+        frames.append(t)
     if not frames:
-        logging.warning("No team_form files loaded – filling team/opp z with NaN")
-        df_players["team_def_z_venue"] = np.nan
-        df_players["opp_att_z_venue"] = np.nan
-        return df_players
+        return None
+    return pd.concat(frames, ignore_index=True)
 
-    tf = pd.concat(frames, ignore_index=True)
+def _merge_team_z(players: pd.DataFrame, team_form: Optional[pd.DataFrame]) -> pd.DataFrame:
+    out = players.copy()
+    if team_form is None:
+        out["team_def_z_venue"] = np.nan
+        out["opp_att_z_venue"] = np.nan
+        return out
 
-    needed = {
-        "season","gw_orig","team_id","venue","home_id","away_id",
-        "def_xga_home_roll_z","def_xga_away_roll_z",
-        "att_xg_home_roll_z","att_xg_away_roll_z",
-    }
-    missing = needed - set(tf.columns)
-    if missing:
-        logging.warning("team_form lacks z inputs (%s); filling with NaN", sorted(missing))
-        df_players["team_def_z_venue"] = np.nan
-        df_players["opp_att_z_venue"] = np.nan
-        return df_players
-
-    tf = tf[list(needed)].copy()
+    tf = team_form.copy()
+    need = {"season","gw_orig","team_id","venue","home_id","away_id",
+            "def_xga_home_roll_z","def_xga_away_roll_z","att_xg_home_roll_z","att_xg_away_roll_z"}
+    if not need.issubset(tf.columns):
+        out["team_def_z_venue"] = np.nan
+        out["opp_att_z_venue"] = np.nan
+        logging.warning("team_form lacks z inputs; filling NaNs.")
+        return out
 
     tf["def_z_at_venue"] = np.where(tf["venue"].eq("Home"), tf["def_xga_home_roll_z"], tf["def_xga_away_roll_z"])
     tf["att_z_at_venue"] = np.where(tf["venue"].eq("Home"), tf["att_xg_home_roll_z"], tf["att_xg_away_roll_z"])
-    tf["opp_team_id"] = np.where(
-        tf["team_id"].astype(str).str.lower().eq(tf["home_id"].astype(str).str.lower()),
-        tf["away_id"], tf["home_id"]
-    )
+    tf["opp_team_id"] = np.where(tf["team_id"].astype(str).str.lower().eq(tf["home_id"].astype(str).str.lower()),
+                                 tf["away_id"], tf["home_id"])
 
-    def_lu = (tf[["season","gw_orig","team_id","def_z_at_venue"]]
-              .drop_duplicates()
-              .rename(columns={"def_z_at_venue":"team_def_z_venue"}))
-    att_lu = (tf[["season","gw_orig","team_id","att_z_at_venue"]]
-              .drop_duplicates()
-              .rename(columns={"team_id":"opp_team_id","att_z_at_venue":"opp_att_z_venue"}))
+    def_lu = tf[["season","gw_orig","team_id","def_z_at_venue"]].drop_duplicates().rename(columns={"def_z_at_venue":"team_def_z_venue"})
+    att_lu = tf[["season","gw_orig","opp_team_id","att_z_at_venue"]].drop_duplicates().rename(columns={"opp_team_id":"opp_team_id","att_z_at_venue":"opp_att_z_venue"})
     opp_lu = tf[["season","gw_orig","team_id","opp_team_id"]].drop_duplicates()
 
-    out = _harmonize_keys(df_players)
-    opp_lu = _harmonize_keys(opp_lu)
-    def_lu = _harmonize_keys(def_lu)
-    att_lu = _harmonize_keys(att_lu)
+    # normalize ids
+    for d in (def_lu, att_lu, opp_lu):
+        for c in set(d.columns) & {"team_id","opp_team_id"}:
+            d[c] = d[c].astype(str).str.strip().str.lower()
 
     out = out.merge(opp_lu, on=["season","gw_orig","team_id"], how="left")
     out = out.merge(def_lu, on=["season","gw_orig","team_id"], how="left")
     out = out.merge(att_lu, on=["season","gw_orig","opp_team_id"], how="left")
-
     for c in ["team_def_z_venue","opp_att_z_venue"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    logging.info("team_form: built z cols -> team_def_z_venue (ours@venue), opp_att_z_venue (opp@venue)")
     return out
 
-# ───────────────────────────── dataset / features ─────────────────────────────
+def _load_expected_minutes(path: Optional[Path]) -> Optional[pd.DataFrame]:
+    """
+    expected_minutes.csv from minutes model.
+    Need at least: season, gw_orig, date_played, player_id, pred_minutes.
+    """
+    if path is None:
+        return None
+    if not path.is_file():
+        logging.warning("expected_minutes file not found at %s", path)
+        return None
+    df = pd.read_csv(path, parse_dates=["date_played"])
+    base_need = {"season","gw_orig","date_played","player_id","pred_minutes"}
+    missing = base_need - set(df.columns)
+    if missing:
+        logging.warning("expected_minutes missing %s", missing)
+        return None
+    # normalize ids
+    for c in ("player_id",):
+        df[c] = df[c].astype(str).str.strip().str.lower()
+    df["season"] = df["season"].astype(str)
+    df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
+    key = ["season","gw_orig","date_played","player_id"]
+    return df.sort_values(key).drop_duplicates(subset=key, keep="last")[key + ["pred_minutes"]].copy()
 
-def _time_split_last_n(df: pd.DataFrame, test_season: str, last_n_gws: int) -> Tuple[pd.Index, pd.Index]:
-    gws = sorted(df.loc[df["season"] == test_season, "gw_orig"].dropna().unique())
-    if not gws:
-        raise ValueError(f"No gw_orig found for season {test_season}")
-    test_gws = set(gws[-last_n_gws:])
-    test_idx = df.index[(df["season"] == test_season) & (df["gw_orig"].isin(test_gws))]
-    train_idx = df.index.difference(test_idx)
-    if len(test_idx) == 0:
-        raise ValueError("Test split produced 0 rows – check season/last-n")
-    return train_idx, test_idx
+# ------------------------------- Split ----------------------------------------
 
-def _build_inference_index(df: pd.DataFrame, season: str, gws: Optional[List[int]]) -> pd.Index:
-    mask = (df["season"] == season)
-    if gws is not None:
-        mask &= df["gw_orig"].isin(gws)
-    idx = df.index[mask]
-    if len(idx) == 0:
-        raise ValueError(f"No rows available to predict for season={season} gws={gws}")
-    return idx
+def _chrono_split(df: pd.DataFrame, seasons: List[str], first_test_gw: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    test_season = seasons[-1]
+    g = pd.to_numeric(df["gw_orig"], errors="coerce")
+    s = df["season"].astype(str)
+    train_mask = (s < test_season) | ((s == test_season) & (g < first_test_gw))
+    test_mask  = (s == test_season) & (g >= first_test_gw)
+    train = df.loc[train_mask].copy()
+    test  = df.loc[test_mask].copy()
+    if train.empty or test.empty:
+        # fallback by date boundary if the GW number isn't fully present
+        cutoff = pd.to_datetime(test["date_played"]).min()
+        if pd.notna(cutoff):
+            train = df[(s < test_season) | ((s == test_season) & (df["date_played"] < cutoff))].copy()
+            test  = df[(s == test_season) & (df["date_played"] >= cutoff)].copy()
+    if train.empty or test.empty:
+        raise ValueError("Split produced empty train or test; check --seasons/--first-test-gw.")
+    return train, test
+
+def _tail_index(df: pd.DataFrame, frac: float = 0.15) -> Tuple[pd.Index, pd.Index]:
+    # robust: if time columns exist, sort by them; else fall back to index order
+    cols = set(df.columns)
+    if {"season","date_played","gw_orig"}.issubset(cols):
+        dfo = df.sort_values(["season","date_played","gw_orig"])
+    else:
+        dfo = df.sort_index()
+    n = len(dfo)
+    if n < 10:
+        return dfo.index, dfo.index
+    k = max(1, int(round(frac * n)))
+    val_idx = dfo.index[-k:]
+    fit_idx = dfo.index.difference(val_idx)
+    return fit_idx, val_idx
+
+# ------------------------------- Features -------------------------------------
 
 def _build_features(df: pd.DataFrame, na_thresh: float) -> Tuple[pd.DataFrame, List[str]]:
     feats: List[str] = []
-    df = df.copy()
-    df["venue_bin"] = (df["venue"].astype(str) == "Home").astype(int); feats.append("venue_bin")
+    X = df.copy()
+    X["venue_bin"] = (X["venue"].astype(str) == "Home").astype(int); feats.append("venue_bin")
     for c in ["team_def_z_venue","opp_att_z_venue"]:
-        if c in df.columns:
+        if c in X.columns:
             feats.append(c)
+    # GK rolls
     roll_candidates = [
         "gk_saves_p90_roll","gk_saves_p90_home_roll","gk_saves_p90_away_roll",
         "gk_sot_against_p90_roll","gk_sot_against_p90_home_roll","gk_sot_against_p90_away_roll",
         "gk_saves_p90_roll_z","gk_saves_p90_home_roll_z","gk_saves_p90_away_roll_z",
         "gk_sot_against_p90_roll_z","gk_sot_against_p90_home_roll_z","gk_sot_against_p90_away_roll_z",
     ]
-    keep_roll = [c for c in roll_candidates if c in df.columns and df[c].notna().mean() >= na_thresh]
-    feats.extend(sorted(set(keep_roll)))
-    X = df[feats].copy()
-    return X, feats
+    keep = [c for c in roll_candidates if c in X.columns and X[c].notna().mean() >= na_thresh]
+    feats.extend(sorted(set(keep)))
+    return X[feats].copy(), feats
 
-def _lgbm_reg():
+# ------------------------------- Models ---------------------------------------
+
+def _lgbm_regressor() -> lgb.LGBMRegressor:
     return lgb.LGBMRegressor(
         objective="regression",
         n_estimators=2000,
-        learning_rate=0.03,
+        learning_rate=0.035,
         num_leaves=127,
-        min_data_in_leaf=15,
+        min_data_in_leaf=20,
         subsample=0.9,
         colsample_bytree=0.9,
         reg_lambda=1.0,
-        n_jobs=-1,
         random_state=42,
+        n_jobs=-1,
         verbosity=-1,
     )
 
-def _train_glm_poisson(X: np.ndarray, y: np.ndarray) -> TweedieRegressor:
-    model = TweedieRegressor(power=1.0, link="log", alpha=0.0005, max_iter=5000, tol=1e-6)
-    model.fit(X, y)
-    return model
+def _train_lgbm_p90(train_rows: pd.DataFrame, Xtr: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[str, Any]]:
+    """
+    train_rows: TRAIN subset of the original dataframe (has season/date_played/gw_orig and y_saves_p90).
+    Xtr: feature matrix aligned to train_rows.index
+    """
+    y = train_rows["y_saves_p90"]
+    fi, vi = _tail_index(train_rows, frac=0.15)
+    model = _lgbm_regressor()
+    model.fit(
+        Xtr.loc[fi], y.loc[fi],
+        eval_set=[(Xtr.loc[vi], y.loc[vi])],
+        eval_metric="l1",
+        callbacks=[lgb.early_stopping(stopping_rounds=80, verbose=False)]
+    )
+    info: Dict[str, Any] = {"best_iteration": int(getattr(model, "best_iteration_", model.n_estimators))}
+    try:
+        pred_val = np.clip(model.predict(Xtr.loc[vi]), 0, None)
+        info["val_mae_p90"] = float(mean_absolute_error(y.loc[vi], pred_val))
+    except Exception:
+        pass
+    return model, info
 
-# ───────────────────────────── minutes merge helpers ─────────────────────────────
+def _train_poisson(Xtr: pd.DataFrame, ytr: np.ndarray) -> Tuple[TweedieRegressor, SimpleImputer]:
+    imp = SimpleImputer(strategy="median")
+    Xn = imp.fit_transform(Xtr)
+    glm = TweedieRegressor(power=1.0, link="log", alpha=5e-4, max_iter=5000, tol=1e-6)
+    glm.fit(Xn, ytr)
+    return glm, imp
 
-def _best_join_keys(left: pd.DataFrame, right: pd.DataFrame):
-    cands = [
-        ["season","game_id","player_id"],
-        ["season","gw_played","player_id"],
-        ["season","gw_orig","date_played","player_id"],
-    ]
-    for ks in cands:
-        if all(k in left.columns for k in ks) and all(k in right.columns for k in ks):
-            return ks
-    raise KeyError("No compatible join key between dump and minutes predictions")
+# ------------------------------- Helpers --------------------------------------
 
-def _write_missing_join_csv(out_pred_dir: Path, frame: pd.DataFrame, miss_mask: pd.Series) -> None:
-    """Write rows (from `frame`) where minutes were missing, using positional boolean mask."""
-    if isinstance(miss_mask, pd.Series):
-        mask_np = miss_mask.to_numpy()
-    else:
-        mask_np = np.asarray(miss_mask, dtype=bool)
-    if mask_np.any():
-        miss = frame.iloc[mask_np].copy()
-        (out_pred_dir / "missing_minutes_join.csv").parent.mkdir(parents=True, exist_ok=True)
-        miss.to_csv(out_pred_dir / "missing_minutes_join.csv", index=False)
+def _sha1_of_list(xs: List[str]) -> str:
+    h = hashlib.sha1()
+    for s in xs:
+        h.update(s.encode("utf-8")); h.update(b"|")
+    return h.hexdigest()
 
-# ───────────────────────────── main ─────────────────────────────
+# ------------------------------- Main -----------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--features-dir", type=Path, default=Path("data/processed/features"))
-    ap.add_argument("--version", required=True)
-    ap.add_argument("--team-form-dir", type=Path, default=Path("data/processed/features"))
-    ap.add_argument("--test-season", required=True)
-    ap.add_argument("--test-last-n", type=int, default=10)
+    ap.add_argument("--seasons", required=True,
+                    help="Comma-separated seasons; last is TEST (e.g. 2022-2023,2023-2024,2024-2025)")
+    ap.add_argument("--first-test-gw", type=int, default=26)
 
-    ap.add_argument("--predict-season", type=str, default=None,
-                    help="If set, run inference for this season (all GWs or --predict-gws).")
-    ap.add_argument("--predict-gws", type=str, default=None,
-                    help="Comma-separated GW list for inference, e.g., '1,2,3'.")
+    ap.add_argument("--features-root", type=Path, default=Path("data/processed/registry/features"))
+    ap.add_argument("--form-version", required=True)
 
     ap.add_argument("--na-thresh", type=float, default=0.70)
-    ap.add_argument("--minutes-preds", type=Path, help="path to minutes_predictions.csv")
-    ap.add_argument("--drop-missing-minutes", action="store_true", help="drop TARGET rows without pred_exp_minutes")
-    ap.add_argument("--poisson-heads", action="store_true")
-    ap.add_argument("--models-out", type=Path, default=Path("data/models/saves"))
-    ap.add_argument("--model-version", default="v4_0")
+    ap.add_argument("--poisson-head", action="store_true")
+
+    ap.add_argument("--minutes-preds", type=Path, help="expected_minutes.csv from minutes model")
+    ap.add_argument("--require-pred-minutes", action="store_true", help="Fail if pred_minutes missing for any TEST row")
+
+    ap.add_argument("--model-out", type=Path, default=Path("data/models/saves"))
+    ap.add_argument("--bump-version", action="store_true")
+    ap.add_argument("--version-tag", type=str, default="")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
 
-    seasons = _find_seasons(args.features_dir, args.version)
-    logging.info("Found seasons: %s", ", ".join(seasons))
+    seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
+    test_season = seasons[-1]
 
-    df_all = _load_players(args.features_dir, args.version, seasons)
-    df_all = df_all[df_all["pos"] == "GK"].copy()
-    df_all = _harmonize_keys(df_all)
+    latest_dir = args.model_out; latest_dir.mkdir(parents=True, exist_ok=True)
+    version_dir, version_name = _ensure_version_dirs(latest_dir, bump=args.bump_version, tag=(args.version_tag or None))
+    logging.info("Writing artifacts to %s (versioned: %s) and %s (latest).", version_dir, version_name, latest_dir)
 
-    # stable order + rid
-    df_all = df_all.sort_values(["season","date_played","gw_orig","player_id","team_id"]).reset_index(drop=True)
-    df_all["rid"] = df_all.index.astype(int)
+    # ---- Load & prep (played matches only) ----
+    df = _load_players(args.features_root, args.form_version, seasons)
+    team_form = _load_team_form(args.features_root, args.form_version, seasons)
+    df = _merge_team_z(df, team_form)
 
-    # team z merge (adds team_def_z_venue, opp_att_z_venue)
-    df_all = _merge_team_z(df_all, args.team_form_dir, args.version)
+    # Features
+    X_all, feat_cols = _build_features(df, na_thresh=args.na_thresh)
+    feat_sha = _sha1_of_list(list(X_all.columns))
 
-    # features over full DF
-    X_all, feat_cols = _build_features(df_all, na_thresh=args.na_thresh)
+    # Targets per-90 for TRAIN (true minutes)
+    m = df["minutes"].fillna(0).clip(lower=0)
+    m90 = (m / 90.0).replace(0, np.nan)
+    df["y_saves_p90"] = (df["saves"] / m90).astype(float)
 
-    # choose TRAIN and TARGET sets
-    if args.predict_season:
-        train_idx, _ = _time_split_last_n(df_all, args.test_season, args.test_last_n)  # keep training aligned with defense/ga pipelines
-        df_train = df_all.loc[train_idx].copy()
-        pred_gws = None if not args.predict_gws else [int(x) for x in args.predict_gws.split(",")]
-        target_idx = _build_inference_index(df_all, args.predict_season, pred_gws)
-        df_target = df_all.loc[target_idx].copy()
-        logging.info("Mode: PREDICT-ONLY for season %s%s",
-                     args.predict_season,
-                     f" GWs {args.predict_gws}" if args.predict_gws else " (all GWs)")
-    else:
-        train_idx, test_idx = _time_split_last_n(df_all, args.test_season, args.test_last_n)
-        df_train = df_all.loc[train_idx].copy()
-        df_target = df_all.loc[test_idx].copy()
-        logging.info("Mode: EVAL (last %d GWs of %s)", args.test_last_n, args.test_season)
+    # Split
+    train_df, test_df = _chrono_split(df, seasons, args.first_test_gw)
+    test_df = test_df.copy()
+    test_df["rid"] = np.arange(len(test_df))  # immutable identity for TEST rows
 
-    # training mask: minutes > 0 and label present
-    m = df_train["minutes"].fillna(0).clip(lower=0)
-    tr_mask = (m > 0) & df_train["saves"].notna()
-    if tr_mask.sum() == 0:
+    # TRAIN rows: finite per-90 label
+    train_rows = train_df[np.isfinite(train_df["y_saves_p90"])].copy()
+    if train_rows.empty:
         raise ValueError("No valid GK training rows (minutes>0 and saves present).")
-    Xtr_df = X_all.loc[df_train.index].iloc[tr_mask.values].copy()
-    ytr_p90 = (df_train.loc[tr_mask, "saves"] / (m.loc[tr_mask] / 90.0)).to_numpy()
 
-    # Train mean head
-    model_lgb = _lgbm_reg()
-    model_lgb.fit(Xtr_df, ytr_p90)
+    Xtr = X_all.loc[train_rows.index]
+    model_lgb, lgb_info = _train_lgbm_p90(train_rows, Xtr)
 
     # Optional Poisson head
-    model_pois = None
-    imputer = None
-    if args.poisson_heads:
-        imputer = SimpleImputer(strategy="median")
-        Xtr_np = imputer.fit_transform(Xtr_df)
-        model_pois = _train_glm_poisson(Xtr_np, ytr_p90)
+    glm = None; imputer = None
+    if args.poisson_head:
+        ytr = train_rows["y_saves_p90"].to_numpy()
+        glm, imputer = _train_poisson(Xtr, ytr)
 
-    # TARGET dump + minutes merge (rid for alignment)
-    dump_cols = ["season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes","rid"]
-    dump = _harmonize_keys(df_target[dump_cols].copy())
+    # ---- Build 'out' from TEST + minutes ----
+    key = ["season","gw_orig","date_played","player_id"]
+    out = test_df[["season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes","rid"]].copy()
 
-    mp = _load_minutes_predictions(args.minutes_preds)
-    join = None
-    kept_rids = np.array([], dtype=int)
-    if mp is not None and len(dump) > 0:
-        right = mp.drop_duplicates()
-        join_keys = _best_join_keys(dump, right)
-
-        select_cols = join_keys + ["pred_exp_minutes"]
-        for c in ("prob_played1_cal","prob_played1_raw","prob_played60_cal","prob_played60_raw"):
-            if c in right.columns and c not in select_cols:
-                select_cols.append(c)
-
-        join = dump.merge(right[select_cols], on=join_keys, how="left", validate="many_to_one")
-        # pick one appearance prob for reference
-        join["p_appear"] = np.nan
-        for cand in ("prob_played1_cal","prob_played60_cal","prob_played1_raw","prob_played60_raw"):
-            if cand in join.columns:
-                join["p_appear"] = pd.to_numeric(join[cand], errors="coerce")
-                break
-
-        miss_mask = join["pred_exp_minutes"].isna()
-        n_miss = int(miss_mask.sum())
-        if n_miss:
-            logging.warning("Minutes merge: %d/%d TARGET GK rows missing pred_exp_minutes after join.", n_miss, len(join))
-            _write_missing_join_csv(args.models_out / args.model_version / "predictions", join, miss_mask)
-
-        if args.drop_missing_minutes:
-            kept = join.loc[~miss_mask].reset_index(drop=True)
-            kept_rids = kept["rid"].astype(int).to_numpy()
-            dump_out = kept.drop(columns=["rid"]).copy()
-        else:
-            # keep all rows; fill missing mins with 0 for scaling
-            join["pred_exp_minutes"] = join["pred_exp_minutes"].fillna(0.0)
-            kept = join.reset_index(drop=True)
-            kept_rids = kept["rid"].astype(int).to_numpy()
-            dump_out = kept.drop(columns=["rid"]).copy()
+    em = _load_expected_minutes(args.minutes_preds)
+    if args.require_pred_minutes and em is None:
+        raise ValueError("--require-pred-minutes was set but --minutes-preds is missing/invalid.")
+    if em is not None:
+        out = out.merge(em, on=key, how="left", validate="many_to_one")
+        if "pred_minutes" not in out.columns:
+            raise ValueError("expected_minutes is missing 'pred_minutes'.")
+        miss_min = out["pred_minutes"].isna()
+        if miss_min.any():
+            miss_df = out.loc[miss_min, key + ["team_id","player","pos","minutes"]]
+            for target in (latest_dir, version_dir):
+                (target / "artifacts").mkdir(parents=True, exist_ok=True)
+                miss_df.to_csv(target / "artifacts" / "missing_pred_minutes.csv", index=False)
+            msg = f"{int(miss_min.sum())}/{len(out)} TEST rows lack pred_minutes. See artifacts/missing_pred_minutes.csv."
+            if args.require_pred_minutes:
+                raise ValueError(msg)
+            logging.warning(msg)
+        out = out.loc[~miss_min].reset_index(drop=True)
     else:
-        if mp is None:
-            logging.warning("No minutes predictions provided; cannot scale per-90 to per-match.")
-        dump_out = dump.drop(columns=["rid"]).copy()
-        dump_out["pred_exp_minutes"] = 0.0
-        kept_rids = dump["rid"].astype(int).to_numpy()
+        # Fallback: use observed minutes to scale if minutes preds not provided
+        out["pred_minutes"] = out["minutes"].astype(float)
 
-    # Slice TARGET features by rid
-    Xte_df = X_all.loc[kept_rids].copy()
+    # Merge true labels for TEST and drop any unplayed (defensive)
+    truth = test_df.set_index("rid")
+    out["saves_true"]   = truth.loc[out["rid"], "saves"].to_numpy()
+    out["minutes_true"] = truth.loc[out["rid"], "minutes"].to_numpy()
+    keep_mask = np.isfinite(out["saves_true"].to_numpy())
+    if (~keep_mask).any():
+        logging.warning("Dropping %d TEST rows without true saves label (unplayed).", int((~keep_mask).sum()))
+    out = out.loc[keep_mask].reset_index(drop=True)
 
-    # Optional eval labels
-    yte = None
-    if not args.predict_season and len(kept_rids) > 0:
-        yte = df_all.loc[kept_rids, "saves"].to_numpy()
-
-    logging.info("Train rows: %d • Target rows kept: %d", len(Xtr_df), len(Xte_df))
+    # ---- Align predictions to FINAL out rows (rid -> original index) ----
+    rid_to_orig = (
+        test_df.reset_index()  # adds 'index' = original row index
+               .rename(columns={"index": "orig_index"})
+               .set_index("rid")["orig_index"]
+    )
+    orig_idx = rid_to_orig.loc[out["rid"]].to_numpy()
+    Xte_aligned = X_all.loc[orig_idx]
 
     # Predict per-90
-    if len(Xte_df) > 0:
-        gk_p90_mean = np.clip(model_lgb.predict(Xte_df), 0, None)
+    p90_mean = np.clip(model_lgb.predict(Xte_aligned), 0, None)
+    if args.poisson_head:
+        Xte_np = imputer.transform(Xte_aligned)
+        p90_pois = np.clip(glm.predict(Xte_np), 0, None)
     else:
-        gk_p90_mean = np.array([])
+        p90_pois = np.full(len(out), np.nan)
 
-    # per-match scaling by expected minutes for the game
-    if len(dump_out) > 0:
-        scale = (pd.to_numeric(dump_out["pred_exp_minutes"], errors="coerce").fillna(0.0).to_numpy() / 90.0)
-        pred_saves_mean = gk_p90_mean * scale
-        exp_save_points_mean = pred_saves_mean / 3.0
-    else:
-        pred_saves_mean = exp_save_points_mean = np.array([])
+    # Scale to per-match using pred_minutes
+    scale = out["pred_minutes"].to_numpy() / 90.0
+    pred_saves_mean = p90_mean * scale
+    pred_saves_pois = p90_pois * scale if args.poisson_head else np.full(len(out), np.nan)
 
-    # Optional Poisson head
-    if args.poisson_heads and len(Xte_df) > 0:
-        Xte_np = SimpleImputer(strategy="median").fit(Xtr_df).transform(Xte_df) if imputer is None else imputer.transform(Xte_df)
-        gk_p90_pois = np.clip(model_pois.predict(Xte_np), 0, None) if model_pois is not None else None
-        if gk_p90_pois is not None and len(dump_out) > 0:
-            pred_saves_pois = gk_p90_pois * scale
-            exp_save_points_pois = pred_saves_pois / 3.0
-        else:
-            pred_saves_pois = exp_save_points_pois = None
-    else:
-        gk_p90_pois = pred_saves_pois = exp_save_points_pois = None
+    # ---- Metrics ----
+    y_true = out["saves_true"].to_numpy()
+    # p90 truth from observed minutes (avoid mixing with minutes model)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        obs_scale = np.where(out["minutes_true"].to_numpy() > 0, out["minutes_true"].to_numpy() / 90.0, np.nan)
+        y_p90_true = np.where(obs_scale > 0, y_true / obs_scale, np.nan)
+    p90_mask = np.isfinite(y_p90_true)
 
-    # Evaluate (only in eval mode)
-    if (not args.predict_season) and yte is not None and len(pred_saves_mean) > 0:
+    metrics: Dict[str, Any] = {
+        "code_version": CODE_VERSION,
+        "n_train": int(len(Xtr)),
+        "n_test_rows_written": int(len(out)),
+        "poisson_head": bool(args.poisson_head),
+        "require_pred_minutes": bool(args.require_pred_minutes),
+        "test_season": test_season,
+        "first_test_gw": int(args.first_test_gw),
+        "features_sha1": feat_sha,
+    }
+    if p90_mask.any():
+        metrics["mae_p90"] = float(mean_absolute_error(y_p90_true[p90_mask], p90_mean[p90_mask]))
+        if args.poisson_head and np.isfinite(p90_pois).any():
+            metrics["mae_p90_pois"] = float(mean_absolute_error(y_p90_true[p90_mask], p90_pois[p90_mask]))
+
+    # Match-level MAEs
+    pred_match_actualmins = p90_mean * np.where(out["minutes_true"].to_numpy() > 0, out["minutes_true"].to_numpy() / 90.0, 0.0)
+    metrics["mae_match_actualmins_meanHead"] = float(mean_absolute_error(y_true, pred_match_actualmins))
+    metrics["mae_match_predmins_meanHead"]   = float(mean_absolute_error(y_true, pred_saves_mean))
+    if args.poisson_head and np.isfinite(pred_saves_pois).any():
+        pred_match_actualmins_pois = p90_pois * np.where(out["minutes_true"].to_numpy() > 0, out["minutes_true"].to_numpy() / 90.0, 0.0)
+        metrics["mae_match_actualmins_poisHead"] = float(mean_absolute_error(y_true, pred_match_actualmins_pois))
+        metrics["mae_match_predmins_poisHead"]   = float(mean_absolute_error(y_true, pred_saves_pois))
+
+    # ---- Assemble output (no point predictions) ----
+    out["pred_saves_p90_mean"]    = p90_mean
+    out["pred_saves_mean"]        = pred_saves_mean
+    out["pred_saves_p90_poisson"] = p90_pois
+    out["pred_saves_poisson"]     = pred_saves_pois
+
+    cols = [
+        "season","gw_orig","date_played","player_id","team_id","player","pos","venue",
+        "minutes_true","pred_minutes","saves_true",
+        "pred_saves_p90_mean","pred_saves_mean",
+        "pred_saves_p90_poisson","pred_saves_poisson"
+    ]
+    out = out[cols].copy()
+
+    # ---- Persist ----
+    for target in (latest_dir, version_dir):
+        (target / "artifacts").mkdir(parents=True, exist_ok=True)
+        (target / "models").mkdir(parents=True, exist_ok=True)
+        out.to_csv(target / "saves_predictions.csv", index=False)
         try:
-            mae_mean = mean_absolute_error(yte, pred_saves_mean)
-            logging.info("Test MAE (saves, mean head): %.4f", mae_mean)
+            fi = pd.DataFrame({"feature": list(X_all.columns), "importance": model_lgb.feature_importances_})
+            fi.to_csv(target / "artifacts" / "feature_importances.csv", index=False)
         except Exception:
             pass
-        if args.poisson_heads and pred_saves_pois is not None:
-            try:
-                mae_pois = mean_absolute_error(yte, pred_saves_pois)
-                logging.info("Test MAE (saves, poisson): %.4f", mae_pois)
-            except Exception:
-                pass
+        (target / "artifacts" / "features_used.txt").write_text("\n".join(list(X_all.columns)), encoding="utf-8")
+        (target / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        _write_meta(target, args)
 
-    # Assemble output
-    out = dump_out.copy()
-    out["pred_saves_p90_mean"] = gk_p90_mean
-    out["pred_saves_mean"] = pred_saves_mean
-    out["exp_save_points_mean"] = exp_save_points_mean
-    if args.poisson_heads and gk_p90_pois is not None:
-        out["pred_saves_p90_poisson"] = gk_p90_pois
-        out["pred_saves_poisson"] = pred_saves_pois
-        out["exp_save_points_poisson"] = exp_save_points_pois
-
-    # Save models + predictions
-    out_base = args.models_out / args.model_version
-    (out_base / "models").mkdir(parents=True, exist_ok=True)
-    (out_base / "predictions").mkdir(parents=True, exist_ok=True)
-    (out_base / "artifacts").mkdir(parents=True, exist_ok=True)
-
-    model_lgb.booster_.save_model(out_base / "models" / "lgbm_saves_p90.txt")
-    if args.poisson_heads and model_pois is not None and imputer is not None:
-        joblib.dump(model_pois, out_base / "models" / "poisson_saves_p90.joblib")
-        joblib.dump(imputer,   out_base / "models" / "poisson_imputer.joblib")
-
-    # feature importances (best effort)
+    # Save models
     try:
-        pd.DataFrame({"feature": X_all.columns.tolist(), "importance": model_lgb.feature_importances_}) \
-          .to_csv(out_base / "artifacts" / "feature_importances.csv", index=False)
+        model_lgb.booster_.save_model(str(latest_dir / "models" / "lgbm_saves_p90.txt"))
+        model_lgb.booster_.save_model(str(version_dir / "models" / "lgbm_saves_p90.txt"))
     except Exception:
         pass
-    (out_base / "features_used.txt").write_text("\n".join(X_all.columns.tolist()), encoding="utf-8")
+    if args.poisson_head and (glm is not None) and (imputer is not None):
+        joblib.dump(glm, latest_dir / "models" / "poisson_saves_p90.joblib")
+        joblib.dump(imputer, latest_dir / "models" / "poisson_imputer.joblib")
+        joblib.dump(glm, version_dir / "models" / "poisson_saves_p90.joblib")
+        joblib.dump(imputer, version_dir / "models" / "poisson_imputer.joblib")
 
-    fp = out_base / "predictions" / "saves_predictions.csv"
-    sort_keys = [k for k in ["season","gw_orig","date_played","team_id","player_id"] if k in out.columns]
-    out.sort_values(sort_keys).to_csv(fp, index=False)
-    logging.info("Wrote predictions to %s", fp.resolve())
-    logging.info("Models & predictions saved to %s", out_base.resolve())
+    logging.info(json.dumps(metrics, indent=2))
+    logging.info("Artifacts written to %s (latest) and %s (versioned: %s).", latest_dir, version_dir, version_name)
 
 if __name__ == "__main__":
     main()
