@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-minutes_forecast.py — score future GWs using fixed v1 gates/calibration.
+minutes_forecast.py — score future GWs using fixed v1 gates/calibration + roster gating.
 
 • Trains minutes regressors on: all history + current-season rows strictly before an as-of timestamp.
 • Predicts for a GW window (default next 3 GWs).
 • If player future rows are missing, synthesizes them from the team fixture calendar + an as-of squad snapshot.
+• Optional roster gate (master_teams.json): only predict players on the future-season roster (optionally filtered by league).
 • Robust GW selection:
     - Prefer gw_played only if >0, else fall back to gw_orig, else gw.
     - Soft-selects the next available GWs ≥ --as-of-gw (up to --n-future).
@@ -17,12 +18,13 @@ Reads FDR (optional) from:
   <form-root>/<version>/<season>/<team|player>_form.csv
 """
 
-import argparse, json
+import argparse, json, logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import joblib
+from typing import Optional, Dict, List, Tuple, Set
 
 from scripts.models.minutes_model_builder import (
     _pick_gw_col, load_minutes, attach_fdr, make_features,
@@ -31,7 +33,7 @@ from scripts.models.minutes_model_builder import (
     predict_with_model, taper_start_minutes
 )
 
-# ----------------------------- utils -----------------------------------------
+# ----------------------------- utils ------------------------------------------
 
 def load_booster(path: Path) -> lgb.Booster:
     if not path.exists():
@@ -109,7 +111,6 @@ def load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFra
 
     # Team id column naming tolerance
     if "team_id" not in tf.columns:
-        # try some common variants
         for alt in ["team", "teamId", "team_code"]:
             if alt in tf.columns:
                 tf = tf.rename(columns={alt: "team_id"})
@@ -123,26 +124,19 @@ def build_asof_squad(hist: pd.DataFrame, as_of_ts: pd.Timestamp, tz: str | None)
     From historical minutes rows strictly before as_of_ts, build the latest-known
     (player_id → player, pos, team_id, is_active) snapshot.
     """
-    # Work with a copy to avoid surprises
     h = hist.copy()
-    # Reuse date selection in local tz
     du = build_date_used(h, tz)
     h = h[du < as_of_ts].copy()
     if h.empty:
         return pd.DataFrame(columns=["player_id","player","pos","team_id","is_active"])
 
-    # sort so tail(1) yields last known state per player
     gw_key = _pick_gw_col(h.columns.tolist()) or "gw_orig"
     h = h.sort_values(["player_id", "season", du.name, gw_key])
     last = h.groupby("player_id", as_index=False).tail(1)
 
-    # Ensure required columns exist
     for c in ["player","pos","team_id","is_active"]:
         if c not in last.columns:
-            if c == "is_active":
-                last[c] = 1
-            else:
-                last[c] = np.nan
+            last[c] = 1 if c == "is_active" else np.nan
 
     return last[["player_id","player","pos","team_id","is_active"]].dropna(subset=["team_id"])
 
@@ -162,11 +156,9 @@ def synthesize_future_player_rows(team_fix: pd.DataFrame,
             "minutes","is_starter","is_active","_is_synth"
         ])
 
-    # Prepare small fixtures frame for join
     keep_cols = [c for c in ["season","gw_orig","gw_played","gw","date_sched","team_id","is_home"] if c in tf.columns]
     tf_small = tf[keep_cols].copy()
 
-    # Left join squad per team_id (cartesian via merge)
     synth = tf_small.merge(squad, how="left", on="team_id", suffixes=("", ""))
     synth["minutes"] = np.nan
     synth["is_starter"] = np.nan
@@ -174,12 +166,78 @@ def synthesize_future_player_rows(team_fix: pd.DataFrame,
         synth["is_active"] = 1
     synth["_is_synth"] = 1
 
-    # prefer gw_orig/gw_played columns
     for c in ["gw_orig","gw_played","gw"]:
         if c in synth.columns:
             synth[c] = pd.to_numeric(synth[c], errors="coerce")
 
     return synth
+
+# ----------------------------- roster gating ----------------------------------
+
+def _load_roster_pairs(teams_json: Optional[Path],
+                       season: str,
+                       league_filter: Optional[str]) -> Optional[Set[Tuple[str, str]]]:
+    """
+    Returns a set of allowed (team_id, player_id) pairs for the given season.
+    If teams_json is None or file missing, returns None (no gating).
+    """
+    if not teams_json:
+        return None
+    p = Path(teams_json)
+    if not p.exists():
+        logging.warning("teams_json not found at %s — skipping roster gate.", p)
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        logging.warning("Failed to parse teams_json (%s): %s — skipping roster gate.", p, e)
+        return None
+
+    allowed: Set[Tuple[str, str]] = set()
+    for team_id, obj in (data or {}).items():
+        career = (obj or {}).get("career", {})
+        season_info = career.get(season)
+        if not season_info:
+            continue
+        if league_filter:
+            if str(season_info.get("league", "")).strip().lower() != str(league_filter).strip().lower():
+                continue
+        players = season_info.get("players", []) or []
+        for pl in players:
+            pid = str(pl.get("id", "")).strip()
+            if pid:
+                allowed.add((str(team_id), pid))
+    if not allowed:
+        logging.warning("Roster map for %s produced 0 allowed pairs (league=%r).", season, league_filter)
+    return allowed or None
+
+def _apply_roster_gate(df: pd.DataFrame,
+                       allowed_pairs: Optional[Set[Tuple[str, str]]],
+                       season: str,
+                       where: str,
+                       out_artifacts_dir: Optional[Path] = None,
+                       require_on_roster: bool = False) -> pd.DataFrame:
+    """
+    Keep only rows with (team_id, player_id) inside allowed_pairs for the season.
+    If require_on_roster is True and any rows are dropped, raise RuntimeError.
+    """
+    if allowed_pairs is None or df.empty:
+        return df
+
+    # Normalize to strings for stable matching
+    tid = df.get("team_id").astype(str)
+    pid = df.get("player_id").astype(str)
+    mask_ok = tid.combine(pid, lambda a, b: (a, b) in allowed_pairs)
+
+    dropped = int((~mask_ok).sum())
+    if dropped:
+        logging.info("Roster gate dropped %d %s row(s) not present on the %s roster.", dropped, where, season)
+        if out_artifacts_dir is not None:
+            out_artifacts_dir.mkdir(parents=True, exist_ok=True)
+            df.loc[~mask_ok].to_csv(out_artifacts_dir / f"roster_dropped_{where}.csv", index=False)
+        if require_on_roster:
+            raise RuntimeError(f"--require-on-roster set: {dropped} {where} rows are not on the {season} roster.")
+    return df.loc[mask_ok].copy()
 
 # ----------------------------- main ------------------------------------------
 
@@ -226,7 +284,16 @@ def main():
     ap.add_argument("--use-pos-bench-caps", action="store_true")
     ap.add_argument("--bench-cap", type=float, default=45.0)
 
+    # Roster gating
+    ap.add_argument("--teams-json", type=Path, help="Path to master_teams.json containing per-season rosters")
+    ap.add_argument("--league-filter", type=str, default="",
+                    help="Optional league name to filter roster for the future season (e.g., 'ENG-Premier League')")
+    ap.add_argument("--require-on-roster", action="store_true",
+                    help="If set, error out when any scoring rows are not on the future-season roster")
+
     args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     model_dir = Path(args.model_dir)
     fix_root = Path(args.fix_root)
@@ -246,43 +313,44 @@ def main():
                 else coerce_ts(args.as_of, args.as_of_tz))
 
     # If player future rows are missing for future season, synthesize from team fixtures
-    # 1) Find available GWs in team fixture file
     team_fix = load_team_fixtures(fix_root, args.future_season, args.team_fixtures_filename)
     gwn_team = gw_coalesce_for_future(team_fix)
     avail_gws = sorted(pd.unique(gwn_team.dropna().astype(int)))
     target_gws = [g for g in avail_gws if g >= gw_from_req][:args.n_future]
     if not target_gws:
-        diag = {
-            "requested_from_to": [int(gw_from_req), int(gw_to_req)],
-            "available_team_gws": avail_gws
-        }
+        diag = {"requested_from_to": [int(gw_from_req), int(gw_to_req)], "available_team_gws": avail_gws}
         raise RuntimeError(f"No future GWs available in team fixtures for selection. Diagnostics: {diag}")
     if args.strict_n_future and len(target_gws) < args.n_future:
         raise RuntimeError(
             f"Only {len(target_gws)} GW(s) available ≥ {gw_from_req}, "
-            f"but --n-future={args.n_future} and --strict-n-future was set. "
-            f"Available: {avail_gws}"
+            f"but --n-future={args.n_future} and --strict-n-future was set. Available: {avail_gws}"
         )
 
-    # 2) Build as-of squad from history (strictly before as_of_ts)
+    # Build as-of squad from history (strictly before as_of_ts)
     date_used_full = build_date_used(df, args.as_of_tz)
-    hist_mask = (df["season"].isin(history)) | (
-        (df["season"] == args.future_season) & (date_used_full < as_of_ts)
-    )
+    hist_mask = (df["season"].isin(history)) | ((df["season"] == args.future_season) & (date_used_full < as_of_ts))
     squad = build_asof_squad(df.loc[hist_mask], as_of_ts, args.as_of_tz)
 
-    # 3) Synthesize player rows for target_gws that aren't already present
+    # --- Roster gating: load allowed pairs and filter the as-of squad (for synthesis)
+    league = args.league_filter.strip() or None
+    allowed_pairs = _load_roster_pairs(args.teams_json, args.future_season, league)
+    if allowed_pairs is not None and not squad.empty:
+        mask_squad = squad["team_id"].astype(str).combine(squad["player_id"].astype(str),
+                                                          lambda a, b: (a, b) in allowed_pairs)
+        dropped_squad = int((~mask_squad).sum())
+        if dropped_squad:
+            logging.info("Roster gate dropped %d as-of squad row(s) not on the %s roster.", dropped_squad, args.future_season)
+        squad = squad.loc[mask_squad].copy()
+
+    # Synthesize player rows for target_gws that aren't already present
     synth = synthesize_future_player_rows(team_fix, squad, target_gws)
 
     # Avoid duplicating real rows: drop any synth rows that already exist in df
     if not synth.empty:
         gw_key = _pick_gw_col(df.columns.tolist()) or "gw_orig"
         if gw_key not in synth.columns:
-            # prefer gw_orig if present
-            if "gw_orig" in synth.columns:
-                gw_key = "gw_orig"
-            elif "gw_played" in synth.columns:
-                gw_key = "gw_played"
+            if "gw_orig" in synth.columns: gw_key = "gw_orig"
+            elif "gw_played" in synth.columns: gw_key = "gw_played"
         existing_keys = set(
             tuple(x) for x in df[["season", "player_id", gw_key, "team_id"]]
             .dropna(subset=[gw_key]).to_records(index=False)
@@ -293,7 +361,7 @@ def main():
         )
         synth = synth.loc[keep_mask].copy()
 
-    # 4) Extend df with synthesized rows (if any)
+    # Extend df with synthesized rows (if any)
     if not synth.empty:
         df = pd.concat([df, synth], ignore_index=True)
 
@@ -303,9 +371,7 @@ def main():
 
     # Leakage control mask computed on the extended df
     date_used = build_date_used(df, args.as_of_tz)
-    pre_asof_mask = (df["season"].isin(history)) | (
-        (df["season"] == args.future_season) & (date_used < as_of_ts)
-    )
+    pre_asof_mask = (df["season"].isin(history)) | ((df["season"] == args.future_season) & (date_used < as_of_ts))
     pre_asof_mask &= df["minutes"].notna()
 
     # Feature engineering (compat with old/new signatures)
@@ -325,17 +391,14 @@ def main():
             use_fdr=args.use_fdr, add_team_rotation=True
         )
 
-    # Neutralize team_rot3 leakage on synthesized rows: set to last known per team pre-as-of
+    # Neutralize team_rot3 leakage on synthesized rows
     if "_is_synth" in df.columns and df["_is_synth"].fillna(0).eq(1).any():
-        # compute last known team_rot3 per team using only pre-as-of rows
         gw_key = _pick_gw_col(df.columns.tolist()) or "gw_orig"
         idx_pre = df.index[pre_asof_mask]
         tmp = df.loc[idx_pre, ["team_id", "team_rot3", "season", gw_key]].copy()
-        # order by chronological keys; use date_used for stable ordering
         tmp["_du"] = date_used.loc[idx_pre]
         tmp = tmp.sort_values(["team_id", "_du", gw_key])
         last_rot = tmp.groupby("team_id")["team_rot3"].last()
-        # apply to synth rows
         mask_synth = df["_is_synth"].fillna(0).eq(1)
         df.loc[mask_synth, "team_rot3"] = df.loc[mask_synth, "team_id"].map(last_rot).fillna(0.0)
 
@@ -349,6 +412,20 @@ def main():
             "future_unique_gws_in_df": sorted(pd.unique(gwn_pred[future_mask].dropna().astype(int)))
         }
         raise RuntimeError(f"No rows to score after synthesis. Diagnostics: {diag}")
+
+    # Apply roster gate to the scoring slice (this is the authoritative filter)
+    season_dir = (out_dir / f"{args.future_season}")
+    artifacts_dir = season_dir / "artifacts"
+    df_pred = _apply_roster_gate(
+        df_pred,
+        allowed_pairs=allowed_pairs,
+        season=args.future_season,
+        where="minutes_scoring",
+        out_artifacts_dir=artifacts_dir,
+        require_on_roster=args.require_on_roster
+    )
+    if df_pred.empty:
+        raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
 
     # Bench caps from historical bench cameos
     hist = df.loc[pre_asof_mask].copy()
@@ -431,6 +508,7 @@ def main():
         return np.clip(p, 0, 1)
 
     # Refit minute regressors on leakage-safe history
+    hist = df.loc[pre_asof_mask].copy()
     reg_start, _ = train_regressor(hist[hist["is_starter"] == 1], feat_reg, objective="regression_l2")
     cameo_min_by_pos, _, cameo_min_global = train_cameo_minutes_by_pos(hist, feat_cameo_min, min_rows=150)
 
@@ -494,7 +572,7 @@ def main():
     p_play = np.clip(p_start + (1.0 - p_start) * p_cameo, 0, 1)
     exp_minutes_points = np.clip(p_play + p60, 0, 2)
 
-    # Build output (include both GW columns if available)
+    # Build output
     out_cols = {
         "season": df_pred["season"].values,
         "player_id": df_pred["player_id"].values,
@@ -521,13 +599,9 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
 
-    # Use the actual target_gws for naming and logging
+    # Name/dirs
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
-
-    # Ensure season subfolder exists: <out-dir>/<future-season>/
-    season_dir = (out_dir / f"{args.future_season}")
     season_dir.mkdir(parents=True, exist_ok=True)
-
     out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
     out.to_csv(out_path, index=False)
 
@@ -538,10 +612,8 @@ def main():
         "available_team_gws": [int(g) for g in avail_gws],
         "scored_gws": [int(g) for g in target_gws],
         "as_of": str(as_of_ts),
-        "out": str(out_path),
-        "synthesized_rows": int(out.get("_is_synth", pd.Series([0]*len(out))).sum()) if "_is_synth" in out.columns else 0
+        "out": str(out_path)
     }, indent=2))
-
 
 if __name__ == "__main__":
     main()
