@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 r"""
 goals_assists_forecast.py — leak-free scorer for future GWs using trained G/A heads,
-now with optional roster gating from master_teams.json.
+with roster gating, venue mapping from team fixtures, and safer feature handling.
 
-Inputs
-------
-• Trained artifacts from goals_assists_model_builder.py
-• Minutes forecast CSV from minutes_forecast.py
-• Registry features (players_form, team_form)
-• Optional roster file (master_teams.json) to restrict scoring to players on the future-season roster
+Key fixes vs prior rev:
+• Remove duplicate columns on merges by design (no importing is_active from last snapshot; add prev_minutes only if absent).
+• Use training medians (artifacts/features_median.json) for Poisson/Tweedie imputations; avoid leakage from serve-time medians.
+• Robust, POS-aware EWMA for shots/SOT p90 (including home/away splits), strictly past-only (shifted by 1).
+• Assert feature-vector order matches artifacts/features.json; log unused fut columns.
+• Normalize --league-filter to reduce label mismatch (e.g., “ENG-Premier League” vs “Premier League”).
+• Gate p_return_any by having positive effective minutes.
+• Output sorted by gw_orig, team_id, player_id into <out-dir>/<SEASON>/GW<from>_<to>.csv.
 
-Output
-------
-<out-dir>/<SEASON>/GW<from>_<to>.csv with columns:
+Outputs
+-------
+<out-dir>/<SEASON>/GW<from>_<to>.csv columns include:
   season, gw_orig, date_sched, player_id, team_id, player, pos,
   pred_minutes, team_att_z_venue, opp_def_z_venue,
   pred_goals_p90_mean, pred_assists_p90_mean,
@@ -22,26 +24,33 @@ Output
   p_goal, p_assist, p_return_any
 """
 from __future__ import annotations
-import argparse, json, logging
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
 
+import argparse
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-import joblib
 
-# ----------------------------- helpers ----------------------------------------
+
+# ───────────────────────────── Helpers ─────────────────────────────
 
 def _load_json(p: Path) -> dict:
-    if not p.exists():
+    if not p or not p.exists():
         return {}
     return json.loads(p.read_text(encoding="utf-8"))
 
+
 def _pick_gw_col(cols: List[str]) -> Optional[str]:
-    for k in ("gw_played","gw_orig","gw"):
-        if k in cols: return k
+    for k in ("gw_played", "gw_orig", "gw"):
+        if k in cols:
+            return k
     return None
+
 
 def _coerce_ts(s: pd.Series, tz: Optional[str]) -> pd.Series:
     out = pd.to_datetime(s, errors="coerce")
@@ -51,6 +60,7 @@ def _coerce_ts(s: pd.Series, tz: Optional[str]) -> pd.Series:
         else:
             out = out.dt.tz_convert(tz)
     return out
+
 
 def _load_players_form(features_root: Path, form_version: str, seasons: List[str]) -> pd.DataFrame:
     frames = []
@@ -62,10 +72,12 @@ def _load_players_form(features_root: Path, form_version: str, seasons: List[str
         t["season"] = s
         frames.append(t)
     df = pd.concat(frames, ignore_index=True)
-    need = {"season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes"}
+    need = {"season", "gw_orig", "date_played", "player_id", "team_id", "player", "pos", "venue", "minutes"}
     miss = need - set(df.columns)
-    if miss: raise KeyError(f"players_form missing: {miss}")
+    if miss:
+        raise KeyError(f"players_form missing required columns: {miss}")
     return df
+
 
 def _load_team_form(features_root: Path, form_version: str, seasons: List[str]) -> Optional[pd.DataFrame]:
     frames = []
@@ -75,140 +87,198 @@ def _load_team_form(features_root: Path, form_version: str, seasons: List[str]) 
             t = pd.read_csv(fp, parse_dates=["date_played"])
             t["season"] = s
             frames.append(t)
-    if not frames: return None
+    if not frames:
+        return None
     return pd.concat(frames, ignore_index=True)
 
+
 def _team_z_venue(team_form: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    if team_form is None: return None
-    if {"team_att_z_venue","opp_def_z_venue"}.issubset(team_form.columns):
-        t = team_form[["season","gw_orig","team_id","team_att_z_venue","opp_def_z_venue"]].drop_duplicates()
-        for c in ["team_att_z_venue","opp_def_z_venue"]:
+    """Return (season, gw_orig, team_id, team_att_z_venue, opp_def_z_venue)."""
+    if team_form is None:
+        return None
+
+    # Preferred direct columns if already computed
+    if {"team_att_z_venue", "opp_def_z_venue"}.issubset(team_form.columns):
+        t = team_form[["season", "gw_orig", "team_id", "team_att_z_venue", "opp_def_z_venue"]].drop_duplicates()
+        for c in ["team_att_z_venue", "opp_def_z_venue"]:
             t[c] = pd.to_numeric(t[c], errors="coerce")
         return t
-    need = {"season","gw_orig","team_id","venue",
-            "att_xg_home_roll_z","att_xg_away_roll_z","def_xga_home_roll_z","def_xga_away_roll_z"}
+
+    # Derive from home/away z-score columns
+    need = {
+        "season", "gw_orig", "team_id", "venue",
+        "att_xg_home_roll_z", "att_xg_away_roll_z",
+        "def_xga_home_roll_z", "def_xga_away_roll_z"
+    }
     if need.issubset(team_form.columns):
         t = team_form[list(need)].copy()
-        t["team_att_z_venue"] = np.where(t["venue"].str.lower().eq("home"),
-                                         t["att_xg_home_roll_z"], t["att_xg_away_roll_z"])
-        t["opp_def_z_venue"] = np.where(t["venue"].str.lower().eq("home"),
-                                         t["def_xga_away_roll_z"], t["def_xga_home_roll_z"])
-        t = t.drop(columns=["venue","att_xg_home_roll_z","att_xg_away_roll_z","def_xga_home_roll_z","def_xga_away_roll_z"])
-        t = t.drop_duplicates(subset=["season","gw_orig","team_id"])
-        for c in ["team_att_z_venue","opp_def_z_venue"]:
+        v = t["venue"].astype(str).str.lower()
+        t["team_att_z_venue"] = np.where(v.eq("home"), t["att_xg_home_roll_z"], t["att_xg_away_roll_z"])
+        t["opp_def_z_venue"] = np.where(v.eq("home"), t["def_xga_away_roll_z"], t["def_xga_home_roll_z"])
+        t = t.drop(columns=["venue", "att_xg_home_roll_z", "att_xg_away_roll_z", "def_xga_home_roll_z", "def_xga_away_roll_z"])
+        t = t.drop_duplicates(subset=["season", "gw_orig", "team_id"])
+        for c in ["team_att_z_venue", "opp_def_z_venue"]:
             t[c] = pd.to_numeric(t[c], errors="coerce")
         return t
+
     return None
+
 
 def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFrame:
     path = fix_root / season / filename
     if not path.exists():
         raise FileNotFoundError(f"Missing team fixtures: {path}")
     tf = pd.read_csv(path)
-    for dc in ("date_sched","date_played"):
-        if dc in tf.columns: tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
+    for dc in ("date_sched", "date_played"):
+        if dc in tf.columns:
+            tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
+    # Normalize is_home
     if "is_home" not in tf.columns:
         if "was_home" in tf.columns:
-            tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1","true","yes"]).astype(int)
+            tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1", "true", "yes"]).astype(int)
         elif "venue" in tf.columns:
             tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype(int)
         else:
             tf["is_home"] = 0
-    for c in ("gw_played","gw_orig","gw"):
-        if c in tf.columns: tf[c] = pd.to_numeric(tf[c], errors="coerce")
+    for c in ("gw_played", "gw_orig", "gw"):
+        if c in tf.columns:
+            tf[c] = pd.to_numeric(tf[c], errors="coerce")
     if "team_id" not in tf.columns:
-        for alt in ["team","teamId","team_code"]:
+        for alt in ["team", "teamId", "team_code"]:
             if alt in tf.columns:
                 tf = tf.rename(columns={alt: "team_id"})
                 break
     tf["season"] = season
     return tf
 
+
 def _gw_for_selection(df: pd.DataFrame) -> pd.Series:
     def num(s): return pd.to_numeric(df.get(s), errors="coerce")
     gwp = num("gw_played"); gwo = num("gw_orig"); gwa = num("gw")
+    # prefer gw_played if > 0 else gw_orig else gw
     return gwo.where(gwp.isna() | (gwp <= 0), gwp).where(lambda x: x.notna(), gwa)
+
 
 def _ewm_shots_per_pos(hist: pd.DataFrame,
                        hl_map: Dict[str, float],
                        min_periods: int,
                        adjust: bool) -> pd.DataFrame:
-    """Compute past-only EWM shots/SOT p90, with venue splits, per pos."""
+    """
+    Compute past-only (shifted) EWM shots/SOT p90, with venue splits, per POS with
+    POS-specific halflives. Robust to missing shots columns.
+    """
     df = hist.copy()
-    shots = next((c for c in ("shots","sh") if c in df.columns), None)
-    sot   = next((c for c in ("sot","shots_on_target") if c in df.columns), None)
-    if shots is None and sot is None:
-        for col in ["shots_p90_ewm","sot_p90_ewm","shots_p90_home_ewm","shots_p90_away_ewm",
-                    "sot_p90_home_ewm","sot_p90_away_ewm"]:
-            df[col] = np.nan
-        return df
-    df["pos"] = df["pos"].astype(str).str.upper()
-    m = df["minutes"].fillna(0).clip(lower=0)
+    shots = next((c for c in ("shots", "sh") if c in df.columns), None)
+    sot   = next((c for c in ("sot", "shots_on_target") if c in df.columns), None)
+
+    # Prepare p90 raw numerators
+    m = pd.to_numeric(df.get("minutes", 0), errors="coerce").fillna(0).clip(lower=0)
     denom = (m / 90.0).replace(0, np.nan)
-    if shots is not None: df["_shots_p90_raw"] = df[shots] / denom
-    if sot   is not None: df["_sot_p90_raw"]   = df[sot]   / denom
 
-    def _ewm_series(s: pd.Series, pos_tag: str) -> pd.Series:
-        hl = float(hl_map.get(pos_tag, list(hl_map.values())[0]))
-        return s.shift(1).ewm(halflife=hl, min_periods=min_periods, adjust=adjust).mean()
+    if shots is not None:
+        df["_shots_p90_raw"] = pd.to_numeric(df[shots], errors="coerce") / denom
+    if sot is not None:
+        df["_sot_p90_raw"] = pd.to_numeric(df[sot], errors="coerce") / denom
 
-    if "_shots_p90_raw" in df.columns:
-        df["shots_p90_ewm"] = (
-            df.groupby(["pos","player_id","season"], sort=False)["_shots_p90_raw"]
-              .transform(lambda s: _ewm_series(s, s.index.get_level_values(0)[0] if isinstance(s.index, pd.MultiIndex) else "MID"))
-        )
-    if "_sot_p90_raw" in df.columns:
-        df["sot_p90_ewm"] = (
-            df.groupby(["pos","player_id","season"], sort=False)["_sot_p90_raw"]
-              .transform(lambda s: _ewm_series(s, s.index.get_level_values(0)[0] if isinstance(s.index, pd.MultiIndex) else "MID"))
-        )
+    df["pos"] = df["pos"].astype(str).str.upper()
+    for col in ["shots_p90_ewm", "sot_p90_ewm", "shots_p90_home_ewm", "shots_p90_away_ewm",
+                "sot_p90_home_ewm", "sot_p90_away_ewm"]:
+        df[col] = np.nan
 
-    mask_h = df["venue"].astype(str).str.lower().eq("home")
-    mask_a = df["venue"].astype(str).str.lower().eq("away")
-    for base_raw, base in (("_shots_p90_raw","shots_p90"), ("_sot_p90_raw","sot_p90")):
-        if base_raw not in df.columns: continue
-        df[f"{base}_home_ewm"] = np.nan
-        df.loc[mask_h, f"{base}_home_ewm"] = (
-            df.loc[mask_h].groupby(["pos","player_id","season"], sort=False)[base_raw]
-              .transform(lambda s: _ewm_series(s, s.index.get_level_values(0)[0] if isinstance(s.index, pd.MultiIndex) else "MID"))
-        )
-        df[f"{base}_away_ewm"] = np.nan
-        df.loc[mask_a, f"{base}_away_ewm"] = (
-            df.loc[mask_a].groupby(["pos","player_id","season"], sort=False)[base_raw]
-              .transform(lambda s: _ewm_series(s, s.index.get_level_values(0)[0] if isinstance(s.index, pd.MultiIndex) else "MID"))
-        )
-    drop = [c for c in ["_shots_p90_raw","_sot_p90_raw"] if c in df.columns]
+    def _ewm(series: pd.Series, hl: float) -> pd.Series:
+        return series.shift(1).ewm(halflife=float(hl), min_periods=min_periods, adjust=adjust).mean()
+
+    v = df.get("venue", pd.Series([""] * len(df))).astype(str).str.lower()
+    mask_home = v.eq("home")
+    mask_away = v.eq("away")
+
+    for tag, hl in hl_map.items():
+        mask_pos = df["pos"].eq(tag)
+
+        if "_shots_p90_raw" in df.columns:
+            df.loc[mask_pos, "shots_p90_ewm"] = (
+                df.loc[mask_pos]
+                  .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                  .transform(lambda s: _ewm(s, hl))
+            )
+            # Venue splits
+            if mask_home.any():
+                sub = mask_pos & mask_home
+                df.loc[sub, "shots_p90_home_ewm"] = (
+                    df.loc[sub]
+                      .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                      .transform(lambda s: _ewm(s, hl))
+                )
+            if mask_away.any():
+                sub = mask_pos & mask_away
+                df.loc[sub, "shots_p90_away_ewm"] = (
+                    df.loc[sub]
+                      .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                      .transform(lambda s: _ewm(s, hl))
+                )
+
+        if "_sot_p90_raw" in df.columns:
+            df.loc[mask_pos, "sot_p90_ewm"] = (
+                df.loc[mask_pos]
+                  .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                  .transform(lambda s: _ewm(s, hl))
+            )
+            if mask_home.any():
+                sub = mask_pos & mask_home
+                df.loc[sub, "sot_p90_home_ewm"] = (
+                    df.loc[sub]
+                      .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                      .transform(lambda s: _ewm(s, hl))
+                )
+            if mask_away.any():
+                sub = mask_pos & mask_away
+                df.loc[sub, "sot_p90_away_ewm"] = (
+                    df.loc[sub]
+                      .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                      .transform(lambda s: _ewm(s, hl))
+                )
+
+    drop = [c for c in ["_shots_p90_raw", "_sot_p90_raw"] if c in df.columns]
     return df.drop(columns=drop)
 
-def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str], as_of_ts: pd.Timestamp, tz: Optional[str]) -> pd.DataFrame:
+
+def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str],
+                              as_of_ts: pd.Timestamp, tz: Optional[str]) -> pd.DataFrame:
     """Take last known row per (season, player_id) strictly before as_of_ts and keep requested feature_cols."""
     du = pd.to_datetime(df["date_played"], errors="coerce")
     if tz:
-        if du.dt.tz is None: du = du.dt.tz_localize(tz)
-        else: du = du.dt.tz_convert(tz)
+        if du.dt.tz is None:
+            du = du.dt.tz_localize(tz)
+        else:
+            du = du.dt.tz_convert(tz)
     hist = df[du < as_of_ts].copy()
     if hist.empty:
-        return pd.DataFrame(columns=["season","player_id"] + feature_cols)
-    gw_key = _pick_gw_col(hist.columns.tolist())
-    sort_cols = ["player_id","season","date_played"] + ([gw_key] if gw_key else [])
-    hist = hist.sort_values(sort_cols)
-    last = hist.groupby(["season","player_id"], as_index=False).tail(1).copy()
+        return pd.DataFrame(columns=["season", "player_id"] + feature_cols)
 
-    keep = ["season","player_id"] + [c for c in feature_cols if c in last.columns]
+    gw_key = _pick_gw_col(hist.columns.tolist())
+    sort_cols = ["player_id", "season", "date_played"] + ([gw_key] if gw_key else [])
+    hist = hist.sort_values(sort_cols)
+    last = hist.groupby(["season", "player_id"], as_index=False).tail(1).copy()
+
+    keep = ["season", "player_id"] + [c for c in feature_cols if c in last.columns]
     for c in feature_cols:
         if c not in keep:
             last[c] = np.nan
-    return last[["season","player_id"] + feature_cols].copy()
+    return last[["season", "player_id"] + feature_cols].copy()
+
 
 def _load_booster(p: Path) -> Optional[lgb.Booster]:
-    if not p.exists(): return None
+    if not p.exists():
+        return None
     return lgb.Booster(model_file=str(p))
+
 
 def _predict_reg(booster: Optional[lgb.Booster], X: pd.DataFrame) -> np.ndarray:
     if booster is None or X.empty:
         return np.zeros(len(X), dtype=float)
     Xn = X.select_dtypes(include=[np.number]).fillna(0)
     return np.clip(booster.predict(Xn), 0, None)
+
 
 def _predict_per_pos(goals_or_assists: str,
                      X: pd.DataFrame,
@@ -217,7 +287,7 @@ def _predict_per_pos(goals_or_assists: str,
     glob = _load_booster(model_dir / f"{goals_or_assists}_global_lgbm.txt")
     out = np.zeros(len(X), dtype=float)
     used = np.zeros(len(X), dtype=bool)
-    for tag in ["GK","DEF","MID","FWD"]:
+    for tag in ["GK", "DEF", "MID", "FWD"]:
         m = _load_booster(model_dir / f"{goals_or_assists}_{tag}_lgbm.txt")
         idx = pos.str.upper().eq(tag).to_numpy()
         if idx.any() and m is not None:
@@ -227,25 +297,42 @@ def _predict_per_pos(goals_or_assists: str,
         out[~used] = _predict_reg(glob, X.iloc[~used])
     return out
 
+
+def _read_features_median(model_dir: Path) -> Optional[pd.Series]:
+    p = model_dir / "artifacts" / "features_median.json"
+    if p.exists():
+        try:
+            dct = _load_json(p)
+            if dct:
+                return pd.Series(dct, dtype=float)
+        except Exception:
+            pass
+    return None
+
+
 def _predict_poisson_per_pos(name: str,
                              X: pd.DataFrame,
                              pos: pd.Series,
                              model_dir: Path,
                              med: Optional[pd.Series]) -> np.ndarray:
-    """Joblib Tweedie regressors trained on med-imputed X."""
+    """Joblib regressors (e.g., Tweedie/Poisson) trained on numeric X; impute with training median if available."""
     def _load(path: Path):
         try:
             return joblib.load(path) if path.exists() else None
         except Exception:
             return None
+
     glob = _load(model_dir / f"{name}_global_poisson.joblib")
     out = np.full(len(X), np.nan, dtype=float)
     used = np.zeros(len(X), dtype=bool)
+
     Xp = X.apply(pd.to_numeric, errors="coerce")
     if med is not None:
-        Xp = Xp.fillna(med)
+        # Align by column; only fill columns present in med
+        Xp = Xp.fillna(med.reindex(Xp.columns))
     Xp = Xp.fillna(0.0)
-    for tag in ["GK","DEF","MID","FWD"]:
+
+    for tag in ["GK", "DEF", "MID", "FWD"]:
         mdl = _load(model_dir / f"{name}_{tag}_poisson.joblib")
         idx = pos.str.upper().eq(tag).to_numpy()
         if mdl is not None and idx.any():
@@ -255,7 +342,12 @@ def _predict_poisson_per_pos(name: str,
         out[~used] = np.clip(glob.predict(Xp.iloc[~used].to_numpy(dtype=float)), 0, None)
     return out
 
-# ----------------------------- roster gating ----------------------------------
+
+# ───────────────────────────── Roster gating ─────────────────────────────
+
+def _norm_label(s: str) -> str:
+    return str(s or "").lower().replace("-", " ").replace("_", " ").strip()
+
 
 def _load_roster_pairs(teams_json: Optional[Path],
                        season: str,
@@ -276,23 +368,26 @@ def _load_roster_pairs(teams_json: Optional[Path],
         logging.warning("Failed to parse teams_json (%s): %s — skipping roster gate.", p, e)
         return None
 
+    lf = _norm_label(league_filter) if league_filter else ""
     allowed: Set[Tuple[str, str]] = set()
+
     for team_id, obj in (data or {}).items():
-        career = (obj or {}).get("career", {})
-        season_info = career.get(season)
+        season_info = (obj or {}).get("career", {}).get(season)
         if not season_info:
             continue
-        if league_filter:
-            if str(season_info.get("league", "")).strip().lower() != str(league_filter).strip().lower():
+        if lf:
+            if _norm_label(season_info.get("league", "")) != lf:
                 continue
         players = season_info.get("players", []) or []
         for pl in players:
             pid = str(pl.get("id", "")).strip()
             if pid:
                 allowed.add((str(team_id), pid))
+
     if not allowed:
         logging.warning("Roster map for %s produced 0 allowed pairs (league=%r).", season, league_filter)
     return allowed or None
+
 
 def _apply_roster_gate(df: pd.DataFrame,
                        allowed_pairs: Optional[Set[Tuple[str, str]]],
@@ -306,9 +401,11 @@ def _apply_roster_gate(df: pd.DataFrame,
     """
     if allowed_pairs is None or df.empty:
         return df
+
     tid = df.get("team_id").astype(str)
     pid = df.get("player_id").astype(str)
-    mask_ok = tid.combine(pid, lambda a, b: (a, b) in allowed_pairs)
+    pairs = list(zip(tid.to_numpy(), pid.to_numpy()))
+    mask_ok = np.fromiter(((a, b) in allowed_pairs for (a, b) in pairs), count=len(pairs), dtype=bool)
 
     dropped = int((~mask_ok).sum())
     if dropped:
@@ -320,11 +417,12 @@ def _apply_roster_gate(df: pd.DataFrame,
             raise RuntimeError(f"--require-on-roster set: {dropped} {where} rows are not on the {season} roster.")
     return df.loc[mask_ok].copy()
 
-# ----------------------------- main -------------------------------------------
+
+# ───────────────────────────── Main ─────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    # Windows
+    # Windows-friendly args
     ap.add_argument("--history-seasons", required=True, help="Comma list of past seasons")
     ap.add_argument("--future-season", required=True, help="Season to score (contains future GWs)")
     ap.add_argument("--as-of", default="now", help='ISO timestamp or "now"')
@@ -368,10 +466,10 @@ def main():
 
     # as-of
     as_of_ts = (pd.Timestamp.now(tz=args.as_of_tz)
-                if str(args.as_of).lower() in ("now","auto","today")
+                if str(args.as_of).lower() in ("now", "auto", "today")
                 else pd.Timestamp(args.as_of, tz=args.as_of_tz))
 
-    # --- Load artifacts ---
+    # --- Load artifacts (features & meta) ---
     feat_path = args.model_dir / "artifacts" / "features.json"
     feat_cols: List[str] = _load_json(feat_path) or []
     if not feat_cols:
@@ -381,16 +479,21 @@ def main():
     train_args = meta.get("args", {})
     hl_default = float(train_args.get("ewm_halflife", 3.0))
     hl_pos_map = {"GK": hl_default, "DEF": hl_default, "MID": hl_default, "FWD": hl_default}
-    for k in ["GK","DEF","MID","FWD"]:
-        key = "ewm_halflife_pos"
-        if isinstance(train_args.get(key), str) and f"{k}:" in train_args[key]:
-            try:
-                parts = dict(p.split(":") for p in train_args[key].split(","))
-                hl_pos_map[k] = float(parts.get(k, hl_default))
-            except Exception:
-                pass
+    # Optional per-pos halflife override string like "GK:4,DEF:3,MID:2,FWD:2"
+    key = "ewm_halflife_pos"
+    if isinstance(train_args.get(key), str) and ":" in train_args[key]:
+        try:
+            parts = dict(p.split(":") for p in train_args[key].split(","))
+            for k in ["GK", "DEF", "MID", "FWD"]:
+                if k in parts:
+                    hl_pos_map[k] = float(parts[k])
+        except Exception:
+            pass
     ewm_min_periods = int(train_args.get("ewm_min_periods", 1))
     ewm_adjust = bool(train_args.get("ewm_adjust", False))
+
+    # Training medians for Poisson imputations
+    med_train = _read_features_median(args.model_dir)
 
     # --- Load registry features up to --as-of ---
     pf = _load_players_form(args.features_root, args.form_version, seasons_all)
@@ -398,7 +501,8 @@ def main():
     tz = args.as_of_tz
 
     du = _coerce_ts(pf["date_played"], tz)
-    pf_hist = pf[(pf["season"].isin(history)) | ((pf["season"] == args.future_season) & (du < as_of_ts))].copy()
+    pf_hist = pf[(pf["season"].isin(history)) |
+                 ((pf["season"] == args.future_season) & (du < as_of_ts))].copy()
     pf_hist = _ewm_shots_per_pos(pf_hist, hl_map=hl_pos_map, min_periods=ewm_min_periods, adjust=ewm_adjust)
 
     # --- Minutes forecast for target GWs ---
@@ -424,13 +528,15 @@ def main():
     gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
     gw_key_t = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
     venue_cols = ["season", "team_id", gw_key_t, "is_home"]
-    vmap = team_fix[venue_cols].dropna(subset=[gw_key_t, "team_id"]).drop_duplicates()
-    vmap = vmap.rename(columns={gw_key_t: gw_key_m})
-    minutes = minutes.merge(vmap, how="left", on=["season","team_id",gw_key_m], validate="many_to_one")
+    vmap = (team_fix[venue_cols]
+            .dropna(subset=[gw_key_t, "team_id"])
+            .drop_duplicates()
+            .rename(columns={gw_key_t: gw_key_m}))
+    minutes = minutes.merge(vmap, how="left", on=["season", "team_id", gw_key_m], validate="many_to_one")
 
     # Build future frame (one row per player fixture)
     fut = minutes.copy()
-    fut["venue_bin"] = fut["is_home"].fillna(0).astype(int)
+    fut["venue_bin"] = pd.to_numeric(fut["is_home"], errors="coerce").fillna(0).astype(int)
     if "fdr" not in fut.columns:
         fut["fdr"] = 0.0
 
@@ -454,45 +560,57 @@ def main():
     # Team z merge (by GW)
     tz_map = _team_z_venue(tf)
     if tz_map is not None and (gw_key_m in fut.columns):
-        fut = fut.merge(tz_map.rename(columns={"gw_orig": gw_key_m}),
-                        how="left", on=["season", gw_key_m, "team_id"], validate="many_to_one")
+        fut = fut.merge(
+            tz_map.rename(columns={"gw_orig": gw_key_m}),
+            how="left",
+            on=["season", gw_key_m, "team_id"],
+            validate="many_to_one"
+        )
     else:
         fut["team_att_z_venue"] = np.nan
         fut["opp_def_z_venue"] = np.nan
 
-    # Last-known snapshot features (days_since_last; prev_minutes if required by features)
-    pull_cols = set([c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)])
-    pull_cols |= {"is_active","minutes"}
+    # Last-known snapshot features (days_since_last; optional prev_minutes)
+    # Build minimal pull set (EWMs/rolls + minutes for prev_minutes)
+    pull_cols = {c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)}
+    pull_cols |= {"minutes"}  # for prev_minutes only
     snap_cols = list(pull_cols)
-    gw_cols = [c for c in ("gw_played","gw_orig","gw") if c in pf_hist.columns]
-    base_cols = ["season","player_id","date_played","minutes","is_active"] + snap_cols + gw_cols
-    last = _last_snapshot_per_player(pf_hist[base_cols].copy(),
-                                     feature_cols=list(pull_cols),
-                                     as_of_ts=as_of_ts, tz=tz)
 
-    last_play = (pf_hist.sort_values(["player_id","season","date_played"])
-                       .groupby(["season","player_id"], as_index=False).tail(1)
-                       .loc[:, ["season","player_id","date_played"]])
+    gw_cols = [c for c in ("gw_played", "gw_orig", "gw") if c in pf_hist.columns]
+    base_cols = ["season", "player_id", "date_played"] + snap_cols + gw_cols
+
+    last = _last_snapshot_per_player(
+        pf_hist[base_cols].copy(),
+        feature_cols=list(pull_cols),
+        as_of_ts=as_of_ts,
+        tz=tz
+    )
+
+    # days_since_last (strictly before date_sched)
+    last_play = (
+        pf_hist.sort_values(["player_id", "season", "date_played"])
+        .groupby(["season", "player_id"], as_index=False)
+        .tail(1)
+        .loc[:, ["season", "player_id", "date_played"]]
+    )
     last_play["date_played"] = _coerce_ts(last_play["date_played"], tz)
     fut["date_sched"] = _coerce_ts(fut["date_sched"], tz)
-    fut = fut.merge(last_play, how="left", on=["season","player_id"])
+    fut = fut.merge(last_play, how="left", on=["season", "player_id"], validate="many_to_one")
     fut["days_since_last"] = (fut["date_sched"] - fut["date_played"]).dt.days.clip(lower=0)
     fut.drop(columns=["date_played"], inplace=True)
 
-    # (Optional) add prev_minutes / is_active if present in features
-    last_small = last[["season","player_id"] + [c for c in last.columns if c not in ("season","player_id")]].copy()
-    if "minutes" in last_small.columns:
-        last_small = last_small.rename(columns={"minutes":"prev_minutes"})
-    else:
-        last_small["prev_minutes"] = np.nan
-    fut = fut.merge(last_small[["season","player_id","prev_minutes","is_active"]], how="left", on=["season","player_id"])
+    # Add prev_minutes only if not present; do NOT bring is_active (avoid dups/precedence issues)
+    if "prev_minutes" not in fut.columns:
+        last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
+        fut = fut.merge(last_prev, how="left", on=["season", "player_id"], validate="many_to_one")
 
+    # Drop any accidental duplicate columns (keep last)
     if fut.columns.duplicated().any():
         dups = fut.columns[fut.columns.duplicated()].tolist()
         logging.warning("Duplicate columns detected; keeping last occurrence: %s", set(dups))
         fut = fut.loc[:, ~fut.columns.duplicated(keep="last")]
 
-    # Feature matrix in exact training order
+    # --- Feature matrix in exact training order ---
     def _get_unique_col(df: pd.DataFrame, name: str) -> pd.Series:
         obj = df[name]
         if isinstance(obj, pd.DataFrame):
@@ -506,19 +624,33 @@ def main():
         else:
             X[c] = np.nan
 
+    # Coerce to numerics to match training dtype expectations
     for c in X.columns:
         if X[c].dtype == object:
             X[c] = pd.to_numeric(X[c], errors="coerce")
-    med = X.median(numeric_only=True).fillna(0.0)
 
-    # Predict per-90
+    # Assert feature order/shape matches training schema
+    try:
+        if list(X.columns) != list(feat_cols):
+            raise AssertionError(f"Feature order mismatch.\nExpected (from features.json): {feat_cols}\nGot: {list(X.columns)}")
+    except AssertionError as e:
+        logging.error(str(e))
+        raise
+
+    # Log some unused columns in fut (debug aid)
+    unused = [c for c in fut.columns if c not in feat_cols]
+    logging.debug("Unused fut columns (sample): %s", unused[:30])
+
+    # POS series
     pos_ser = fut["pos"].astype(str).str.upper()
+
+    # Predict per-90 (LGBM)
     g_p90_mean = _predict_per_pos("goals", X, pos_ser, args.model_dir)
     a_p90_mean = _predict_per_pos("assists", X, pos_ser, args.model_dir)
 
-    # Optional Poisson heads
-    g_p90_pois = _predict_poisson_per_pos("goals", X, pos_ser, args.model_dir, med=med)
-    a_p90_pois = _predict_poisson_per_pos("assists", X, pos_ser, args.model_dir, med=med)
+    # Optional Poisson/Tweedie heads (prefer training medians for imputes)
+    g_p90_pois = _predict_poisson_per_pos("goals", X, pos_ser, args.model_dir, med=med_train)
+    a_p90_pois = _predict_poisson_per_pos("assists", X, pos_ser, args.model_dir, med=med_train)
 
     # Scale to per-match using pred_minutes
     scale = pd.to_numeric(fut["pred_minutes"], errors="coerce").fillna(0.0).to_numpy() / 90.0
@@ -527,16 +659,16 @@ def main():
     pred_goals_pois   = g_p90_pois * scale
     pred_assists_pois = a_p90_pois * scale
 
-    # Probabilities
+    # Combine rates for probabilities (prefer Poisson if present)
     rg90 = np.where(~np.isnan(g_p90_pois), g_p90_pois, g_p90_mean)
     ra90 = np.where(~np.isnan(a_p90_pois), a_p90_pois, a_p90_mean)
 
-    have_mix = all(c in fut.columns for c in ["p_start","p_cameo","pred_start_head","pred_bench_cameo_head"])
+    have_mix = all(c in fut.columns for c in ["p_start", "p_cameo", "pred_start_head", "pred_bench_cameo_head"])
     if have_mix:
-        ps = fut["p_start"].clip(0,1).to_numpy()
-        pc = fut["p_cameo"].clip(0,1).to_numpy()
-        ms = np.clip(fut["pred_start_head"].to_numpy(), 0, None)
-        mb = np.clip(fut["pred_bench_cameo_head"].to_numpy(), 0, None)
+        ps = fut["p_start"].clip(0, 1).to_numpy()
+        pc = fut["p_cameo"].clip(0, 1).to_numpy()
+        ms = np.clip(pd.to_numeric(fut["pred_start_head"], errors="coerce").fillna(0).to_numpy(), 0, None)
+        mb = np.clip(pd.to_numeric(fut["pred_bench_cameo_head"], errors="coerce").fillna(0).to_numpy(), 0, None)
 
         lam_g_s = rg90 * (ms / 90.0); lam_g_b = rg90 * (mb / 90.0)
         lam_a_s = ra90 * (ms / 90.0); lam_a_b = ra90 * (mb / 90.0)
@@ -549,29 +681,11 @@ def main():
         p_goal_raw   = 1.0 - np.exp(-lam_g_eff)
         p_assist_raw = 1.0 - np.exp(-lam_a_eff)
 
-    p_goal = np.clip(p_goal_raw, 0, 1)
+    p_goal   = np.clip(p_goal_raw, 0, 1)
     p_assist = np.clip(p_assist_raw, 0, 1)
 
-    # Optional isotonic calibration
-    if args.apply_calibration:
-        def _load_iso(fn: str) -> Dict[str, object]:
-            p = args.model_dir / "artifacts" / fn
-            try:
-                return joblib.load(p) if p.exists() else {}
-            except Exception:
-                return {}
-        g_iso = _load_iso("p_goal_isotonic_per_pos.joblib")
-        a_iso = _load_iso("p_assist_isotonic_per_pos.joblib")
-        for tag, iso in g_iso.items():
-            m = pos_ser.eq(tag).to_numpy()
-            if iso is not None and m.any():
-                p_goal[m] = np.clip(iso.transform(p_goal[m]), 0, 1)
-        for tag, iso in a_iso.items():
-            m = pos_ser.eq(tag).to_numpy()
-            if iso is not None and m.any():
-                p_assist[m] = np.clip(iso.transform(p_assist[m]), 0, 1)
-
-    p_return_any = 1.0 - (1.0 - p_goal) * (1.0 - p_assist)
+    # Union probability (independence assumption). Gate by having positive effective minutes.
+    p_return_any = (1.0 - (1.0 - p_goal) * (1.0 - p_assist)) * (scale > 0)
 
     # Zero GK if requested
     if args.skip_gk and pos_ser.eq("GK").any():
@@ -608,8 +722,9 @@ def main():
     out = pd.DataFrame(cols)
 
     # sort and persist
-    sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in out.columns]
-    if sort_keys: out = out.sort_values(sort_keys).reset_index(drop=True)
+    sort_keys = [k for k in ["gw_orig", "team_id", "player_id"] if k in out.columns]
+    if sort_keys:
+        out = out.sort_values(sort_keys).reset_index(drop=True)
 
     season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
@@ -626,6 +741,7 @@ def main():
         "out": str(out_path)
     }
     print(json.dumps(diag, indent=2))
+
 
 if __name__ == "__main__":
     main()
