@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 r"""
-defense_forecast.py — leak-free forecaster for CS & DCP using trained defense heads
-Now with optional roster gating from master_teams.json.
+defense_forecast.py — leak-free forecaster for CS, DCP, and exp_gc using trained defense heads
+Now with optional roster gating from master_teams.json and team-level exp_gc.
 
 Inputs
 ------
 • Trained artifacts from defense_model_builder.py:
     - team_cs_lgbm.txt                  (LightGBM Booster; team-level CS classifier)
     - cs_isotonic.joblib                (optional isotonic calibration for team CS)
+    - team_gc_lgbm.joblib               (optional LightGBM Regressor; expected goals conceded)
     - dcp_DEF_lgbm.joblib, dcp_MID_lgbm.joblib, dcp_FWD_lgbm.joblib  (LGBMRegressor per-90)
     - artifacts/cs_features_team.json   (authoritative feature order for CS team head)
+    - artifacts/gc_features_team.json   (optional; defaults to cs_features_team if missing)
     - artifacts/dcp_features.json       (authoritative feature order for DCP per-90 head)
 
 • Minutes forecast CSV (from minutes_forecast.py):
@@ -39,7 +41,8 @@ Output
   pred_minutes, prob_played60_use,
   team_att_z_venue, team_def_xga_venue, team_def_xga_venue_z, team_possession_venue, opp_att_z_venue, fdr, venue_bin,
   p_teamCS, prob_cs,
-  lambda90, expected_dc, prob_dcp
+  lambda90, expected_dc, prob_dcp,
+  exp_gc                      ← NEW (team-level E[GA], replicated per player)
 [+ optional: lambda_match if --dump-lambdas]
 
 Notes
@@ -66,6 +69,15 @@ def _load_json(p: Path) -> list | dict:
     if not p.exists():
         raise FileNotFoundError(f"Missing artifact: {p}")
     return json.loads(p.read_text(encoding="utf-8"))
+
+def _try_load_json(p: Path) -> Optional[list | dict]:
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        logging.warning("Failed to parse %s; falling back if possible.", p)
+        return None
 
 def _pick_gw_col(cols: List[str]) -> Optional[str]:
     for k in ("gw_played","gw_orig","gw"):
@@ -415,6 +427,10 @@ def main():
     # --- Load artifacts ---
     cs_feats = _load_json(args.model_dir / "artifacts" / "cs_features_team.json")  # list[str]
     dcp_feats = _load_json(args.model_dir / "artifacts" / "dcp_features.json")     # list[str]
+    gc_feats = _try_load_json(args.model_dir / "artifacts" / "gc_features_team.json")  # optional
+    if gc_feats is None:
+        gc_feats = cs_feats
+        logging.info("gc_features_team.json not found; using cs_features_team.json order for GC.")
 
     cs_booster = lgb.Booster(model_file=str(args.model_dir / "team_cs_lgbm.txt"))
     iso_cs = None
@@ -425,6 +441,19 @@ def main():
             logging.info("Loaded isotonic calibration for team CS.")
         except Exception:
             logging.warning("Failed loading isotonic calibration; proceeding without.")
+
+    # Optional GC regressor
+    gc_model_path = args.model_dir / "team_gc_lgbm.joblib"
+    gc_model = None
+    if gc_model_path.exists():
+        try:
+            gc_model = joblib.load(gc_model_path)
+            logging.info("Loaded team GC regressor (expected goals conceded).")
+        except Exception as e:
+            logging.warning("Failed loading GC regressor: %s — exp_gc will be NaN.", e)
+            gc_model = None
+    else:
+        logging.info("team_gc_lgbm.joblib not found — exp_gc will be NaN.")
 
     dcp_models: Dict[str, object] = {}
     for tag in ("DEF","MID","FWD"):
@@ -501,7 +530,7 @@ def main():
     if "fdr" not in minutes.columns:
         minutes["fdr"] = 0.0
 
-    # --- Build team rows for CS features (keep minutes' GW key as-is) ---
+    # --- Build team rows for CS/GC features (keep minutes' GW key as-is) ---
     team_rows = (minutes[["season", gw_key_m, "team_id", "is_home", "venue_bin", "fdr", "date_sched"]]
                  .drop_duplicates()
                  .rename(columns={gw_key_m: "gw_orig"}))
@@ -536,6 +565,24 @@ def main():
     p_team = np.clip(iso_cs.transform(p_team_raw), 0, 1) if iso_cs is not None else p_team_raw
     team_rows["p_teamCS"] = p_team
 
+    # Assemble X_gc in artifact order (may be same as cs_feats)
+    if gc_model is not None:
+        Xgc = pd.DataFrame(index=team_rows.index)
+        for f in gc_feats:
+            if f in team_rows.columns:
+                Xgc[f] = pd.to_numeric(team_rows[f], errors="coerce")
+            elif f == "venue_bin":
+                Xgc[f] = team_rows["venue_bin"]
+            elif f == "fdr":
+                Xgc[f] = pd.to_numeric(team_rows["fdr"], errors="coerce")
+            else:
+                Xgc[f] = np.nan
+        Xgc = Xgc.fillna(0.0)
+        exp_gc_team = np.clip(gc_model.predict(Xgc), 0.0, None)
+        team_rows["exp_gc_team"] = exp_gc_team
+    else:
+        team_rows["exp_gc_team"] = np.nan
+
     # --- Player last snapshot for DCP *_roll/EWM features (leak-free) ---
     pull_cols = [c for c in dcp_feats if c not in ("venue_bin","fdr",
                                                    "team_possession_venue","opp_att_z_venue",
@@ -546,10 +593,10 @@ def main():
 
     # --- Build per-player future frame ---
     fut = minutes.copy()
-    # attach team CS probs & context
+    # attach team CS/GC probs & context
     team_rows_for_merge = team_rows.rename(columns={"gw_orig": gw_key_m})
     fut = fut.merge(
-        team_rows_for_merge[["season", gw_key_m, "team_id", "p_teamCS",
+        team_rows_for_merge[["season", gw_key_m, "team_id", "p_teamCS", "exp_gc_team",
                              "team_def_xga_venue","team_def_xga_venue_z",
                              "team_possession_venue","team_att_z_venue","opp_att_z_venue"]],
         on=["season", gw_key_m, "team_id"], how="left", validate="many_to_one"
@@ -672,6 +719,7 @@ def main():
         "lambda90": lam90,
         "expected_dc": expected_dc,
         "prob_dcp": prob_dcp,
+        "exp_gc": fut.get("exp_gc_team", pd.Series([np.nan]*len(fut))).values,  # NEW
     }
     out = pd.DataFrame(out_cols)
     if args.dump_lambdas:
@@ -695,6 +743,7 @@ def main():
         "as_of": str(as_of_ts),
         "out": str(out_path),
         "has_iso_cs": bool(iso_cs is not None),
+        "has_gc": bool(gc_model is not None),              # NEW
         "dcp_models": list(dcp_models.keys()),
         "mixture_used": bool(have_mix),
         "roster_gate": {

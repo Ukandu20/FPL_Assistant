@@ -16,14 +16,17 @@ Train/Eval split:
 Outputs:
   models/defense/<version_name>/
     ├─ team_cs_lgbm.txt, cs_isotonic.joblib (optional)
+    ├─ team_gc_lgbm.joblib                         ← NEW (expected goals conceded regressor)
     ├─ dcp_DEF_lgbm.joblib (and MID/FWD if trained)
     ├─ artifacts/
     │    cs_features_team.json, dcp_features.json,
+    │    gc_features_team.json,                    ← NEW
     │    cs_feature_importances.csv, dcp_*_feature_importances.csv,
+    │    gc_feature_importances.csv,               ← NEW
     │    cs_calibration_bins.csv (team-level reliability; if labels available)
     └─ predictions/
-         defense_probabilities_eval__<test_season>__GW<from>_<to>.csv
-         metrics_cs.json, metrics_dcp.json
+         expected_defense.csv   (includes prob_cs, prob_dcp, exp_dc, true_dc, p_teamCS, exp_gc)
+         metrics_cs.json, metrics_dcp.json, metrics_gc.json  ← NEW
          missing_minutes_join.csv
 
 Notes:
@@ -40,7 +43,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, mean_absolute_error
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
 import joblib
 
 RANDOM_STATE = 42
@@ -320,7 +323,7 @@ def main():
     df = _load_players(args.features_root, args.form_version, seasons)
     df = _merge_team_features(df, args.features_root, args.form_version)
 
-    # Team table for CS training
+    # Team table for CS/GC training
     team_keys = ["season","gw_orig","team_id","venue","date_played"]
     keep_cols = team_keys + [c for c in [
         "ga","fdr_home","fdr_away","team_att_z_venue","team_def_xga_venue","team_def_xga_venue_z","team_possession_venue","opp_att_z_venue"
@@ -332,7 +335,6 @@ def main():
     Xdcp_all, dcp_feats = _build_dcp_features(df, na_thresh=args.na_thresh, use_z=args.use_z)
 
     # Train/Eval split using first-test-gw in the TEST season
-    # Train = all rows outside the eval window; Eval = TEST season with gw >= first-test-gw
     gw_all_test = sorted(df.loc[df["season"]==test_season, "gw_orig"].dropna().unique())
     if not gw_all_test:
         raise ValueError(f"No gw_orig for season {test_season}")
@@ -342,13 +344,13 @@ def main():
     df_eval = df.loc[is_eval_player].copy()
     df_train = df.loc[~is_eval_player].copy()
 
-    # Map to team rows for team CS
+    # Map to team rows for team CS/GC
     tgt_team_keys = df_eval[team_keys].drop_duplicates()
     is_tgt = pd.merge(df_team.reset_index(), tgt_team_keys, on=team_keys, how="inner")["index"].to_numpy()
     is_trn = np.setdiff1d(np.arange(len(df_team)), is_tgt)
     df_team_train = df_team.iloc[is_trn].copy()
 
-    # Train team CS
+    # Train team CS (classifier)
     mono_map = {"venue_bin": +1, "fdr": -1, "opp_att_z_venue": -1,
                 "team_def_xga_venue": -1, "team_def_xga_venue_z": -1,
                 "team_possession_venue": +1}
@@ -358,7 +360,16 @@ def main():
     Xcs_tr = Xcs_team.loc[df_team_train.index]
     cs_model.fit(Xcs_tr, y_cs_tr)
 
-    # Optional isotonic calibration on a temporal tail of train
+    # NEW: Train team GC (regressor) → expected goals conceded
+    valid_gc_tr = df_team_train.dropna(subset=["ga"])
+    if len(valid_gc_tr) == 0:
+        raise ValueError("No GA labels available to train GC regressor.")
+    Xgc_tr = Xcs_team.loc[valid_gc_tr.index]
+    y_gc_tr = valid_gc_tr["ga"].astype(float).to_numpy()
+    gc_model = _lgbm_reg()
+    gc_model.fit(Xgc_tr, y_gc_tr)
+
+    # Optional isotonic calibration on a temporal tail of train (CS only)
     iso_cs = None
     if args.calibrate_team_cs:
         tr_sorted = df_team_train.sort_values(["season","date_played","gw_orig"]).copy()
@@ -401,20 +412,27 @@ def main():
         logging.warning("Dropping %d/%d EVAL rows with missing mins/p60 (coverage %.1f%%).", n_drop, len(join), cov)
     kept = join.loc[~miss_mask].reset_index(drop=True)
 
-    # Team CS predictions for EVAL teams
+    # Team CS/GC predictions for EVAL teams
     Xcs_team_full = Xcs_team.join(df_team[team_keys])
     tgt_team = kept[["season","gw_orig","team_id","venue","date_played"]].drop_duplicates()
+    # Merge features (and true GA if present) for EVAL teams
     tgt_team_full = tgt_team.merge(Xcs_team_full.join(df_team[["ga"]]), on=team_keys, how="left")
+
+    # CS proba
     p_team_raw = cs_model.predict_proba(tgt_team_full[cs_feats])[:,1]
     p_team = iso_cs.predict(p_team_raw) if iso_cs is not None else p_team_raw
     tgt_team_full["p_teamCS"] = p_team
+
+    # GC expectation (non-negative clamp)
+    exp_gc_team = np.clip(gc_model.predict(tgt_team_full[cs_feats]), 0.0, None)
+    tgt_team_full["exp_gc_team"] = exp_gc_team
 
     # >>> FIX 2: DGW-safe merge on full team–match key
     team_match_key = ["season","gw_orig","team_id","venue","date_played"]
     dups = tgt_team_full.duplicated(team_match_key).sum()
     if dups:
         logging.warning("tgt_team_full has %d duplicate team–match rows; dropping duplicates on %s", dups, team_match_key)
-    tt = tgt_team_full[team_match_key + ["p_teamCS"]].drop_duplicates(team_match_key)
+    tt = tgt_team_full[team_match_key + ["p_teamCS","exp_gc_team"]].drop_duplicates(team_match_key)
 
     kept = kept.merge(tt, on=team_match_key, how="left", validate="many_to_one")
     prob_cs = kept["p_teamCS"].to_numpy() * kept["prob_played60_use"].to_numpy()
@@ -444,8 +462,7 @@ def main():
     pos_dcp = pos_tr[keep_dcp]
     sw = m90_tr[keep_dcp].clip(lower=1e-6).to_numpy()
 
-
-    # Train ONLY DEF & MID
+    # Train ONLY DEF & MID & FWD
     dcp_models: Dict[str, lgb.LGBMRegressor] = {}
     for p in ["DEF", "MID", "FWD"]:
         mask = (pos_dcp == p)
@@ -454,7 +471,6 @@ def main():
         model = _lgbm_reg()
         model.fit(Xdcp_tr.loc[mask], y_dcp_tr[mask], sample_weight=sw[mask])
         dcp_models[p] = model
-
 
     # DCP probability on EVAL players
     Xdcp_te, _ = _build_dcp_features(df.loc[kept["rid"].to_numpy()], args.na_thresh, args.use_z)
@@ -490,9 +506,8 @@ def main():
     exp_dc = np.where(valid_dcp_pos, lam_match, np.nan)
     exp_dc = np.where(kept["pos"].astype(str).to_numpy() == "GK", np.nan, exp_dc)
 
-
-
-
+    # Expected GC per player = team-level exp_gc_team merged by team–match key (same for all players on team)
+    exp_gc = kept["exp_gc_team"].to_numpy()
 
     # ── Save artifacts & predictions ──
     outdir = version_dir
@@ -509,6 +524,7 @@ def main():
     cs_model.booster_.save_model(str(outdir / "team_cs_lgbm.txt"))
     if iso_cs is not None:
         joblib.dump(iso_cs, outdir / "cs_isotonic.joblib")
+    joblib.dump(gc_model, outdir / "team_gc_lgbm.joblib")  # NEW
     for p, mreg in dcp_models.items():
         joblib.dump(mreg, outdir / f"dcp_{p}_lgbm.joblib")
 
@@ -516,6 +532,9 @@ def main():
     pd.DataFrame({"feature": cs_feats, "importance": cs_model.feature_importances_}).to_csv(art_dir / "cs_feature_importances.csv", index=False)
     (art_dir / "cs_features_team.json").write_text(json.dumps(cs_feats, indent=2))
     (art_dir / "dcp_features.json").write_text(json.dumps(dcp_feats, indent=2))
+    # NEW: GC artifacts
+    pd.DataFrame({"feature": cs_feats, "importance": gc_model.feature_importances_}).to_csv(art_dir / "gc_feature_importances.csv", index=False)
+    (art_dir / "gc_features_team.json").write_text(json.dumps(cs_feats, indent=2))
 
     # --- True DC from actual events, aligned to kept order ---
     comp_true = df.loc[kept["rid"].to_numpy(), ["clr","blocks","tkl","int","recoveries"]].copy().fillna(0)
@@ -523,10 +542,8 @@ def main():
 
     base_true = comp_true["clr"] + comp_true["blocks"] + comp_true["tkl"] + comp_true["int"]
     true_dc = base_true + np.where(np.isin(pos_kept, ["MID","FWD"]), comp_true["recoveries"], 0)
-
     # GK not part of DCP schema → NaN
     true_dc = np.where(pos_kept == "GK", np.nan, true_dc)
-
 
     # Predictions (EVAL tail only)
     dump_cols = ["season","gw_orig","date_played","player_id","team_id","player","pos","venue","minutes",
@@ -536,8 +553,8 @@ def main():
     out["prob_dcp"] = prob_dcp
     out["p_teamCS"] = kept["p_teamCS"]
     out["exp_dc"] = exp_dc
-    out["true_dc"] = true_dc 
-
+    out["true_dc"] = true_dc
+    out["exp_gc"] = exp_gc  # NEW
 
     fp = pred_dir / f"expected_defense.csv"
     out.to_csv(fp, index=False)
@@ -561,7 +578,7 @@ def main():
 
     # Team-level calibration table (build directly from team table to avoid DGW duplication)
     rel_bins = max(2, int(args.reliability_bins))
-    team_eval = tgt_team_full.dropna(subset=["ga","p_teamCS"]).copy()
+    team_eval = tgt_team_full.dropna(subset=["ga","p_teamCS","exp_gc_team"]).copy()
     if len(team_eval):
         lab = (team_eval["ga"]==0).astype(int).to_numpy()
         pte = team_eval["p_teamCS"].to_numpy()
@@ -618,11 +635,21 @@ def main():
         except Exception:
             pass
 
-
-
+    # NEW: GC regression metrics at team level (eval set only)
+    metrics_gc = {}
+    if len(team_eval):
+        y_gc_te = team_eval["ga"].astype(float).to_numpy()
+        yhat_gc = team_eval["exp_gc_team"].astype(float).to_numpy()
+        try:
+            metrics_gc["mae_team_gc"] = float(mean_absolute_error(y_gc_te, yhat_gc))
+            rmse = mean_squared_error(y_gc_te, yhat_gc, squared=False)
+            metrics_gc["rmse_team_gc"] = float(rmse)
+        except Exception:
+            pass
 
     (pred_dir / "metrics_cs.json").write_text(json.dumps(metrics_cs, indent=2))
     (pred_dir / "metrics_dcp.json").write_text(json.dumps(metrics_dcp, indent=2))
+    (pred_dir / "metrics_gc.json").write_text(json.dumps(metrics_gc, indent=2))  # NEW
 
     logging.info("Saved models, artifacts, and eval probabilities to %s", outdir.resolve())
 
