@@ -7,7 +7,7 @@ Combine per-component model outputs into expected FPL points per player–fixtur
 Inputs (CSV paths)
 ------------------
 --minutes        minutes_predictions.csv
-                 (needs: pred_exp_minutes; optional: prob_played1_cal/_raw, prob_played60_cal/_raw, pos, exp_appearance_points)
+                 (needs: pred_minutes; optional: prob_played1_cal/_raw, prob_played60_cal/_raw, pos, exp_appearance_points)
 --goals-assists  goals_assists_predictions.csv
                  (needs: pred_goals_mean, pred_assists_mean; typically provides pos/player/venue)
 --saves          saves_predictions.csv  (GK only; optional: exp_save_points_mean or pred_saves_mean)
@@ -220,9 +220,9 @@ def main():
         raise ValueError("GA file missing required key columns: " + ", ".join(KEY))
     _coverage(ga_df, KEY + ["pred_goals_mean","pred_assists_mean","pos","player","venue"], "GA")
 
-    min_need = ["pred_exp_minutes"]
+    min_need = ["pred_minutes"]
     min_df = _drop_dupes(_read_csv(args.minutes, need=min_need), "MIN")
-    _coverage(min_df, KEY + ["pred_exp_minutes","prob_played1_cal","prob_played60_cal","prob_played1_raw","prob_played60_raw","exp_appearance_points","pos"], "MIN")
+    _coverage(min_df, KEY + ["pred_minutes","prob_played1_cal","prob_played60_cal","prob_played1_raw","prob_played60_raw","exp_appearance_points","pos"], "MIN")
 
     def_df = None
     if args.defense:
@@ -238,14 +238,14 @@ def main():
     base = ga_df.copy()
 
     # Merge minutes: bring expected minutes and p1/p60
-    m_exp = pd.to_numeric(min_df.get("pred_exp_minutes", pd.Series(np.nan, index=min_df.index)), errors="coerce").fillna(0.0).to_numpy(float)
+    m_exp = pd.to_numeric(min_df.get("pred_minutes", pd.Series(np.nan, index=min_df.index)), errors="coerce").fillna(0.0).to_numpy(float)
     fallback_p1  = (m_exp > 0).astype(float)
     fallback_p60 = np.clip(m_exp / 90.0, 0.0, 1.0)
 
     min_df["__p1__"]  = _select_prob(min_df, "prob_played1_cal",  "prob_played1_raw",  fallback_p1)
     min_df["__p60__"] = _select_prob(min_df, "prob_played60_cal", "prob_played60_raw", fallback_p60)
 
-    base = base.merge(min_df[KEY + [c for c in ["pred_exp_minutes","__p1__","__p60__","exp_appearance_points","pos"] if c in min_df.columns]],
+    base = base.merge(min_df[KEY + [c for c in ["pred_minutes","__p1__","__p60__","exp_appearance_points","pos"] if c in min_df.columns]],
                       on=KEY, how="left", validate="one_to_one")
 
     # Ensure identity columns exist (player, pos, venue), preferring GA → MIN
@@ -337,13 +337,17 @@ def main():
     # Order & write
     out_cols = list(dict.fromkeys([
         *KEY, "player", "pos", "venue",
-        "pred_exp_minutes", "p1", "p60",
+        "pred_minutes", "p1", "p60",
         "exp_goals","exp_assists","__p_cs__","pred_ga_mean",
         *comp_cols, "exp_points_total"
     ]))
     out_cols = [c for c in out_cols if c in base.columns]
 
-    out = base[out_cols].copy().sort_values(["season","gw_orig","date_played","team_id","player_id"])
+    out = base[out_cols].copy()
+    if "exp_points_total" in out.columns:
+        out = out.rename(columns={"exp_points_total": "xPts"})
+        out["xPts"] = out["xPts"].round(1)
+    out = out.sort_values(["season","gw_orig","date_played","team_id","player_id"])
 
     fp = out_dir / "expected_points.csv"
     out.to_csv(fp, index=False)
