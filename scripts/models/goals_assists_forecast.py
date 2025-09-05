@@ -333,7 +333,11 @@ def _predict_poisson_per_pos(name: str,
     Xp = Xp.fillna(0.0)
 
     for tag in ["GK", "DEF", "MID", "FWD"]:
-        mdl = _load(model_dir / f"{name}_{tag}_poisson.joblib")
+        mdl = None
+        try:
+            mdl = joblib.load(model_dir / f"{name}_{tag}_poisson.joblib")
+        except Exception:
+            mdl = None
         idx = pos.str.upper().eq(tag).to_numpy()
         if mdl is not None and idx.any():
             out[idx] = np.clip(mdl.predict(Xp.iloc[idx].to_numpy(dtype=float)), 0, None)
@@ -599,6 +603,9 @@ def main():
     fut["days_since_last"] = (fut["date_sched"] - fut["date_played"]).dt.days.clip(lower=0)
     fut.drop(columns=["date_played"], inplace=True)
 
+    # >>> NEW: normalize date_sched to date-only while keeping datetime dtype
+    fut["date_sched"] = fut["date_sched"].dt.normalize()
+
     # Add prev_minutes only if not present; do NOT bring is_active (avoid dups/precedence issues)
     if "prev_minutes" not in fut.columns:
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
@@ -729,7 +736,8 @@ def main():
     season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
-    out.to_csv(out_path, index=False)
+    # >>> NEW: print only the date in CSV while dtype stays datetime in-memory
+    out.to_csv(out_path, index=False, date_format="%Y-%m-%d")
 
     diag = {
         "rows": int(len(out)),
