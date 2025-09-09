@@ -1,53 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-points_forecast.py — upcoming fixtures — v1.3
+points_forecast.py — upcoming fixtures — v1.5
 
-What this does
---------------
-• Forecasts expected FPL points (xPts) for *upcoming* matches — no actuals join.
-• **Forced 4-col KEY** for joins: ["season","gw_orig","player_id","team_id"] (no dates in KEY).
-• If aux tables (GA/DEF/SAV) have multiple matches per 4-col key (e.g., DGW), we resolve
-  duplicates with a **nearest-date tie-breaker** against the base (minutes) date when available.
-• Dynamic identity fill: pulls player/pos from GA when missing in minutes.
-• Output-only rounding: xPts → 1 dp; all other floats → 2 dp.
-• Saves points computed exactly as E[floor(S/3)] with robust NaN handling.
-• GC penalty uses exact Poisson pairs formula with minutes exposure scaling.
-• Discipline v1: position prior per 90 × minutes.
-• Roster-gate (optional): filter minutes/base to players on the provided master_teams roster
-  for seasons present in the minutes CSV; optional league restriction.
-• NEW: Maintains `<out-dir>/expected_points_merged.csv` that overwrites overlapping rows by 4-col KEY.
-
-Inputs (CSV)
-------------
---minutes        Required. Must contain: season, gw_orig, player_id, team_id, pos, pred_minutes.
-                Nice-to-have: p_play, p60, exp_minutes_points, player, date_sched/date_played/kickoff_time.
-
---goals-assists  Required. Should contain: pred_goals_mean, pred_assists_mean (+ KEY columns).
-                May also contain player/pos and a date column for tie-breaking (recommended).
-
---defense        Optional. Uses: prob_cs or p_teamCS (CS prob); lambda90 (per-90 GA) or exp_gc (per-match GA).
-                If lambda90 missing, falls back to exp_gc; else to -log(prob_cs).
-
---saves          Optional. Columns supported:
-                season,gw_orig,date_sched,player_id,team_id,player,pos,pred_minutes,
-                team_def_z_venue,opp_att_z_venue,
-                pred_saves_p90_mean, pred_saves_mean,
-                pred_saves_p90_poisson, pred_saves_poisson
-                Logic:
-                - Prefer per-match λ: first of [pred_saves_mean, pred_saves_poisson]
-                - Else per-90 λ: first of [pred_saves_p90_mean, pred_saves_p90_poisson] scaled by minutes/90
-                - Else assume 0
-
-CLI example
------------
-py -m scripts.models.points_forecast ^
-  --minutes data/predictions/minutes/2025-2026/GW3_5.csv ^
-  --goals-assists data/predictions/goals_assists/2025-2026/GW3_5.csv ^
-  --defense data/predictions/defense/2025-2026/GW3_5.csv ^
-  --saves data/predictions/saves/2025-2026/GW3_5.csv ^
-  --out-dir data/predictions/expected_points ^
-  --version v3 --write-latest --log-level INFO
+What's new vs v1.4
+------------------
+• Expose DCP signals (prob_dcp, expected_dc) for all OUTFIELD positions (DEF/MID/FWD); GKs → NaN.
+• Add DCP bonus into xPts: +2 * prob_dcp_outfield, with thresholds 10 (DEF) / 12 (MID,FWD).
+• Rename internal/team defense columns for readability in OUTPUT:
+    __p_cs__      → team_prob_cs
+    __lambda90__  → team_ga_lambda90
+    __exp_gc__    → team_exp_gc
+• Auto-maintained merged CSV with overwrite-by-key semantics.
+• date_sched placed immediately after season in the header.
 """
 
 from __future__ import annotations
@@ -58,7 +23,7 @@ from typing import List, Dict, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "future.v1.3"
+SCHEMA_VERSION = "future.v1.5"
 
 # ───────────────────────── versioning & pointers ─────────────────────────
 
@@ -95,7 +60,6 @@ def _write_latest_pointer(root: Path, version: str) -> None:
 
 def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={c: c.strip() for c in df.columns})
-    # Keep real datetimes for tie-breaks
     for c in ("date_sched", "date_played", "kickoff_time"):
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -136,7 +100,14 @@ def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(tmp, index=False)
     os.replace(tmp, path)
 
-# ───────────────────────── scoring utilities ─────────────────────────
+# ───────────────────────── math helpers ─────────────────────────
+
+def _round_for_output(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_float_dtype(out[c]):
+            out[c] = out[c].round(1 if c == "xPts" else 2)
+    return out
 
 def _pos_points_vector(pos: pd.Series, kind: str) -> np.ndarray:
     p = pos.fillna("").astype(str).str.upper().str[:3]
@@ -149,9 +120,17 @@ def _pos_points_vector(pos: pd.Series, kind: str) -> np.ndarray:
                         np.where(p.isin(["MID"]), 1, 0.0)).astype(float)
     raise ValueError("kind must be 'goal' or 'cs'")
 
-def _is_def_like(pos: pd.Series) -> np.ndarray:
+def _is_gk(pos: pd.Series) -> np.ndarray:
     p = pos.fillna("").astype(str).str.upper().str[:3]
-    return p.isin(["GKP","GK","DEF"]).to_numpy()
+    return p.isin(["GK","GKP"]).to_numpy()
+
+def _is_def(pos: pd.Series) -> np.ndarray:
+    p = pos.fillna("").astype(str).str.upper().str[:3]
+    return p.eq("DEF").to_numpy()
+
+def _is_outfield(pos: pd.Series) -> np.ndarray:
+    p = pos.fillna("").astype(str).str.upper().str[:3]
+    return ~p.isin(["GK","GKP"]).to_numpy()
 
 def _choose_first_num(df: pd.DataFrame, candidates: List[str], default: float | None = None) -> pd.Series:
     for c in candidates:
@@ -184,28 +163,17 @@ def _expected_floor_div3_poisson(lam: np.ndarray, kmax: int | None = None) -> np
         out += (i // 3) * pmf
     return out
 
-def _round_for_output(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in out.columns:
-        if pd.api.types.is_float_dtype(out[c]):
-            out[c] = out[c].round(1 if c == "xPts" else 2)
-    return out
-
-def _parse_priors(spec: str | None) -> Dict[str, float]:
-    default = {"GK": -0.05, "GKP": -0.05, "DEF": -0.18, "MID": -0.14, "FWD": -0.10}
-    if not spec:
-        return default
-    d: Dict[str, float] = {}
-    for tok in spec.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        k, _, v = tok.partition(":")
-        try:
-            d[k.strip().upper()] = float(v.strip())
-        except Exception:
-            pass
-    return {**default, **d}
+def _poisson_sf_vectorized(lam: np.ndarray, k_threshold: int) -> np.ndarray:
+    lam = np.asarray(lam, dtype=float)
+    lam = np.where(np.isfinite(lam) & (lam >= 0.0), lam, 0.0)
+    pmf0 = np.exp(-lam)
+    cdf = pmf0.copy()
+    pmf = pmf0.copy()
+    for i in range(1, k_threshold):
+        pmf = pmf * lam / i
+        cdf += pmf
+    sf = 1.0 - cdf
+    return np.clip(sf, 0.0, 1.0)
 
 # ───────────────────────── KEY & merge helpers ─────────────────────────
 
@@ -325,11 +293,9 @@ def _align_union_columns(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[pd.DataFrame
     all_cols = list(dict.fromkeys([*a.columns, *b.columns]))
     a2 = a.reindex(columns=all_cols)
     b2 = b.reindex(columns=all_cols)
-    # Put date_sched right after season if both exist
     if "season" in all_cols and "date_sched" in all_cols:
         all_cols.remove("date_sched")
-        idx = all_cols.index("season") + 1
-        all_cols.insert(idx, "date_sched")
+        all_cols.insert(all_cols.index("season") + 1, "date_sched")
     return a2[all_cols], b2[all_cols], all_cols
 
 def _update_merged_csv(new_df: pd.DataFrame,
@@ -340,23 +306,16 @@ def _update_merged_csv(new_df: pd.DataFrame,
         old = _read_csv(merged_path, tag="MERGED")
     else:
         old = pd.DataFrame(columns=new_df.columns)
-
     old, new, all_cols = _align_union_columns(old, new_df)
-
-    # Anti-join: keep old rows not present in new by KEY
     key_df = new[key_cols].drop_duplicates()
     old_mark = old.merge(key_df.assign(__hit__=1), on=key_cols, how="left")
     old_kept = old_mark[old_mark["__hit__"].isna()].drop(columns="__hit__")
-
     merged = pd.concat([old_kept, new], ignore_index=True, sort=False)
-
-    # Sort & round
     for c in sort_cols:
         if c not in merged.columns:
             merged[c] = np.nan
     merged = merged.sort_values(by=[c for c in sort_cols if c in merged.columns])
     merged = _round_for_output(merged)
-
     _atomic_write_csv(merged, merged_path)
     logging.info("[merged] updated %s (rows=%d)", merged_path.resolve(), len(merged))
 
@@ -374,24 +333,17 @@ def main():
     ap.add_argument("--write-latest", action="store_true")
     ap.add_argument("--discipline-priors", type=str, default=None,
                     help='Override per-90 priors, e.g. "GK:-0.05,DEF:-0.20,MID:-0.15,FWD:-0.10"')
-
-    # Roster gate (optional)
-    ap.add_argument("--teams-json", type=Path, default=None,
-                    help="Path to master_teams.json containing per-season rosters")
-    ap.add_argument("--league-filter", type=str, default="ENG-Premier League",
-                    help='Restrict roster to a league (e.g., "ENG-Premier League")')
-    ap.add_argument("--require-on-roster", action="store_true",
-                    help="Error out if any minutes rows are not on the roster")
-
-    # Merged writer control
-    ap.add_argument("--no-merged", action="store_true",
-                    help="Skip updating <out-dir>/expected_points_merged.csv")
-
+    ap.add_argument("--teams-json", type=Path, default=None)
+    ap.add_argument("--league-filter", type=str, default=None)
+    ap.add_argument("--require-on-roster", action="store_true")
+    ap.add_argument("--no-merged", action="store_true")
     ap.add_argument("--log-level", default="INFO", type=str)
     args = ap.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
-                        format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s: %(message)s"
+    )
 
     version = _resolve_version(args.out_dir, args.version, args.auto_version)
     out_dir = args.out_dir / version
@@ -410,7 +362,14 @@ def main():
     def_df = None
     if args.defense:
         def_df = _read_csv(args.defense, tag="DEF")
-        _coverage(def_df, ["season","gw_orig","player_id","team_id","prob_cs","p_teamCS","lambda90","exp_gc","date_sched","date_played","kickoff_time"], "DEF")
+        _coverage(def_df, [
+            "season","gw_orig","player_id","team_id",
+            "prob_cs","p_teamCS","lambda90","exp_gc",
+            "prob_dcp","p_dcp","dcp_prob",
+            "lambda90_dcp","dcp_lambda90","dcp_p90","lambda_dcp90",
+            "expected_dc",
+            "date_sched","date_played","kickoff_time"
+        ], "DEF")
 
     sav_df = None
     if args.saves:
@@ -420,29 +379,28 @@ def main():
             "pred_saves_p90_mean","pred_saves_p90_poisson","pred_minutes","player","pos","date_sched","date_played","kickoff_time"
         ], "SAV")
 
-    # Forced KEY (no dates)
     KEY = FORCED_KEY
     logging.info("[key] FORCED -> %s (date columns not used in key)", KEY)
 
-    # De-duplication policy:
+    # De-dupe
     min_df = _drop_exact_dupes(min_df, "MIN")
     ga_df  = _drop_exact_dupes(ga_df,  "GA")
     if def_df is not None: def_df = _drop_exact_dupes(def_df, "DEF")
     if sav_df is not None: sav_df = _drop_exact_dupes(sav_df, "SAV")
 
-    # Base = MINUTES
+    # Base
     if not set(KEY).issubset(min_df.columns):
         raise ValueError(f"MINUTES CSV missing key columns for required KEY: {KEY}")
     base = min_df.copy()
 
-    # ── Roster gate ──
+    # Roster gate
     seasons_in_minutes = sorted(base["season"].dropna().astype(str).unique().tolist())
     allow_keys = _build_roster_keyset(args.teams_json, seasons_in_minutes, args.league_filter)
     base = _apply_roster_gate(base, allow_keys, artifacts_dir, args.require_on_roster)
     if base.empty:
         raise RuntimeError("No rows remain after roster gating.")
 
-    # Identity fields from GA if missing in minutes
+    # Fill identity from GA if needed
     for c in ("player","pos"):
         if c not in base.columns and ga_df is not None and c in ga_df.columns:
             right = ga_df[KEY + [c] + [col for col in RIGHT_DATE_PREFS if col in ga_df.columns]]
@@ -460,21 +418,33 @@ def main():
     base["pred_goals_mean"]   = pd.to_numeric(base.get("pred_goals_mean", 0.0), errors="coerce").fillna(0.0)
     base["pred_assists_mean"] = pd.to_numeric(base.get("pred_assists_mean", 0.0), errors="coerce").fillna(0.0)
 
-    # Defense signals
+    # Defense signals (CS/GA + DCP)
     if def_df is not None and len(def_df):
         tmp = def_df.copy()
-        tmp["__p_cs__"]     = _select_prob_series(tmp, ["prob_cs","p_teamCS"])
-        tmp["__lambda90__"] = pd.to_numeric(tmp.get("lambda90", np.nan), errors="coerce")
-        tmp["__exp_gc__"]   = pd.to_numeric(tmp.get("exp_gc",   np.nan), errors="coerce")
-        keep = ["__p_cs__","__lambda90__","__exp_gc__"]
+        tmp["__p_cs__"]         = _select_prob_series(tmp, ["prob_cs","p_teamCS"])
+        tmp["__lambda90__"]     = pd.to_numeric(tmp.get("lambda90", np.nan), errors="coerce")
+        tmp["__exp_gc__"]       = pd.to_numeric(tmp.get("exp_gc",   np.nan), errors="coerce")
+
+        # DCP pieces (for all rows; will mask GKs later)
+        tmp["__prob_dcp__"]     = _select_prob_series(tmp, ["prob_dcp","p_dcp","dcp_prob"])
+        tmp["__lambda90_dcp__"] = _choose_first_num(tmp, ["lambda90_dcp","dcp_lambda90","dcp_p90","lambda_dcp90"], default=np.nan)
+        if "expected_dc" in tmp.columns:
+            tmp["__expected_dc__"] = pd.to_numeric(tmp["expected_dc"], errors="coerce")
+        else:
+            tmp["__expected_dc__"] = np.nan
+
+        keep = ["__p_cs__","__lambda90__","__exp_gc__","__prob_dcp__","__lambda90_dcp__","__expected_dc__"]
         right = tmp[KEY + keep + [col for col in RIGHT_DATE_PREFS if col in tmp.columns]]
         base = _merge_with_nearest_date(base, right, KEY, keep, tag="DEF")
     else:
         base["__p_cs__"] = np.nan
         base["__lambda90__"] = np.nan
         base["__exp_gc__"] = np.nan
+        base["__prob_dcp__"] = np.nan
+        base["__lambda90_dcp__"] = np.nan
+        base["__expected_dc__"] = np.nan
 
-    # Saves (GK)
+    # Saves (GK) — prefer per-match λ; else per-90 scaled by minutes
     if sav_df is not None and len(sav_df):
         tmp = sav_df.copy()
         lam_pm  = _choose_first_num(tmp, ["pred_saves_mean","pred_saves_poisson"], default=np.nan)
@@ -506,7 +476,7 @@ def main():
     p_cs = pd.to_numeric(base.get("__p_cs__", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     base["xp_clean_sheets"] = base["p60"] * p_cs * cs_pts_vec
 
-    # Goals-conceded penalty (GK/DEF)
+    # Goals-conceded penalty (GK/DEF-like)
     lam90   = pd.to_numeric(base.get("__lambda90__", np.nan), errors="coerce")
     exp_gc  = pd.to_numeric(base.get("__exp_gc__",   np.nan), errors="coerce")
     lam_team = lam90.where(lam90.notna(), exp_gc)
@@ -516,8 +486,8 @@ def main():
     )
     lam_on = lam_team.fillna(0.0) * (m / 90.0)
     e_pairs = _expected_gc_pairs_lambda_on(lam_on.to_numpy())
-    is_def = _is_def_like(base["pos"])
-    base["xp_concede_penalty"] = np.where(is_def, -e_pairs, 0.0)
+    is_def_like_mask = base["pos"].fillna("").astype(str).str.upper().str[:3].isin(["GKP","GK","DEF"]).to_numpy()
+    base["xp_concede_penalty"] = np.where(is_def_like_mask, -e_pairs, 0.0)
 
     # Saves EP (GK only)
     raw_lambda = pd.to_numeric(base.get("__saves_lambda_raw__"), errors="coerce")
@@ -528,14 +498,38 @@ def main():
     lam_saves = raw_lambda if had_pm else raw_lambda * np.clip(m/90.0, 0.0, None)
     lam_saves = lam_saves.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
     exp_floor_s3 = _expected_floor_div3_poisson(lam_saves.to_numpy(), kmax=None)
-    is_gk = base["pos"].fillna("").astype(str).str.upper().str.startswith(("GK","GKP"))
-    base["xp_saves_points"] = np.where(is_gk, exp_floor_s3, 0.0)
+    base["xp_saves_points"] = np.where(_is_gk(base["pos"]), exp_floor_s3, 0.0)
 
     # Discipline v1 prior (per-90 × minutes)
-    priors = _parse_priors(args.discipline_priors)
+    priors = {"GK": -0.05, "GKP": -0.05, "DEF": -0.18, "MID": -0.14, "FWD": -0.10}
     pos_upper = base["pos"].fillna("").astype(str).str.upper()
     prior_per90 = pos_upper.map(lambda x: priors.get(x, priors.get(x[:3], -0.12))).astype(float).fillna(-0.12)
     base["xp_discipline_prior"] = prior_per90 * (m / 90.0)
+
+    # DCP exposure for outfield & fallback prob if needed
+    is_outfield = _is_outfield(base["pos"])
+    is_def = _is_def(base["pos"])
+
+    prob_dcp_in = pd.to_numeric(base.get("__prob_dcp__"), errors="coerce").clip(0.0, 1.0)
+    lam90_dcp   = pd.to_numeric(base.get("__lambda90_dcp__"), errors="coerce")
+    exp_dc_dir  = pd.to_numeric(base.get("__expected_dc__"), errors="coerce")
+
+    expected_dc = exp_dc_dir.where(exp_dc_dir.notna(), lam90_dcp * (m / 90.0))
+
+    # Thresholds: DEF=10, MID/FWD=12
+    lam_on_dcp = lam90_dcp * (m / 90.0)
+    sf10 = _poisson_sf_vectorized(lam_on_dcp.to_numpy(), 10)
+    sf12 = _poisson_sf_vectorized(lam_on_dcp.to_numpy(), 12)
+    sf_fallback = np.where(is_def, sf10, sf12)
+
+    prob_dcp_final = prob_dcp_in.where(prob_dcp_in.notna(), sf_fallback)
+    prob_dcp_final = np.where(is_outfield, prob_dcp_final, np.nan)
+
+    base["prob_dcp"]    = np.where(is_outfield, prob_dcp_final, np.nan)
+    base["expected_dc"] = np.where(is_outfield, expected_dc, np.nan)
+
+    # DCP bonus → xPts
+    base["xp_dcp_bonus"] = np.where(is_outfield, 2.0 * prob_dcp_final, 0.0)
 
     # Sum components → xPts
     comp_cols = [
@@ -543,22 +537,29 @@ def main():
         "xp_goals",
         "xp_assists",
         "xp_clean_sheets",
-        "xp_concede_penalty",
         "xp_saves_points",
         "xp_discipline_prior",
+        "xp_dcp_bonus",
     ]
     for c in comp_cols:
         base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
     base["xPts"] = base[comp_cols].sum(axis=1)
 
-    # Output columns (date_sched immediately after season)
+    # Friendly output aliases for team defense signals
+    base["team_prob_cs"]     = pd.to_numeric(base.get("__p_cs__"), errors="coerce")
+    base["team_ga_lambda90"] = pd.to_numeric(base.get("__lambda90__"), errors="coerce")
+    base["team_exp_gc"]      = pd.to_numeric(base.get("__exp_gc__"), errors="coerce")
+
+    # Output columns (place date_sched right after season)
     out_cols = list(dict.fromkeys([
         *FORCED_KEY, "player", "pos",
+        *[c for c in LEFT_DATE_PREFS if c in base.columns],
         "pred_minutes", "p1", "p60",
-        "pred_goals_mean","pred_assists_mean","__p_cs__","__lambda90__","__exp_gc__",
-        "__saves_lambda_raw__",
-        *comp_cols, "xPts",
-        *[c for c in LEFT_DATE_PREFS if c in base.columns]
+        "pred_goals_mean","pred_assists_mean",
+        "team_prob_cs","team_ga_lambda90","team_exp_gc",
+        "prob_dcp","expected_dc",
+        "xp_appearance","xp_goals","xp_assists","xp_clean_sheets","xp_concede_penalty","xp_saves_points","xp_discipline_prior","xp_dcp_bonus",
+        "xPts",
     ]))
     out_cols = [c for c in out_cols if c in base.columns]
     if "season" in out_cols and "date_sched" in out_cols:
@@ -572,8 +573,6 @@ def main():
             sort_cols.append(dc)
 
     out = base[out_cols].copy().sort_values(by=sort_cols)
-
-    # Output-only rounding
     out_rounded = _round_for_output(out)
 
     # Write per-run (versioned)
@@ -586,7 +585,7 @@ def main():
         merged_fp = args.out_dir / "expected_points_merged.csv"
         _update_merged_csv(out_rounded, merged_fp, FORCED_KEY, sort_cols)
 
-    # Sanity log for GA means flowing
+    # Logs
     nonzero_ga = int((base["pred_goals_mean"] > 0).sum())
     nonzero_as = int((base["pred_assists_mean"] > 0).sum())
     logging.info("[GA] non-zero means -> goals=%d, assists=%d", nonzero_ga, nonzero_as)
@@ -607,14 +606,14 @@ def main():
             "appearance": ["exp_minutes_points", "p_play + p60 (fallback)"],
             "goals": ["pred_goals_mean"],
             "assists": ["pred_assists_mean"],
-            "clean_sheet_prob": ["prob_cs", "p_teamCS"],
-            "ga_lambda": ["lambda90 (per90)", "exp_gc (per match)", "-log(prob_cs) (fallback)"],
-            "saves_lambda_candidates": [
-                "per-match: pred_saves_mean, pred_saves_poisson",
-                "per-90: pred_saves_p90_mean, pred_saves_p90_poisson × minutes/90"
+            "clean_sheet_prob": ["team_prob_cs ← (prob_cs | p_teamCS)"],
+            "ga_lambda": ["team_ga_lambda90 ← lambda90 (per90)", "team_exp_gc ← exp_gc (per match)", "fallback: -log(prob_cs)"],
+            "saves_points_formula": "Exact E[floor(S/3)] with per-match saves λ",
+            "dcp": [
+                "prob_dcp ← (prob_dcp|p_dcp|dcp_prob); fallback P(DC≥thr) via Poisson with λ_on=lambda90_dcp×min/90",
+                "expected_dc ← defense.expected_dc or lambda90_dcp×min/90",
+                "DCP bonus: +2 * prob_dcp_outfield; thr DEF=10, MID/FWD=12"
             ],
-            "gc_penalty_formula": "E[floor(N/2)] = 0.5*λ_on - 0.25*(1 - e^{-2λ_on}); λ_on = λ_team * pred_minutes/90",
-            "saves_points_formula": "Exact E[floor(S/3)] with λ being per-match saves"
         },
         "output_fields": {"total": "xPts (1 dp)", "others": "2 dp"}
     }
