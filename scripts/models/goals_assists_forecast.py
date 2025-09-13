@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 r"""
 goals_assists_forecast.py — leak-free scorer for future GWs using trained G/A heads,
 with roster gating, venue mapping from team fixtures, and safer feature handling.
 
 Key fixes vs prior rev:
+• Robust fixtures join: coerce key dtypes (gw numeric, team_id string), ensure `is_home`,
+  and compute `venue_bin` *after* the merge to avoid KeyError.
 • Remove duplicate columns on merges by design (no importing is_active from last snapshot; add prev_minutes only if absent).
-• Use training medians (artifacts/features_median.json) for Poisson/Tweedie imputations; avoid leakage from serve-time medians.
+• Keep NaNs for LGBM at inference (no blanket fillna(0)); LightGBM routes missing values.
+• Use training medians (artifacts/features_median.json) for Poisson/Tweedie imputations; avoid leakage.
 • Robust, POS-aware EWMA for shots/SOT p90 (including home/away splits), strictly past-only (shifted by 1).
 • Assert feature-vector order matches artifacts/features.json; log unused fut columns.
-• Normalize --league-filter to reduce label mismatch (e.g., “ENG-Premier League” vs “Premier League”).
+• Normalize --league-filter labels and date_sched to date-only (CSV).
 • Gate p_return_any by having positive effective minutes.
 • Output sorted by gw_orig, team_id, player_id into <out-dir>/<SEASON>/GW<from>_<to>.csv.
 
-Outputs
--------
-<out-dir>/<SEASON>/GW<from>_<to>.csv columns include:
-  season, gw_orig, date_sched, player_id, team_id, player, pos,
-  pred_minutes, team_att_z_venue, opp_def_z_venue,
-  pred_goals_p90_mean, pred_assists_p90_mean,
-  pred_goals_mean, pred_assists_mean,
-  pred_goals_p90_poisson, pred_assists_p90_poisson,
-  pred_goals_poisson,  pred_assists_poisson,
-  p_goal, p_assist, p_return_any
+Output columns (ordered)
+------------------------
+# Requested minutes metadata first:
+season, gw_played, gw_orig, date_sched, fbref_id, team_id, team, opponent_id, opponent, is_home,
+player_id, player, pos, fdr, p_start, p60, p_cameo, p_play, pred_start_head,
+pred_bench_cameo_head, pred_bench_head, pred_minutes, exp_minutes_points, _is_synth,
+# Context (kept):
+team_att_z_venue, opp_def_z_venue,
+# Predictions:
+pred_goals_p90_mean, pred_assists_p90_mean, pred_goals_mean, pred_assists_mean,
+pred_goals_p90_poisson, pred_assists_p90_poisson, pred_goals_poisson, pred_assists_poisson,
+p_goal, p_assist, p_return_any
 """
 from __future__ import annotations
 
@@ -140,14 +146,18 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
             tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype(int)
         else:
             tf["is_home"] = 0
+    # Coerce GWs numeric
     for c in ("gw_played", "gw_orig", "gw"):
         if c in tf.columns:
             tf[c] = pd.to_numeric(tf[c], errors="coerce")
+    # Normalize team_id
     if "team_id" not in tf.columns:
         for alt in ["team", "teamId", "team_code"]:
             if alt in tf.columns:
                 tf = tf.rename(columns={alt: "team_id"})
                 break
+    if "team_id" in tf.columns:
+        tf["team_id"] = tf["team_id"].astype(str)
     tf["season"] = season
     return tf
 
@@ -276,7 +286,8 @@ def _load_booster(p: Path) -> Optional[lgb.Booster]:
 def _predict_reg(booster: Optional[lgb.Booster], X: pd.DataFrame) -> np.ndarray:
     if booster is None or X.empty:
         return np.zeros(len(X), dtype=float)
-    Xn = X.select_dtypes(include=[np.number]).fillna(0)
+    # Preserve NaNs exactly as in training; just ensure numeric dtype.
+    Xn = X.astype(float)
     return np.clip(booster.predict(Xn), 0, None)
 
 
@@ -333,11 +344,7 @@ def _predict_poisson_per_pos(name: str,
     Xp = Xp.fillna(0.0)
 
     for tag in ["GK", "DEF", "MID", "FWD"]:
-        mdl = None
-        try:
-            mdl = joblib.load(model_dir / f"{name}_{tag}_poisson.joblib")
-        except Exception:
-            mdl = None
+        mdl = _load(model_dir / f"{name}_{tag}_poisson.joblib")
         idx = pos.str.upper().eq(tag).to_numpy()
         if mdl is not None and idx.any():
             out[idx] = np.clip(mdl.predict(Xp.iloc[idx].to_numpy(dtype=float)), 0, None)
@@ -514,6 +521,7 @@ def main():
     if "season" not in minutes.columns:
         minutes["season"] = args.future_season
 
+    # Robust GW selection key
     gw_sel = _gw_for_selection(minutes)
     avail_gws = sorted(pd.unique(gw_sel.dropna().astype(int)))
     avail_gws = [int(x) for x in avail_gws]
@@ -527,22 +535,60 @@ def main():
     if minutes.empty:
         raise RuntimeError("No minute rows after filtering target GWs.")
 
-    # Merge venue from team fixtures for venue_bin calculation
+    # Merge venue from team fixtures for venue_bin calculation (ROBUST)
     team_fix = _load_team_fixtures(args.fix_root, args.future_season, args.team_fixtures_filename)
+
+    # Harmonize dtypes/keys before joining
     gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
     gw_key_t = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+
+    if gw_key_m in minutes.columns:
+        minutes[gw_key_m] = pd.to_numeric(minutes[gw_key_m], errors="coerce")
+    if gw_key_t in team_fix.columns:
+        team_fix[gw_key_t] = pd.to_numeric(team_fix[gw_key_t], errors="coerce")
+
+    if "team_id" in minutes.columns:
+        minutes["team_id"] = minutes["team_id"].astype(str)
+    if "team_id" in team_fix.columns:
+        team_fix["team_id"] = team_fix["team_id"].astype(str)
+
     venue_cols = ["season", "team_id", gw_key_t, "is_home"]
     vmap = (team_fix[venue_cols]
             .dropna(subset=[gw_key_t, "team_id"])
             .drop_duplicates()
             .rename(columns={gw_key_t: gw_key_m}))
-    minutes = minutes.merge(vmap, how="left", on=["season", "team_id", gw_key_m], validate="many_to_one")
+
+    minutes = minutes.merge(
+        vmap,
+        how="left",
+        on=["season", "team_id", gw_key_m],
+        validate="many_to_one",
+        copy=False,
+    )
+
+    # Ensure `is_home` exists even if fixtures lacked it
+    if "is_home" not in minutes.columns:
+        if "venue" in minutes.columns:
+            minutes["is_home"] = minutes["venue"].astype(str).str.lower().eq("home").astype(int)
+        else:
+            minutes["is_home"] = np.nan  # will fallback to 0 in feature input if needed
+
+    # Build `venue_bin`
+    venue_fallback = (
+        minutes["venue"].astype(str).str.lower().eq("home").astype(int)
+        if "venue" in minutes.columns else 0
+    )
+    minutes["venue_bin"] = (
+        pd.to_numeric(minutes["is_home"], errors="coerce")
+          .fillna(venue_fallback)
+          .fillna(0)
+          .astype(int)
+    )
 
     # Build future frame (one row per player fixture)
     fut = minutes.copy()
-    fut["venue_bin"] = pd.to_numeric(fut["is_home"], errors="coerce").fillna(0).astype(int)
     if "fdr" not in fut.columns:
-        fut["fdr"] = 0.0
+        fut["fdr"] = np.nan
 
     # --- Roster gating (authoritative filter for scoring set) ---
     allowed_pairs = _load_roster_pairs(
@@ -575,7 +621,6 @@ def main():
         fut["opp_def_z_venue"] = np.nan
 
     # Last-known snapshot features (days_since_last; optional prev_minutes)
-    # Build minimal pull set (EWMs/rolls + minutes for prev_minutes)
     pull_cols = {c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)}
     pull_cols |= {"minutes"}  # for prev_minutes only
     snap_cols = list(pull_cols)
@@ -603,10 +648,10 @@ def main():
     fut["days_since_last"] = (fut["date_sched"] - fut["date_played"]).dt.days.clip(lower=0)
     fut.drop(columns=["date_played"], inplace=True)
 
-    # >>> NEW: normalize date_sched to date-only while keeping datetime dtype
+    # Normalize date_sched to date-only while keeping datetime dtype in-memory; CSV will write date-only
     fut["date_sched"] = fut["date_sched"].dt.normalize()
 
-    # Add prev_minutes only if not present; do NOT bring is_active (avoid dups/precedence issues)
+    # Add prev_minutes only if not present
     if "prev_minutes" not in fut.columns:
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
         fut = fut.merge(last_prev, how="left", on=["season", "player_id"], validate="many_to_one")
@@ -637,12 +682,12 @@ def main():
             X[c] = pd.to_numeric(X[c], errors="coerce")
 
     # Assert feature order/shape matches training schema
-    try:
-        if list(X.columns) != list(feat_cols):
-            raise AssertionError(f"Feature order mismatch.\nExpected (from features.json): {feat_cols}\nGot: {list(X.columns)}")
-    except AssertionError as e:
-        logging.error(str(e))
-        raise
+    if list(X.columns) != list(feat_cols):
+        raise AssertionError(
+            "Feature order mismatch.\n"
+            f"Expected (from features.json): {feat_cols}\n"
+            f"Got: {list(X.columns)}"
+        )
 
     # Log some unused columns in fut (debug aid)
     unused = [c for c in fut.columns if c not in feat_cols]
@@ -691,6 +736,22 @@ def main():
     p_goal   = np.clip(p_goal_raw, 0, 1)
     p_assist = np.clip(p_assist_raw, 0, 1)
 
+    if args.apply_calibration:
+        try:
+            goal_cal = joblib.load(args.model_dir / "artifacts" / "p_goal_isotonic_per_pos.joblib")
+            ass_cal  = joblib.load(args.model_dir / "artifacts" / "p_assist_isotonic_per_pos.joblib")
+            def _apply_iso(p: np.ndarray, pos: pd.Series, cal_map: dict) -> np.ndarray:
+                pout = p.copy()
+                for tag, iso in (cal_map or {}).items():
+                    m = pos.str.upper().eq(tag).to_numpy()
+                    if m.any():
+                        pout[m] = iso.transform(pout[m])
+                return np.clip(pout, 0, 1)
+            p_goal   = _apply_iso(p_goal,   pos_ser, goal_cal)
+            p_assist = _apply_iso(p_assist, pos_ser, ass_cal)
+        except Exception as e:
+            logging.warning("Calibration artifacts missing or failed: %s", e)
+
     # Union probability (independence assumption). Gate by having positive effective minutes.
     p_return_any = (1.0 - (1.0 - p_goal) * (1.0 - p_assist)) * (scale > 0)
 
@@ -702,41 +763,104 @@ def main():
                     p_goal, p_assist, p_return_any):
             arr[m] = 0.0
 
-    # Assemble output
-    cols = {
-        "season": fut["season"].values,
-        "gw_orig": fut[gw_key_m].values if gw_key_m in fut.columns else np.nan,
-        "date_sched": fut["date_sched"].values,
-        "player_id": fut["player_id"].values,
-        "team_id": fut.get("team_id", pd.Series([np.nan]*len(fut))).values,
-        "player": fut.get("player", pd.Series([np.nan]*len(fut))).values,
-        "pos": fut["pos"].values,
-        "pred_minutes": fut["pred_minutes"].values,
-        "team_att_z_venue": fut.get("team_att_z_venue", pd.Series([np.nan]*len(fut))).values,
-        "opp_def_z_venue": fut.get("opp_def_z_venue", pd.Series([np.nan]*len(fut))).values,
-        "pred_goals_p90_mean": g_p90_mean,
-        "pred_assists_p90_mean": a_p90_mean,
-        "pred_goals_mean": pred_goals_mean,
-        "pred_assists_mean": pred_assists_mean,
+    # ---------------------- Assemble output with metadata ----------------------
+    def pick_col(df: pd.DataFrame, *names: str):
+        for n in names:
+            if n in df.columns:
+                return df[n].values
+        return np.full(len(df), np.nan, dtype=object)
+
+    opponent_id_vals    = pick_col(fut, "opponent_id", "opp_team_id", "opp_id")
+    opponent_name_vals  = pick_col(fut, "opponent", "opp_team", "opp_name")
+    fbref_id_vals       = pick_col(fut, "fbref_id", "fixture_id", "game_id")
+    team_name_vals      = pick_col(fut, "team", "team_name", "team_short", "team_long")
+
+    gw_played_vals = pd.to_numeric(fut.get("gw_played", np.nan), errors="coerce").values
+    gw_orig_vals   = pd.to_numeric(fut.get("gw_orig",   fut.get("gw", np.nan)), errors="coerce").values
+    fdr_vals       = pd.to_numeric(fut.get("fdr", np.nan), errors="coerce").values
+
+    p_start_vals = pd.to_numeric(fut.get("p_start", np.nan), errors="coerce").clip(0, 1).values
+    p60_vals     = pd.to_numeric(fut.get("p60", np.nan), errors="coerce").clip(0, 1).values
+    p_cameo_vals = pd.to_numeric(fut.get("p_cameo", np.nan), errors="coerce").clip(0, 1).values
+    p_play_vals  = pd.to_numeric(fut.get("p_play", np.nan), errors="coerce").clip(0, 1).values
+
+    pred_start_head_vals       = pd.to_numeric(fut.get("pred_start_head", np.nan), errors="coerce").values
+    pred_bench_cameo_head_vals = pd.to_numeric(fut.get("pred_bench_cameo_head", np.nan), errors="coerce").values
+    pred_bench_head_vals       = pd.to_numeric(fut.get("pred_bench_head", np.nan), errors="coerce").values
+    exp_minutes_points_vals    = pd.to_numeric(fut.get("exp_minutes_points", np.nan), errors="coerce").values
+    is_synth_vals              = fut.get("_is_synth", pd.Series([False]*len(fut))).astype(bool).values
+
+    out = pd.DataFrame({
+        # --- Requested metadata first ---
+        "season":            fut["season"].values,
+        "gw_played":         gw_played_vals,
+        "gw_orig":           gw_orig_vals,
+        "date_sched":        fut["date_sched"].dt.normalize().values,  # date-only
+        "fbref_id":          fbref_id_vals,
+        "team_id":           fut.get("team_id", pd.Series([np.nan]*len(fut))).astype(str).values,
+        "team":              team_name_vals,
+        "opponent_id":       opponent_id_vals,
+        "opponent":          opponent_name_vals,
+        "is_home":           pd.to_numeric(fut.get("is_home", np.nan), errors="coerce").fillna(0).astype(int).values,
+        "player_id":         fut["player_id"].astype(str).values,
+        "player":            fut.get("player", pd.Series([np.nan]*len(fut))).values,
+        "pos":               fut["pos"].astype(str).values,
+        "fdr":               fdr_vals,
+        "p_start":           p_start_vals,
+        "p60":               p60_vals,
+        "p_cameo":           p_cameo_vals,
+        "p_play":            p_play_vals,
+        "pred_start_head":       pred_start_head_vals,
+        "pred_bench_cameo_head": pred_bench_cameo_head_vals,
+        "pred_bench_head":       pred_bench_head_vals,
+        "pred_minutes":      pd.to_numeric(fut["pred_minutes"], errors="coerce").values,
+        "exp_minutes_points": exp_minutes_points_vals,
+        "_is_synth":         is_synth_vals,
+
+        # --- Context z-scores kept for diagnostics ---
+        "team_att_z_venue":  fut.get("team_att_z_venue", pd.Series([np.nan]*len(fut))).values,
+        "opp_def_z_venue":   fut.get("opp_def_z_venue", pd.Series([np.nan]*len(fut))).values,
+
+        # --- Predictions ---
+        "pred_goals_p90_mean":    g_p90_mean,
+        "pred_assists_p90_mean":  a_p90_mean,
+        "pred_goals_mean":        pred_goals_mean,
+        "pred_assists_mean":      pred_assists_mean,
         "pred_goals_p90_poisson": g_p90_pois,
         "pred_assists_p90_poisson": a_p90_pois,
-        "pred_goals_poisson": pred_goals_pois,
-        "pred_assists_poisson": pred_assists_pois,
-        "p_goal": p_goal,
-        "p_assist": p_assist,
-        "p_return_any": p_return_any
-    }
-    out = pd.DataFrame(cols)
+        "pred_goals_poisson":     pred_goals_pois,
+        "pred_assists_poisson":   pred_assists_pois,
+        "p_goal":                 p_goal,
+        "p_assist":               p_assist,
+        "p_return_any":           p_return_any,
+    })
+
+    # Reorder strictly: requested meta first (exact order), then context, then predictions
+    desired_order = [
+        "season","gw_played","gw_orig","date_sched","fbref_id",
+        "team_id","team","opponent_id","opponent","is_home",
+        "player_id","player","pos","fdr",
+        "p_start","p60","p_cameo","p_play",
+        "pred_start_head","pred_bench_cameo_head","pred_bench_head",
+        "pred_minutes","exp_minutes_points","_is_synth",
+        "team_att_z_venue","opp_def_z_venue",
+        "pred_goals_p90_mean","pred_assists_p90_mean",
+        "pred_goals_mean","pred_assists_mean",
+        "pred_goals_p90_poisson","pred_assists_p90_poisson",
+        "pred_goals_poisson","pred_assists_poisson",
+        "p_goal","p_assist","p_return_any"
+    ]
+    keep_cols = [c for c in desired_order if c in out.columns]
+    out = out[keep_cols].copy()
 
     # sort and persist
     sort_keys = [k for k in ["gw_orig", "team_id", "player_id"] if k in out.columns]
     if sort_keys:
-        out = out.sort_values(sort_keys).reset_index(drop=True)
+        out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
 
     season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
-    # >>> NEW: print only the date in CSV while dtype stays datetime in-memory
     out.to_csv(out_path, index=False, date_format="%Y-%m-%d")
 
     diag = {
