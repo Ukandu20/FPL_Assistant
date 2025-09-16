@@ -258,7 +258,7 @@ def make_features(df: pd.DataFrame,
     df["min_ewm_hl2"] = (
         df.groupby(["player_id", "season"], sort=False)["minutes"]
           .transform(lambda s: s.shift(1).ewm(halflife=halflife_min, adjust=False).mean())
-    )
+    ).fillna(0.0)
 
     prev_date = df.groupby(["player_id", "season"], sort=False)["_date_used"].shift(1)
     ds = (df["_date_used"] - prev_date).dt.days
