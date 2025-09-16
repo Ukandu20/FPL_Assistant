@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-goals_assists_model_builder.py — TRAIN/TEST ONLY — v12.7.0
+goals_assists_model_builder.py — TRAIN/TEST ONLY — v12.8.0
 
 Adds GK handling + true labels in CSV + probabilities:
 • --skip-gk: exclude GK from TRAIN & METRICS; hard-zero GK predictions in output.
@@ -10,6 +10,13 @@ Adds GK handling + true labels in CSV + probabilities:
 • Poisson probabilities (p_goal, p_assist) + p_return_any, optional per-position isotonic calibration.
 • Minutes-style versioning (--bump-version / --version-tag).
 • EWMA-based recency for shots/SOT with per-position halflife; also consumes upstream *_ewm/*_roll features.
+
+New in v12.8.0
+--------------
+• Persist training medians: artifacts/features_median.json (global) and features_median_by_pos.csv (optional).
+• Row-level audit: artifacts/missing_features_by_row.csv (feat coverage + list of NaN features per written TEST row).
+• Feature-level audit: artifacts/feature_na_summary.csv (train vs final-test NaN rate and delta).
+• Metrics: per_pos_models now reflects actual availability; added per_pos_models_poisson.
 
 Outputs (<model-out>/goals_assists_predictions.csv) with columns:
   season,gw_orig,date_played,player_id,team_id,player,pos,venue,minutes,pred_minutes,
@@ -40,7 +47,7 @@ from sklearn.linear_model import TweedieRegressor
 from sklearn.isotonic import IsotonicRegression
 import joblib
 
-CODE_VERSION = "12.7.0"
+CODE_VERSION = "12.8.0"
 
 # ------------------------------- Versioning -----------------------------------
 
@@ -548,16 +555,29 @@ def main():
         raise ValueError("No valid labeled rows in TRAIN.")
     Xtr = Xtr.iloc[mask]; ytr_g = ytr_g[mask]; ytr_a = ytr_a[mask]; pos_tr = pos_tr.iloc[mask]
 
+    # Persist training medians (global) and per-pos medians (optional)
+    med_train = Xtr.median(numeric_only=True)
+    for target in (latest_dir, version_dir):
+        (target / "artifacts").mkdir(parents=True, exist_ok=True)
+        # Global medians used for GLM imputations and can be reused by forecast
+        (target / "artifacts" / "features_median.json").write_text(
+            med_train.to_json(), encoding="utf-8"
+        )
+        # Per-position medians (optional; useful for experiments / audits)
+        try:
+            med_by_pos = Xtr.assign(pos=pos_tr.to_numpy()).groupby("pos").median(numeric_only=True)
+            med_by_pos.to_csv(target / "artifacts" / "features_median_by_pos.csv")
+        except Exception:
+            pass
+
     # Models
     g_pos_models, g_global = _fit_per_pos_models(Xtr, ytr_g, pos_tr, min_rows=150)
     a_pos_models, a_global = _fit_per_pos_models(Xtr, ytr_a, pos_tr, min_rows=150)
 
     if args.poisson_heads:
-        med = Xtr.median(numeric_only=True)
-        g_pos_pois, g_global_pois = _fit_per_pos_poisson(Xtr, ytr_g, pos_tr, med=med, min_rows=150)
-        a_pos_pois, a_global_pois = _fit_per_pos_poisson(Xtr, ytr_a, pos_tr, med=med, min_rows=150)
+        g_pos_pois, g_global_pois = _fit_per_pos_poisson(Xtr, ytr_g, pos_tr, med=med_train, min_rows=150)
+        a_pos_pois, a_global_pois = _fit_per_pos_poisson(Xtr, ytr_a, pos_tr, med=med_train, min_rows=150)
     else:
-        med = None
         g_pos_pois = a_pos_pois = {}
         g_global_pois = a_global_pois = None
 
@@ -565,11 +585,14 @@ def main():
     Xte = X.loc[test_df.index]
     pos_te = test_df["pos"].astype(str).str.upper()
 
+    # LGBM keeps NaNs (matches training missing-value routing); clip to non-negative
     g_p90_mean = np.clip(_predict_per_pos(g_pos_models, g_global, Xte, pos_te, is_glm=False, med=None), 0, None)
     a_p90_mean = np.clip(_predict_per_pos(a_pos_models, a_global, Xte, pos_te, is_glm=False, med=None), 0, None)
+
+    # GLM imputes with TRAIN medians; clip to non-negative
     if args.poisson_heads:
-        g_p90_pois = np.clip(_predict_per_pos(g_pos_pois, g_global_pois, Xte, pos_te, is_glm=True, med=med), 0, None)
-        a_p90_pois = np.clip(_predict_per_pos(a_pos_pois, a_global_pois, Xte, pos_te, is_glm=True, med=med), 0, None)
+        g_p90_pois = np.clip(_predict_per_pos(g_pos_pois, g_global_pois, Xte, pos_te, is_glm=True, med=med_train), 0, None)
+        a_p90_pois = np.clip(_predict_per_pos(a_pos_pois, a_global_pois, Xte, pos_te, is_glm=True, med=med_train), 0, None)
     else:
         g_p90_pois = np.full(len(Xte), np.nan); a_p90_pois = np.full(len(Xte), np.nan)
 
@@ -664,8 +687,8 @@ def main():
         g_c_mean = np.clip(_predict_per_pos(g_pos_models, g_global, Xc, pos_c, is_glm=False, med=None), 0, None)
         a_c_mean = np.clip(_predict_per_pos(a_pos_models, a_global, Xc, pos_c, is_glm=False, med=None), 0, None)
         if args.poisson_heads:
-            g_c = np.clip(_predict_per_pos(g_pos_pois, g_global_pois, Xc, pos_c, is_glm=True, med=med), 0, None)
-            a_c = np.clip(_predict_per_pos(a_pos_pois, a_global_pois, Xc, pos_c, is_glm=True, med=med), 0, None)
+            g_c = np.clip(_predict_per_pos(g_pos_pois, g_global_pois, Xc, pos_c, is_glm=True, med=med_train), 0, None)
+            a_c = np.clip(_predict_per_pos(a_pos_pois, a_global_pois, Xc, pos_c, is_glm=True, med=med_train), 0, None)
         else:
             g_c = g_c_mean; a_c = a_c_mean
 
@@ -727,6 +750,13 @@ def main():
         goal_rel.to_csv(target / "artifacts" / "reliability_goal.csv", index=False)
         ass_rel.to_csv(target / "artifacts" / "reliability_assist.csv", index=False)
 
+    # Reflect actual per-pos model availability
+    per_pos_models_lgbm = {tag: (tag in g_pos_models) and (tag in a_pos_models) for tag in ["GK","DEF","MID","FWD"]}
+    if args.poisson_heads:
+        per_pos_models_poisson = {tag: (tag in g_pos_pois) and (tag in a_pos_pois) for tag in ["GK","DEF","MID","FWD"]}
+    else:
+        per_pos_models_poisson = None
+
     metrics = {
         "code_version": CODE_VERSION,
         "n_train": int(len(Xtr)),
@@ -759,7 +789,8 @@ def main():
         "ece_assist": round(ass_stats.get("ece", np.nan), 6),
         "test_season": test_season,
         "first_test_gw": int(args.first_test_gw),
-        "per_pos_models": {k: True for k in ["GK","DEF","MID","FWD"]},
+        "per_pos_models": per_pos_models_lgbm,
+        "per_pos_models_poisson": per_pos_models_poisson,
     }
 
     # ---- Assemble output (add true labels) ----
@@ -814,6 +845,41 @@ def main():
 
     out = out[cols].copy()
 
+    # ===================== AUDITS (row-level & feature-level) =====================
+    # Row-level NaN audit for features used by the models (aligned to written rows)
+    Xte_mask = Xte.isna().copy()
+    Xte_mask.index = test_df["rid"].to_numpy()
+    Xte_mask = Xte_mask.reindex(rid_keep)
+
+    feat_non_na = (~Xte_mask).sum(axis=1).astype(int)
+    feat_total  = int(Xte_mask.shape[1])
+    feat_ratio  = (feat_non_na / float(feat_total))
+
+    missing_features_str = Xte_mask.apply(
+        lambda r: "|".join([col for col, is_na in zip(Xte_mask.columns, r.values) if is_na]),
+        axis=1
+    )
+
+    na_rows = out[["season","gw_orig","date_played","player_id","team_id","player","pos"]].copy()
+    na_rows["feat_non_na"]      = feat_non_na.values
+    na_rows["feat_total"]       = feat_total
+    na_rows["feat_ratio"]       = feat_ratio.values
+    na_rows["missing_features"] = missing_features_str.values
+
+    # Feature-level NaN summary: TRAIN vs final written TEST rows
+    na_train = Xtr.isna().mean().rename("train_na_rate")
+    Xte_final = Xte.copy()
+    Xte_final.index = test_df["rid"].to_numpy()
+    Xte_final = Xte_final.reindex(rid_keep)
+    na_test  = Xte_final.isna().mean().rename("test_na_rate")
+    na_sum = pd.concat([na_train, na_test], axis=1)
+    na_sum["delta_pp"] = (na_sum["test_na_rate"] - na_sum["train_na_rate"]) * 100.0
+
+    for target in (latest_dir, version_dir):
+        (target / "artifacts").mkdir(parents=True, exist_ok=True)
+        na_rows.to_csv(target / "artifacts" / "missing_features_by_row.csv", index=False)
+        na_sum.sort_values("delta_pp", ascending=False).to_csv(target / "artifacts" / "feature_na_summary.csv")
+
     # ---- Persist ----
     for target in (latest_dir, version_dir):
         (target / "artifacts").mkdir(parents=True, exist_ok=True)
@@ -823,8 +889,8 @@ def main():
 
     # Feature importances
     try:
-        fi_g = pd.DataFrame({"feature": list(X.columns), "importance": g_global.feature_importances_})
-        fi_a = pd.DataFrame({"feature": list(X.columns), "importance": a_global.feature_importances_})
+        fi_g = pd.DataFrame({"feature": list(X.columns), "importance": g_global.feature_importances_() if callable(getattr(g_global, "feature_importances_", None)) else g_global.feature_importances_})
+        fi_a = pd.DataFrame({"feature": list(X.columns), "importance": a_global.feature_importances_() if callable(getattr(a_global, "feature_importances_", None)) else a_global.feature_importances_})
         for target in (latest_dir, version_dir):
             fi_g.to_csv(target / "artifacts" / "goals_feature_importances.csv", index=False)
             fi_a.to_csv(target / "artifacts" / "assists_feature_importances.csv", index=False)

@@ -2,29 +2,26 @@
 # -*- coding: utf-8 -*-
 r"""
 goals_assists_forecast.py — leak-free scorer for future GWs using trained G/A heads,
-with roster gating, venue mapping from team fixtures, and safer feature handling.
+with roster gating, venue mapping from team fixtures, serve-time feature parity, and safer handling.
 
 Key fixes vs prior rev:
 • Robust fixtures join: coerce key dtypes (gw numeric, team_id string), ensure `is_home`,
-  and compute `venue_bin` *after* the merge to avoid KeyError.
-• Remove duplicate columns on merges by design (no importing is_active from last snapshot; add prev_minutes only if absent).
+  and compute `venue_bin` AFTER the merge to avoid KeyError paths.
+• Serve-time feature parity: MERGE last-known per-player EWMs/rolls into `fut` before building X.
+  (This removes the NaN-heavy LGBM vector that caused Salah underestimates and Thiago 5.99 a90 explosions.)
 • Keep NaNs for LGBM at inference (no blanket fillna(0)); LightGBM routes missing values.
 • Use training medians (artifacts/features_median.json) for Poisson/Tweedie imputations; avoid leakage.
-• Robust, POS-aware EWMA for shots/SOT p90 (including home/away splits), strictly past-only (shifted by 1).
-• Assert feature-vector order matches artifacts/features.json; log unused fut columns.
-• Normalize --league-filter labels and date_sched to date-only (CSV).
-• Gate p_return_any by having positive effective minutes.
-• Output sorted by gw_orig, team_id, player_id into <out-dir>/<SEASON>/GW<from>_<to>.csv.
+• Optional safety clamp: --cap-per90 "GK:0.10,DEF:0.35,MID:1.00,FWD:1.40" (applies to LGBM per-90s only).
+• Apply isotonic calibration for probabilities when --apply-calibration is set.
+• Normalize league labels and write date-only for date_sched in CSV.
+• Output includes rich minutes metadata in a fixed order.
 
 Output columns (ordered)
 ------------------------
-# Requested minutes metadata first:
 season, gw_played, gw_orig, date_sched, fbref_id, team_id, team, opponent_id, opponent, is_home,
 player_id, player, pos, fdr, p_start, p60, p_cameo, p_play, pred_start_head,
 pred_bench_cameo_head, pred_bench_head, pred_minutes, exp_minutes_points, _is_synth,
-# Context (kept):
 team_att_z_venue, opp_def_z_venue,
-# Predictions:
 pred_goals_p90_mean, pred_assists_p90_mean, pred_goals_mean, pred_assists_mean,
 pred_goals_p90_poisson, pred_assists_p90_poisson, pred_goals_poisson, pred_assists_poisson,
 p_goal, p_assist, p_return_any
@@ -431,6 +428,21 @@ def _apply_roster_gate(df: pd.DataFrame,
 
 # ───────────────────────────── Main ─────────────────────────────
 
+def _parse_cap_per90(s: Optional[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not s:
+        return out
+    for part in str(s).split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            k = k.strip().upper()
+            try:
+                out[k] = float(v)
+            except Exception:
+                continue
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     # Windows-friendly args
@@ -454,6 +466,7 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=Path("data/predictions/goals_assists"))
     ap.add_argument("--apply-calibration", action="store_true")
     ap.add_argument("--skip-gk", action="store_true")
+    ap.add_argument("--cap-per90", type=str, default="", help='Optional per-POS cap, e.g. "GK:0.10,DEF:0.35,MID:1.00,FWD:1.40"')
     ap.add_argument("--log-level", default="INFO")
 
     # Roster gating
@@ -621,6 +634,7 @@ def main():
         fut["opp_def_z_venue"] = np.nan
 
     # Last-known snapshot features (days_since_last; optional prev_minutes)
+    # Build minimal pull set (EWMs/rolls + minutes for prev_minutes)
     pull_cols = {c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)}
     pull_cols |= {"minutes"}  # for prev_minutes only
     snap_cols = list(pull_cols)
@@ -656,6 +670,17 @@ def main():
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
         fut = fut.merge(last_prev, how="left", on=["season", "player_id"], validate="many_to_one")
 
+    # >>> NEW: merge ALL last-known per-player EWMs/rolls into fut (serve-time feature parity)
+    last_feat = last.drop(columns=["minutes"], errors="ignore")
+    feat_like = [c for c in last_feat.columns if c not in ("season", "player_id")]
+    if feat_like:
+        fut = fut.merge(
+            last_feat[["season", "player_id"] + feat_like],
+            how="left",
+            on=["season", "player_id"],
+            validate="many_to_one"
+        )
+
     # Drop any accidental duplicate columns (keep last)
     if fut.columns.duplicated().any():
         dups = fut.columns[fut.columns.duplicated()].tolist()
@@ -672,14 +697,16 @@ def main():
     X = pd.DataFrame(index=fut.index)
     for c in feat_cols:
         if c in fut.columns:
-            X[c] = _get_unique_col(fut, c)
+            X[c] = pd.to_numeric(_get_unique_col(fut, c), errors="coerce")
         else:
             X[c] = np.nan
 
-    # Coerce to numerics to match training dtype expectations
-    for c in X.columns:
-        if X[c].dtype == object:
-            X[c] = pd.to_numeric(X[c], errors="coerce")
+    # Diagnostics: feature missingness before prediction
+    na_rate = X.isna().mean()
+    bad = na_rate[na_rate > 0.5]
+    if not bad.empty:
+        logging.warning("High missingness in features used by LGBM (top offenders):\n%s",
+                        bad.sort_values(ascending=False).head(15))
 
     # Assert feature order/shape matches training schema
     if list(X.columns) != list(feat_cols):
@@ -689,16 +716,21 @@ def main():
             f"Got: {list(X.columns)}"
         )
 
-    # Log some unused columns in fut (debug aid)
-    unused = [c for c in fut.columns if c not in feat_cols]
-    logging.debug("Unused fut columns (sample): %s", unused[:30])
-
     # POS series
     pos_ser = fut["pos"].astype(str).str.upper()
 
     # Predict per-90 (LGBM)
     g_p90_mean = _predict_per_pos("goals", X, pos_ser, args.model_dir)
     a_p90_mean = _predict_per_pos("assists", X, pos_ser, args.model_dir)
+
+    # Optional per-POS clamp for LGBM per-90s (guardrail)
+    caps = _parse_cap_per90(args.cap_per90)
+    if caps:
+        for tag, cap in caps.items():
+            mask = pos_ser.eq(tag).to_numpy()
+            if mask.any():
+                g_p90_mean[mask] = np.clip(g_p90_mean[mask], 0.0, cap)
+                a_p90_mean[mask] = np.clip(a_p90_mean[mask], 0.0, cap)
 
     # Optional Poisson/Tweedie heads (prefer training medians for imputes)
     g_p90_pois = _predict_poisson_per_pos("goals", X, pos_ser, args.model_dir, med=med_train)
@@ -862,6 +894,15 @@ def main():
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
     out.to_csv(out_path, index=False, date_format="%Y-%m-%d")
+
+    # Light sanity log (99.5th pct) to spot any remaining spikes quickly
+    try:
+        def q995(x): return float(pd.Series(x).quantile(0.995))
+        for nm, arr in [("g90_LGBM", g_p90_mean), ("a90_LGBM", a_p90_mean),
+                        ("g90_POIS", g_p90_pois), ("a90_POIS", a_p90_pois)]:
+            logging.info("%s 99.5th percentile: %.3f", nm, q995(arr))
+    except Exception:
+        pass
 
     diag = {
         "rows": int(len(out)),
