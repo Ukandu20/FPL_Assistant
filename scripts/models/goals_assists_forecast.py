@@ -17,6 +17,9 @@ Key fixes vs prior rev:
 • Output includes rich minutes metadata in a fixed order.
 • Auto-resolve minutes file from GW window (+ dual CSV/Parquet loader), with helpful failures.
 • NEW: Output format control (--out-format csv|parquet|both) + optional zero-padded filenames.
+
+NEW (legacy meta like minutes_forecast):
+• Attach game_id (fbref_id), team, opponent_id, opponent from fixture_calendar.csv.
 """
 from __future__ import annotations
 
@@ -92,14 +95,12 @@ def _team_z_venue(team_form: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     if team_form is None:
         return None
 
-    # Preferred direct columns if already computed
     if {"team_att_z_venue", "opp_def_z_venue"}.issubset(team_form.columns):
         t = team_form[["season", "gw_orig", "team_id", "team_att_z_venue", "opp_def_z_venue"]].drop_duplicates()
         for c in ["team_att_z_venue", "opp_def_z_venue"]:
             t[c] = pd.to_numeric(t[c], errors="coerce")
         return t
 
-    # Derive from home/away z-score columns
     need = {
         "season", "gw_orig", "team_id", "venue",
         "att_xg_home_roll_z", "att_xg_away_roll_z",
@@ -127,7 +128,6 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
     for dc in ("date_sched", "date_played"):
         if dc in tf.columns:
             tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
-    # Normalize is_home
     if "is_home" not in tf.columns:
         if "was_home" in tf.columns:
             tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1", "true", "yes"]).astype(int)
@@ -135,11 +135,9 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
             tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype(int)
         else:
             tf["is_home"] = 0
-    # Coerce GWs numeric
     for c in ("gw_played", "gw_orig", "gw"):
         if c in tf.columns:
             tf[c] = pd.to_numeric(tf[c], errors="coerce")
-    # Normalize team_id
     if "team_id" not in tf.columns:
         for alt in ["team", "teamId", "team_code"]:
             if alt in tf.columns:
@@ -154,7 +152,6 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
 def _gw_for_selection(df: pd.DataFrame) -> pd.Series:
     def num(s): return pd.to_numeric(df.get(s), errors="coerce")
     gwp = num("gw_played"); gwo = num("gw_orig"); gwa = num("gw")
-    # prefer gw_played if > 0 else gw_orig else gw
     return gwo.where(gwp.isna() | (gwp <= 0), gwp).where(lambda x: x.notna(), gwa)
 
 
@@ -162,15 +159,10 @@ def _ewm_shots_per_pos(hist: pd.DataFrame,
                        hl_map: Dict[str, float],
                        min_periods: int,
                        adjust: bool) -> pd.DataFrame:
-    """
-    Compute past-only (shifted) EWM shots/SOT p90, with venue splits, per POS with
-    POS-specific halflives. Robust to missing shots columns.
-    """
     df = hist.copy()
     shots = next((c for c in ("shots", "sh") if c in df.columns), None)
     sot   = next((c for c in ("sot", "shots_on_target") if c in df.columns), None)
 
-    # Prepare p90 raw numerators
     m = pd.to_numeric(df.get("minutes", 0), errors="coerce").fillna(0).clip(lower=0)
     denom = (m / 90.0).replace(0, np.nan)
 
@@ -188,52 +180,44 @@ def _ewm_shots_per_pos(hist: pd.DataFrame,
         return series.shift(1).ewm(halflife=float(hl), min_periods=min_periods, adjust=adjust).mean()
 
     v = df.get("venue", pd.Series([""] * len(df))).astype(str).str.lower()
-    mask_home = v.eq("home")
-    mask_away = v.eq("away")
+    mask_home = v.eq("home"); mask_away = v.eq("away")
 
     for tag, hl in hl_map.items():
         mask_pos = df["pos"].eq(tag)
 
         if "_shots_p90_raw" in df.columns:
             df.loc[mask_pos, "shots_p90_ewm"] = (
-                df.loc[mask_pos]
-                  .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                df.loc[mask_pos].groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
                   .transform(lambda s: _ewm(s, hl))
             )
-            # Venue splits
             if mask_home.any():
                 sub = mask_pos & mask_home
                 df.loc[sub, "shots_p90_home_ewm"] = (
-                    df.loc[sub]
-                      .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                    df.loc[sub].groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
                       .transform(lambda s: _ewm(s, hl))
                 )
             if mask_away.any():
                 sub = mask_pos & mask_away
                 df.loc[sub, "shots_p90_away_ewm"] = (
-                    df.loc[sub]
-                      .groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
+                    df.loc[sub].groupby(["player_id", "season"], sort=False)["_shots_p90_raw"]
                       .transform(lambda s: _ewm(s, hl))
                 )
 
         if "_sot_p90_raw" in df.columns:
             df.loc[mask_pos, "sot_p90_ewm"] = (
-                df.loc[mask_pos]
-                  .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                df.loc[mask_pos].groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
                   .transform(lambda s: _ewm(s, hl))
             )
             if mask_home.any():
                 sub = mask_pos & mask_home
                 df.loc[sub, "sot_p90_home_ewm"] = (
-                    df.loc[sub]
-                      .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                    df.loc[sub].groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
                       .transform(lambda s: _ewm(s, hl))
                 )
             if mask_away.any():
                 sub = mask_pos & mask_away
                 df.loc[sub, "sot_p90_away_ewm"] = (
-                    df.loc[sub]
-                      .groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
+                    df.loc[sub].groupby(["player_id", "season"], sort=False)["_sot_p90_raw"]
                       .transform(lambda s: _ewm(s, hl))
                 )
 
@@ -243,7 +227,6 @@ def _ewm_shots_per_pos(hist: pd.DataFrame,
 
 def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str],
                               as_of_ts: pd.Timestamp, tz: Optional[str]) -> pd.DataFrame:
-    """Take last known row per (season, player_id) strictly before as_of_ts and keep requested feature_cols."""
     du = pd.to_datetime(df["date_played"], errors="coerce")
     if tz:
         if du.dt.tz is None:
@@ -275,7 +258,6 @@ def _load_booster(p: Path) -> Optional[lgb.Booster]:
 def _predict_reg(booster: Optional[lgb.Booster], X: pd.DataFrame) -> np.ndarray:
     if booster is None or X.empty:
         return np.zeros(len(X), dtype=float)
-    # Preserve NaNs exactly as in training; just ensure numeric dtype.
     Xn = X.astype(float)
     return np.clip(booster.predict(Xn), 0, None)
 
@@ -315,7 +297,6 @@ def _predict_poisson_per_pos(name: str,
                              pos: pd.Series,
                              model_dir: Path,
                              med: Optional[pd.Series]) -> np.ndarray:
-    """Joblib regressors (e.g., Tweedie/Poisson) trained on numeric X; impute with training median if available."""
     def _load(path: Path):
         try:
             return joblib.load(path) if path.exists() else None
@@ -328,7 +309,6 @@ def _predict_poisson_per_pos(name: str,
 
     Xp = X.apply(pd.to_numeric, errors="coerce")
     if med is not None:
-        # Align by column; only fill columns present in med
         Xp = Xp.fillna(med.reindex(Xp.columns))
     Xp = Xp.fillna(0.0)
 
@@ -361,10 +341,6 @@ def _candidate_minutes_paths(minutes_root: Path, future_season: str, gw_from: in
 
 
 def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> Optional[Path]:
-    """
-    If exact candidates are missing, try globbing GW{from}_*.{csv,parquet} and
-    pick the one whose trailing GW equals gw_to.
-    """
     season_dir = minutes_root / str(future_season)
     if not season_dir.exists():
         return None
@@ -373,7 +349,7 @@ def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: 
     for pat in patterns:
         for p in sorted(season_dir.glob(pat)):
             try:
-                stem = p.stem  # e.g., "GW5_7"
+                stem = p.stem
                 to_str = stem.split("_")[-1].replace("GW", "")
                 to_val = int(to_str)
                 if to_val == int(gw_to):
@@ -384,15 +360,6 @@ def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: 
 
 
 def _resolve_minutes_path(args: argparse.Namespace, gw_from: int, gw_to: int) -> Path:
-    """
-    Decide which minutes file to load (CSV or Parquet).
-
-    Priority:
-      1) If --minutes-csv provided, use it (must exist).
-      2) Else try exact candidates under <minutes-root>/<future-season>:
-         GW{from}_{to}.{csv,parquet} and zero-padded variants.
-      3) Else glob for GW{from}_*.{csv,parquet} and pick the one whose "to" == gw_to.
-    """
     if args.minutes_csv:
         p = Path(args.minutes_csv)
         if not p.exists():
@@ -426,13 +393,8 @@ def _resolve_minutes_path(args: argparse.Namespace, gw_from: int, gw_to: int) ->
 
 
 def _load_minutes_dual(path: Path) -> pd.DataFrame:
-    """
-    Load minutes from CSV or Parquet.
-    Ensures 'date_sched' is parsed as datetime if present.
-    """
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        # read header first to decide parse_dates
         hdr = pd.read_csv(path, nrows=0)
         parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
         df = pd.read_csv(path, parse_dates=parse_cols)
@@ -454,10 +416,6 @@ def _norm_label(s: str) -> str:
 def _load_roster_pairs(teams_json: Optional[Path],
                        season: str,
                        league_filter: Optional[str]) -> Optional[Set[Tuple[str, str]]]:
-    """
-    Returns a set of allowed (team_id, player_id) pairs for the given season.
-    If teams_json is None / missing / invalid, returns None (no gating).
-    """
     if not teams_json:
         return None
     p = Path(teams_json)
@@ -477,9 +435,8 @@ def _load_roster_pairs(teams_json: Optional[Path],
         season_info = (obj or {}).get("career", {}).get(season)
         if not season_info:
             continue
-        if lf:
-            if _norm_label(season_info.get("league", "")) != lf:
-                continue
+        if lf and _norm_label(season_info.get("league", "")) != lf:
+            continue
         players = season_info.get("players", []) or []
         for pl in players:
             pid = str(pl.get("id", "")).strip()
@@ -497,10 +454,6 @@ def _apply_roster_gate(df: pd.DataFrame,
                        where: str,
                        out_artifacts_dir: Optional[Path] = None,
                        require_on_roster: bool = False) -> pd.DataFrame:
-    """
-    Keep only rows with (team_id, player_id) inside allowed_pairs for the season.
-    If require_on_roster is True and any rows are dropped, raise RuntimeError.
-    """
     if allowed_pairs is None or df.empty:
         return df
 
@@ -520,7 +473,7 @@ def _apply_roster_gate(df: pd.DataFrame,
     return df.loc[mask_ok].copy()
 
 
-# ───────────────────────────── GA output helpers (NEW) ─────────────────────────────
+# ───────────────────────────── GA output helpers ─────────────────────────────
 
 def _ga_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
                   zero_pad: bool, out_format: str) -> List[Path]:
@@ -550,6 +503,64 @@ def _write_ga(df: pd.DataFrame, paths: List[Path]) -> List[str]:
         else:
             raise ValueError(f"Unsupported output extension: {p.suffix}")
     return written
+
+
+# ───────────────────────────── Legacy metadata attach (NEW) ─────────────────────────────
+
+def _attach_legacy_meta(df_pred: pd.DataFrame, team_fix: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach legacy metadata to df_pred from team fixtures:
+      - game_id (from fbref_id), team, opponent_id, opponent (home/away derived)
+    Join keys: (season, team_id, gw_key), preferring gw_played>0 → gw_orig>0 → gw>0.
+    """
+    if df_pred.empty or team_fix.empty:
+        for col in ["fbref_id", "team", "opponent_id", "opponent"]:
+            if col not in df_pred.columns:
+                df_pred[col] = np.nan
+        return df_pred
+
+    df = df_pred.copy()
+    gw_df = _pick_gw_col(df.columns.tolist()) or "gw_orig"
+    gw_tf = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+
+    if gw_df in df.columns:
+        df[gw_df] = pd.to_numeric(df[gw_df], errors="coerce")
+    tf = team_fix.copy()
+    if gw_tf in tf.columns:
+        tf[gw_tf] = pd.to_numeric(tf[gw_tf], errors="coerce")
+
+    if "team_id" in df.columns:
+        df["team_id"] = df["team_id"].astype(str)
+    if "team_id" in tf.columns:
+        tf["team_id"] = tf["team_id"].astype(str)
+
+    keep = ["season", "team_id", gw_tf, "fbref_id", "team", "opponent_id", "is_home", "home", "away"]
+    keep = [c for c in keep if c in tf.columns]
+    tf_small = (tf[keep]
+                .dropna(subset=[gw_tf, "team_id"])
+                .drop_duplicates())
+    if gw_tf != gw_df:
+        tf_small = tf_small.rename(columns={gw_tf: gw_df})
+
+    merged = df.merge(
+        tf_small,
+        how="left",
+        on=["season", "team_id", gw_df],
+        validate="many_to_one",
+        copy=False,
+        suffixes=("", "_fix")
+    )
+
+    if "opponent" not in merged.columns or merged["opponent"].isna().all():
+        if {"home", "away", "is_home"}.issubset(merged.columns):
+            ih = pd.to_numeric(merged["is_home"], errors="coerce").fillna(0).astype(int)
+            merged["opponent"] = np.where(ih == 1, merged.get("away"), merged.get("home"))
+
+    for col in ["fbref_id", "team", "opponent_id", "opponent"]:
+        if col not in merged.columns:
+            merged[col] = np.nan
+
+    return merged
 
 
 # ───────────────────────────── Main ─────────────────────────────
@@ -593,7 +604,7 @@ def main():
     ap.add_argument("--minutes-root", type=Path, default=Path("data/predictions/minutes"),
                     help="Root containing <season>/GW<from>_<to>.csv|parquet")
 
-    # GA output (NEW)
+    # GA output
     ap.add_argument("--out-dir", type=Path, default=Path("data/predictions/goals_assists"))
     ap.add_argument("--out-format", choices=["csv", "parquet", "both"], default="csv",
                     help="Output format for G/A predictions (default: csv)")
@@ -640,7 +651,6 @@ def main():
     train_args = meta.get("args", {})
     hl_default = float(train_args.get("ewm_halflife", 3.0))
     hl_pos_map = {"GK": hl_default, "DEF": hl_default, "MID": hl_default, "FWD": hl_default}
-    # Optional per-pos halflife override string like "GK:4,DEF:3,MID:2,FWD:2"
     key = "ewm_halflife_pos"
     if isinstance(train_args.get(key), str) and ":" in train_args[key]:
         try:
@@ -653,7 +663,6 @@ def main():
     ewm_min_periods = int(train_args.get("ewm_min_periods", 1))
     ewm_adjust = bool(train_args.get("ewm_adjust", False))
 
-    # Training medians for Poisson imputations
     med_train = _read_features_median(args.model_dir)
 
     # --- Load registry features up to --as-of ---
@@ -672,7 +681,6 @@ def main():
     if "season" not in minutes.columns:
         minutes["season"] = args.future_season
 
-    # Robust GW selection key
     gw_sel = _gw_for_selection(minutes)
     avail_gws = sorted(pd.unique(gw_sel.dropna().astype(int)))
     avail_gws = [int(x) for x in avail_gws]
@@ -686,45 +694,38 @@ def main():
     if minutes.empty:
         raise RuntimeError("No minute rows after filtering target GWs.")
 
-    # Merge venue from team fixtures for venue_bin calculation (ROBUST)
+    # Merge team fixtures (for venue + legacy metadata)
     team_fix = _load_team_fixtures(args.fix_root, args.future_season, args.team_fixtures_filename)
 
-    # Harmonize dtypes/keys before joining
+    # Harmonize join keys
     gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
     gw_key_t = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
-
     if gw_key_m in minutes.columns:
         minutes[gw_key_m] = pd.to_numeric(minutes[gw_key_m], errors="coerce")
     if gw_key_t in team_fix.columns:
         team_fix[gw_key_t] = pd.to_numeric(team_fix[gw_key_t], errors="coerce")
-
     if "team_id" in minutes.columns:
         minutes["team_id"] = minutes["team_id"].astype(str)
     if "team_id" in team_fix.columns:
         team_fix["team_id"] = team_fix["team_id"].astype(str)
 
+    # Bring in is_home
     venue_cols = ["season", "team_id", gw_key_t, "is_home"]
     vmap = (team_fix[venue_cols]
             .dropna(subset=[gw_key_t, "team_id"])
             .drop_duplicates()
             .rename(columns={gw_key_t: gw_key_m}))
-
     minutes = minutes.merge(
-        vmap,
-        how="left",
-        on=["season", "team_id", gw_key_m],
-        validate="many_to_one",
-        copy=False,
+        vmap, how="left", on=["season", "team_id", gw_key_m],
+        validate="many_to_one", copy=False,
     )
 
-    # Ensure `is_home` exists even if fixtures lacked it
     if "is_home" not in minutes.columns:
         if "venue" in minutes.columns:
             minutes["is_home"] = minutes["venue"].astype(str).str.lower().eq("home").astype(int)
         else:
-            minutes["is_home"] = np.nan  # will fallback to 0 in feature input if needed
+            minutes["is_home"] = np.nan
 
-    # Build `venue_bin`
     venue_fallback = (
         minutes["venue"].astype(str).str.lower().eq("home").astype(int)
         if "venue" in minutes.columns else 0
@@ -736,12 +737,12 @@ def main():
           .astype(int)
     )
 
-    # Build future frame (one row per player fixture)
+    # Build future scoring frame
     fut = minutes.copy()
     if "fdr" not in fut.columns:
         fut["fdr"] = np.nan
 
-    # --- Roster gating (authoritative filter for scoring set) ---
+    # Roster gate
     allowed_pairs = _load_roster_pairs(
         teams_json=args.teams_json,
         season=args.future_season,
@@ -758,7 +759,7 @@ def main():
     if fut.empty:
         raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
 
-    # Team z merge (by GW)
+    # Team z-venue merge (by GW)
     tz_map = _team_z_venue(tf)
     if tz_map is not None and (gw_key_m in fut.columns):
         fut = fut.merge(
@@ -771,9 +772,12 @@ def main():
         fut["team_att_z_venue"] = np.nan
         fut["opp_def_z_venue"] = np.nan
 
-    # Last-known snapshot features (days_since_last; optional prev_minutes)
+    # --- NEW: attach legacy metadata from fixtures (fbref_id→game_id, team, opponent_id, opponent)
+    fut = _attach_legacy_meta(fut, team_fix)
+
+    # Last-known snapshot features
     pull_cols = {c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)}
-    pull_cols |= {"minutes"}  # for prev_minutes only
+    pull_cols |= {"minutes"}
     snap_cols = list(pull_cols)
 
     gw_cols = [c for c in ("gw_played", "gw_orig", "gw") if c in pf_hist.columns]
@@ -786,7 +790,7 @@ def main():
         tz=tz
     )
 
-    # days_since_last (strictly before date_sched)
+    # days_since_last
     last_play = (
         pf_hist.sort_values(["player_id", "season", "date_played"])
         .groupby(["season", "player_id"], as_index=False)
@@ -798,16 +802,12 @@ def main():
     fut = fut.merge(last_play, how="left", on=["season", "player_id"], validate="many_to_one")
     fut["days_since_last"] = (fut["date_sched"] - fut["date_played"]).dt.days.clip(lower=0)
     fut.drop(columns=["date_played"], inplace=True)
-
-    # Normalize date_sched to date-only while keeping datetime dtype in-memory; CSV will write date-only
     fut["date_sched"] = fut["date_sched"].dt.normalize()
 
-    # Add prev_minutes only if not present
     if "prev_minutes" not in fut.columns:
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
         fut = fut.merge(last_prev, how="left", on=["season", "player_id"], validate="many_to_one")
 
-    # Merge ALL last-known per-player EWMs/rolls into fut (serve-time feature parity)
     last_feat = last.drop(columns=["minutes"], errors="ignore")
     feat_like = [c for c in last_feat.columns if c not in ("season", "player_id")]
     if feat_like:
@@ -818,7 +818,6 @@ def main():
             validate="many_to_one"
         )
 
-    # Drop any accidental duplicate columns (keep last)
     if fut.columns.duplicated().any():
         dups = fut.columns[fut.columns.duplicated()].tolist()
         logging.warning("Duplicate columns detected; keeping last occurrence: %s", set(dups))
@@ -831,36 +830,34 @@ def main():
             return obj[obj.columns[-1]]
         return obj
 
+    feat_path_cols = _load_json(args.model_dir / "artifacts" / "features.json") or []
     X = pd.DataFrame(index=fut.index)
-    for c in feat_cols:
+    for c in feat_path_cols:
         if c in fut.columns:
             X[c] = pd.to_numeric(_get_unique_col(fut, c), errors="coerce")
         else:
             X[c] = np.nan
 
-    # Diagnostics: feature missingness before prediction
     na_rate = X.isna().mean()
     bad = na_rate[na_rate > 0.5]
     if not bad.empty:
         logging.warning("High missingness in features used by LGBM (top offenders):\n%s",
                         bad.sort_values(ascending=False).head(15))
 
-    # Assert feature order/shape matches training schema
-    if list(X.columns) != list(feat_cols):
+    if list(X.columns) != list(feat_path_cols):
         raise AssertionError(
             "Feature order mismatch.\n"
-            f"Expected (from features.json): {feat_cols}\n"
+            f"Expected (from features.json): {feat_path_cols}\n"
             f"Got: {list(X.columns)}"
         )
 
-    # POS series
     pos_ser = fut["pos"].astype(str).str.upper()
 
     # Predict per-90 (LGBM)
     g_p90_mean = _predict_per_pos("goals", X, pos_ser, args.model_dir)
     a_p90_mean = _predict_per_pos("assists", X, pos_ser, args.model_dir)
 
-    # Optional per-POS clamp for LGBM per-90s (guardrail)
+    # Optional per-POS clamp
     caps = _parse_cap_per90(args.cap_per90)
     if caps:
         for tag, cap in caps.items():
@@ -869,7 +866,8 @@ def main():
                 g_p90_mean[mask] = np.clip(g_p90_mean[mask], 0.0, cap)
                 a_p90_mean[mask] = np.clip(a_p90_mean[mask], 0.0, cap)
 
-    # Optional Poisson/Tweedie heads (prefer training medians for imputes)
+    # Optional Poisson/Tweedie heads
+    med_train = _read_features_median(args.model_dir)
     g_p90_pois = _predict_poisson_per_pos("goals", X, pos_ser, args.model_dir, med=med_train)
     a_p90_pois = _predict_poisson_per_pos("assists", X, pos_ser, args.model_dir, med=med_train)
 
@@ -880,7 +878,7 @@ def main():
     pred_goals_pois   = g_p90_pois * scale
     pred_assists_pois = a_p90_pois * scale
 
-    # Combine rates for probabilities (prefer Poisson if present)
+    # Combine to probabilities
     rg90 = np.where(~np.isnan(g_p90_pois), g_p90_pois, g_p90_mean)
     ra90 = np.where(~np.isnan(a_p90_pois), a_p90_pois, a_p90_mean)
 
@@ -921,10 +919,8 @@ def main():
         except Exception as e:
             logging.warning("Calibration artifacts missing or failed: %s", e)
 
-    # Union probability (independence assumption). Gate by having positive effective minutes.
     p_return_any = (1.0 - (1.0 - p_goal) * (1.0 - p_assist)) * (scale > 0)
 
-    # Zero GK if requested
     if args.skip_gk and pos_ser.eq("GK").any():
         m = pos_ser.eq("GK").to_numpy()
         for arr in (g_p90_mean, a_p90_mean, g_p90_pois, a_p90_pois,
@@ -932,7 +928,7 @@ def main():
                     p_goal, p_assist, p_return_any):
             arr[m] = 0.0
 
-    # ---------------------- Assemble output with metadata ----------------------
+    # ---------------------- Assemble output with legacy metadata ----------------------
     def pick_col(df: pd.DataFrame, *names: str):
         for n in names:
             if n in df.columns:
@@ -941,7 +937,7 @@ def main():
 
     opponent_id_vals    = pick_col(fut, "opponent_id", "opp_team_id", "opp_id")
     opponent_name_vals  = pick_col(fut, "opponent", "opp_team", "opp_name")
-    fbref_id_vals       = pick_col(fut, "fbref_id", "fixture_id", "game_id")
+    game_id_vals        = pick_col(fut, "fbref_id", "fixture_id", "game_id")  # legacy: expose as game_id
     team_name_vals      = pick_col(fut, "team", "team_name", "team_short", "team_long")
 
     gw_played_vals = pd.to_numeric(fut.get("gw_played", np.nan), errors="coerce").values
@@ -960,21 +956,25 @@ def main():
     is_synth_vals              = fut.get("_is_synth", pd.Series([False]*len(fut))).astype(bool).values
 
     out = pd.DataFrame({
-        # --- Requested metadata first ---
+        # --- Legacy/fixture metadata first (match minutes_forecast) ---
         "season":            fut["season"].values,
         "gw_played":         gw_played_vals,
         "gw_orig":           gw_orig_vals,
         "date_sched":        fut["date_sched"].dt.normalize().values,  # date-only
-        "fbref_id":          fbref_id_vals,
+        "game_id":           game_id_vals,       # fbref_id → game_id
         "team_id":           fut.get("team_id", pd.Series([np.nan]*len(fut))).astype(str).values,
         "team":              team_name_vals,
         "opponent_id":       opponent_id_vals,
         "opponent":          opponent_name_vals,
         "is_home":           pd.to_numeric(fut.get("is_home", np.nan), errors="coerce").fillna(0).astype(int).values,
+
+        # --- Player context ---
         "player_id":         fut["player_id"].astype(str).values,
         "player":            fut.get("player", pd.Series([np.nan]*len(fut))).values,
         "pos":               fut["pos"].astype(str).values,
         "fdr":               fdr_vals,
+
+        # --- Minutes heads & gates (for consumers) ---
         "p_start":           p_start_vals,
         "p60":               p60_vals,
         "p_cameo":           p_cameo_vals,
@@ -986,11 +986,11 @@ def main():
         "exp_minutes_points": exp_minutes_points_vals,
         "_is_synth":         is_synth_vals,
 
-        # --- Context z-scores kept for diagnostics ---
+        # --- Context z-scores (diagnostics) ---
         "team_att_z_venue":  fut.get("team_att_z_venue", pd.Series([np.nan]*len(fut))).values,
         "opp_def_z_venue":   fut.get("opp_def_z_venue", pd.Series([np.nan]*len(fut))).values,
 
-        # --- Predictions ---
+        # --- GA predictions ---
         "pred_goals_p90_mean":    g_p90_mean,
         "pred_assists_p90_mean":  a_p90_mean,
         "pred_goals_mean":        pred_goals_mean,
@@ -1004,9 +1004,9 @@ def main():
         "p_return_any":           p_return_any,
     })
 
-    # Reorder strictly: requested meta first (exact order), then context, then predictions
+    # Desired column order: meta → player/gates → context → preds
     desired_order = [
-        "season","gw_played","gw_orig","date_sched","fbref_id",
+        "season","gw_played","gw_orig","date_sched","game_id",
         "team_id","team","opponent_id","opponent","is_home",
         "player_id","player","pos","fdr",
         "p_start","p60","p_cameo","p_play",
@@ -1022,7 +1022,6 @@ def main():
     keep_cols = [c for c in desired_order if c in out.columns]
     out = out[keep_cols].copy()
 
-    # sort and persist
     sort_keys = [k for k in ["gw_orig", "team_id", "player_id"] if k in out.columns]
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
@@ -1038,7 +1037,6 @@ def main():
     )
     written_paths = _write_ga(out, out_paths)
 
-    # Light sanity log (99.5th pct) to spot any remaining spikes quickly
     try:
         def q995(x): return float(pd.Series(x).quantile(0.995))
         for nm, arr in [("g90_LGBM", g_p90_mean), ("a90_LGBM", a_p90_mean),
