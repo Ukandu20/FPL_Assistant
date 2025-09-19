@@ -15,6 +15,7 @@ Key fixes vs prior rev:
 • Apply isotonic calibration for probabilities when --apply-calibration is set.
 • Normalize league labels and write date-only for date_sched in CSV.
 • Output includes rich minutes metadata in a fixed order.
+• NEW: Auto-resolve minutes file from GW window (+ dual CSV/Parquet loader), with helpful failures.
 
 Output columns (ordered)
 ------------------------
@@ -351,6 +352,106 @@ def _predict_poisson_per_pos(name: str,
     return out
 
 
+# ───────────────────────────── Minutes resolver & dual loader ─────────────────────────────
+
+def _fmt_gw(n: int, zero_pad: bool) -> str:
+    return f"{int(n):02d}" if zero_pad else f"{int(n)}"
+
+
+def _candidate_minutes_paths(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> List[Path]:
+    season_dir = minutes_root / str(future_season)
+    cands: List[Path] = []
+    for zp in (False, True):
+        a = _fmt_gw(gw_from, zp)
+        b = _fmt_gw(gw_to, zp)
+        cands.append(season_dir / f"GW{a}_{b}.csv")
+        cands.append(season_dir / f"GW{a}_{b}.parquet")
+    return cands
+
+
+def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> Optional[Path]:
+    """
+    If exact candidates are missing, try globbing GW{from}_*.{csv,parquet} and
+    pick the one whose trailing GW equals gw_to.
+    """
+    season_dir = minutes_root / str(future_season)
+    if not season_dir.exists():
+        return None
+    patterns = [f"GW{gw_from}_*.csv", f"GW{gw_from}_*.parquet",
+                f"GW{gw_from:02d}_*.csv", f"GW{gw_from:02d}_*.parquet"]
+    for pat in patterns:
+        for p in sorted(season_dir.glob(pat)):
+            # extract last number after underscore and before extension
+            try:
+                stem = p.stem  # e.g., "GW5_7"
+                to_str = stem.split("_")[-1].replace("GW", "")
+                to_val = int(to_str)
+                if to_val == int(gw_to):
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def _resolve_minutes_path(args: argparse.Namespace, gw_from: int, gw_to: int) -> Path:
+    """
+    Decide which minutes file to load (CSV or Parquet).
+
+    Priority:
+      1) If --minutes-csv provided, use it (must exist).
+      2) Else try exact candidates under <minutes-root>/<future-season>:
+         GW{from}_{to}.{csv,parquet} and zero-padded variants.
+      3) Else glob for GW{from}_*.{csv,parquet} and pick the one whose "to" == gw_to.
+    """
+    if args.minutes_csv:
+        p = Path(args.minutes_csv)
+        if not p.exists():
+            raise FileNotFoundError(f"--minutes-csv not found: {p}")
+        return p
+
+    for cand in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
+        if cand.exists():
+            return cand
+
+    fb = _glob_fallback(args.minutes_root, args.future_season, gw_from, gw_to)
+    if fb:
+        return fb
+
+    season_dir = args.minutes_root / str(args.future_season)
+    msg = [
+        f"Minutes file not found for GW window {gw_from}-{gw_to}.",
+        f"Looked under: {season_dir}",
+        "Tried candidates:",
+    ]
+    for c in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
+        msg.append(f"  - {c}")
+    msg += [
+        "Also tried glob fallback: GW{from}_*.{csv,parquet} (with and without zero-padding).",
+        "Fix by either:",
+        "  • generating that file, or",
+        "  • pointing directly via --minutes-csv <path>, or",
+        "  • adjusting --minutes-root / GW window."
+    ]
+    raise FileNotFoundError("\n".join(msg))
+
+
+def _load_minutes_dual(path: Path) -> pd.DataFrame:
+    """
+    Load minutes from CSV or Parquet.
+    Ensures 'date_sched' is parsed as datetime if present.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(path, parse_dates=["date_sched"] if "date_sched" in pd.read_csv(path, nrows=0).columns else None)
+    elif suffix in (".parquet", ".pq"):
+        df = pd.read_parquet(path)
+        if "date_sched" in df.columns:
+            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
+    else:
+        raise ValueError(f"Unsupported minutes file extension: {suffix}. Use .csv or .parquet")
+    return df
+
+
 # ───────────────────────────── Roster gating ─────────────────────────────
 
 def _norm_label(s: str) -> str:
@@ -461,7 +562,12 @@ def main():
     ap.add_argument("--form-version", required=True)
     ap.add_argument("--fix-root", type=Path, default=Path("data/processed/registry/fixtures"))
     ap.add_argument("--team-fixtures-filename", default="fixture_calendar.csv")
-    ap.add_argument("--minutes-csv", type=Path, required=True, help="Output CSV from minutes_forecast.py")
+
+    # NEW: minutes-csv optional; add minutes-root
+    ap.add_argument("--minutes-csv", type=Path, help="Explicit minutes file (CSV or Parquet). Overrides auto-resolution.")
+    ap.add_argument("--minutes-root", type=Path, default=Path("data/predictions/minutes"),
+                    help="Root containing <season>/GW<from>_<to>.csv|parquet")
+
     ap.add_argument("--model-dir", type=Path, required=True, help="Folder with trained G/A artifacts (a specific version)")
     ap.add_argument("--out-dir", type=Path, default=Path("data/predictions/goals_assists"))
     ap.add_argument("--apply-calibration", action="store_true")
@@ -529,8 +635,9 @@ def main():
                  ((pf["season"] == args.future_season) & (du < as_of_ts))].copy()
     pf_hist = _ewm_shots_per_pos(pf_hist, hl_map=hl_pos_map, min_periods=ewm_min_periods, adjust=ewm_adjust)
 
-    # --- Minutes forecast for target GWs ---
-    minutes = pd.read_csv(args.minutes_csv, parse_dates=["date_sched"])
+    # --- Minutes forecast for target GWs (auto-resolve + dual loader) ---
+    minutes_path = _resolve_minutes_path(args, gw_from_req, gw_to_req)
+    minutes = _load_minutes_dual(minutes_path)
     if "season" not in minutes.columns:
         minutes["season"] = args.future_season
 
@@ -540,7 +647,7 @@ def main():
     avail_gws = [int(x) for x in avail_gws]
     target_gws = [int(g) for g in avail_gws if g >= int(gw_from_req)][:int(args.n_future)]
     if not target_gws:
-        raise RuntimeError(f"No target GWs >= {gw_from_req} in minutes CSV. Available: {avail_gws}")
+        raise RuntimeError(f"No target GWs >= {gw_from_req} in minutes file ({minutes_path}). Available: {avail_gws}")
     if args.strict_n_future and len(target_gws) < args.n_future:
         raise RuntimeError(f"Only {len(target_gws)} GW(s) available; wanted {args.n_future}. Available: {avail_gws}")
 
@@ -911,6 +1018,7 @@ def main():
         "available_team_gws": [int(x) for x in avail_gws],
         "scored_gws": [int(x) for x in target_gws],
         "as_of": str(as_of_ts),
+        "minutes_in": str(minutes_path),
         "out": str(out_path)
     }
     print(json.dumps(diag, indent=2))
