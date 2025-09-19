@@ -886,14 +886,17 @@ def build_player_form(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", help="e.g. 2025-2026; omit for batch over all folders under --fixtures-root")
+    ap.add_argument("--season",  type=str, default="all",
+                    help="Season selector: 'all', 'latest', or 'YYYY-YY'/'YYYY-YYYY'")
+    ap.add_argument("--seasons", type=str, default="",
+                    help="Comma list of seasons, e.g. '2024-25,2025-26' (takes precedence over --season)")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"),
                     help="Root containing <SEASON>/player_fixture_calendar.csv")
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"),
                     help="Root for versioned features output")
 
     # Versioning
-    ap.add_argument("--version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
+    ap.add_argument("--feat-version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
     ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
     ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
 
@@ -928,7 +931,7 @@ def main() -> None:
     # Resolve version directory once
     features_root = args.out_dir
     features_root.mkdir(parents=True, exist_ok=True)
-    version = _resolve_version(features_root, args.version, args.auto_version)
+    version = _resolve_version(features_root, args.feat_version, args.auto_version)
     version_dir = features_root / version
     version_dir.mkdir(parents=True, exist_ok=True)
 
