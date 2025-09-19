@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 minutes_forecast.py — score future GWs using fixed v1 gates/calibration + roster gating.
 
@@ -16,6 +17,11 @@ Fallback for future rows from:
   <fix-root>/<season>/fixture_calendar.csv
 Reads FDR (optional) from:
   <form-root>/<version>/<season>/<team|player>_form.csv
+
+NEW:
+• Auto-name outputs from the GW window and dual writer (CSV/Parquet):
+  - --out-format {csv,parquet,both} (default: csv)
+  - --zero-pad-filenames to emit GW05_07 instead of GW5_7
 """
 
 import argparse, json, logging
@@ -366,6 +372,49 @@ def _build_player_bench_caps(cameo_hist: pd.DataFrame,
         out[str(pid)] = float(np.clip(cap, 0.0, pos_cap if winsor_to_pos else np.inf))
     return out
 
+# ----------------------------- I/O helpers (NEW) ------------------------------
+
+def _fmt_gw(n: int, zero_pad: bool) -> str:
+    return f"{int(n):02d}" if zero_pad else f"{int(n)}"
+
+def _out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int, zero_pad: bool, out_format: str) -> List[Path]:
+    """
+    Build one or two output paths depending on out_format: csv|parquet|both.
+    """
+    a = _fmt_gw(gw_from, zero_pad); b = _fmt_gw(gw_to, zero_pad)
+    season_dir = base_dir / str(season)
+    season_dir.mkdir(parents=True, exist_ok=True)
+    stem = season_dir / f"GW{a}_{b}"
+    if out_format == "csv":
+        return [Path(str(stem) + ".csv")]
+    if out_format == "parquet":
+        return [Path(str(stem) + ".parquet")]
+    # both
+    return [Path(str(stem) + ".csv"), Path(str(stem) + ".parquet")]
+
+def _write_minutes(out: pd.DataFrame, paths: List[Path]) -> List[str]:
+    """
+    Write CSV and/or Parquet. Ensures date columns are written cleanly.
+    Returns list of stringified paths written.
+    """
+    written: List[str] = []
+    for p in paths:
+        if p.suffix.lower() == ".csv":
+            # normalize date column to date-only string for stability
+            if "date_sched" in out.columns:
+                tmp = out.copy()
+                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            else:
+                tmp = out
+            tmp.to_csv(p, index=False)
+            written.append(str(p))
+        elif p.suffix.lower() == ".parquet":
+            out.to_parquet(p, index=False)
+            written.append(str(p))
+        else:
+            raise ValueError(f"Unsupported output extension: {p.suffix}")
+    return written
+
 # ----------------------------- main ------------------------------------------
 
 def main():
@@ -387,7 +436,12 @@ def main():
     ap.add_argument("--fix-root", default="data/processed/registry/fixtures")
     ap.add_argument("--team-fixtures-filename", default="fixture_calendar.csv",
                     help="Filename of team fixtures under <fix-root>/<season>/ (default: fixture_calendar.csv)")
-    ap.add_argument("--out-dir", default="data/predictions/minutes_v1")
+    ap.add_argument("--out-dir", default="data/predictions/minutes")
+    ap.add_argument("--out-format", choices=["csv","parquet","both"], default="csv",
+                    help="Output format for minutes (default: csv)")
+    ap.add_argument("--zero-pad-filenames", action="store_true",
+                    help="Write filenames as GW05_07 instead of GW5_7")
+
     ap.add_argument("--model-dir", default="data/models/minutes/versions/v1")
 
     # Features (mirror v1)
@@ -440,7 +494,7 @@ def main():
                 else coerce_ts(args.as_of, args.as_of_tz))
 
     # If player future rows are missing for future season, synthesize from team fixtures
-    team_fix = load_team_fixtures(fix_root, args.future_season, args.team_fixtures_filename)
+    team_fix = load_team_fixtures(fix_root, args.future_season, args.team_fixtures_filenames if hasattr(args, "team_fixtures_filenames") else args.team_fixtures_filename)
     gwn_team = gw_coalesce_for_future(team_fix)
     avail_gws = sorted(pd.unique(gwn_team.dropna().astype(int)))
     target_gws = [g for g in avail_gws if g >= gw_from_req][:args.n_future]
@@ -677,13 +731,12 @@ def main():
 
     # BENCH: player-specific caps (recency-weighted 95th) shrunk to position cap
     if args.use_pos_bench_caps and not cameo_hist.empty:
-        camio_hist = cameo_hist.assign()  # alias to be safe if reused
         player_caps = _build_player_bench_caps(
-            cameo_hist=camio_hist,
+            cameo_hist=cameo_hist.assign(),
             pos_caps=bench_caps,
-            halflife_matches=8.0,  # recency weighting (matches)
-            shrink_k=6.0,          # shrink strength
-            winsor_to_pos=True     # clamp to position 95th
+            halflife_matches=8.0,
+            shrink_k=6.0,
+            winsor_to_pos=True
         )
         cap_vec = df_pred["player_id"].astype(str).map(player_caps).to_numpy()
         # Fallback to position cap if a player has no history
@@ -725,7 +778,7 @@ def main():
     p_play = np.clip(p_start + (1.0 - p_start) * p_cameo, 0, 1)
     exp_minutes_points = np.clip(p_play + p60, 0, 2)
 
-    # Build output
+    # Build output (metadata first, then predictions)
     out_cols = {
         "season": df_pred["season"].values,
         "player_id": df_pred["player_id"].values,
@@ -752,12 +805,17 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
 
-    # Name/dirs
+    # ---------- NEW: auto-name output + dual writer ----------
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
-    season_dir = (out_dir / f"{args.future_season}")
-    season_dir.mkdir(parents=True, exist_ok=True)
-    out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
-    out.to_csv(out_path, index=False)
+    out_paths = _out_paths(
+        base_dir=out_dir,
+        season=args.future_season,
+        gw_from=gw_from_eff,
+        gw_to=gw_to_eff,
+        zero_pad=args.zero_pad_filenames,
+        out_format=args.out_format
+    )
+    written_paths = _write_minutes(out, out_paths)
 
     print(json.dumps({
         "rows": int(len(out)),
@@ -766,7 +824,7 @@ def main():
         "available_team_gws": [int(g) for g in avail_gws],
         "scored_gws": [int(g) for g in target_gws],
         "as_of": str(as_of_ts),
-        "out": str(out_path)
+        "out": written_paths
     }, indent=2))
 
 if __name__ == "__main__":
