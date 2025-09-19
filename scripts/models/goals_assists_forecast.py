@@ -15,17 +15,8 @@ Key fixes vs prior rev:
 • Apply isotonic calibration for probabilities when --apply-calibration is set.
 • Normalize league labels and write date-only for date_sched in CSV.
 • Output includes rich minutes metadata in a fixed order.
-• NEW: Auto-resolve minutes file from GW window (+ dual CSV/Parquet loader), with helpful failures.
-
-Output columns (ordered)
-------------------------
-season, gw_played, gw_orig, date_sched, fbref_id, team_id, team, opponent_id, opponent, is_home,
-player_id, player, pos, fdr, p_start, p60, p_cameo, p_play, pred_start_head,
-pred_bench_cameo_head, pred_bench_head, pred_minutes, exp_minutes_points, _is_synth,
-team_att_z_venue, opp_def_z_venue,
-pred_goals_p90_mean, pred_assists_p90_mean, pred_goals_mean, pred_assists_mean,
-pred_goals_p90_poisson, pred_assists_p90_poisson, pred_goals_poisson, pred_assists_poisson,
-p_goal, p_assist, p_return_any
+• Auto-resolve minutes file from GW window (+ dual CSV/Parquet loader), with helpful failures.
+• NEW: Output format control (--out-format csv|parquet|both) + optional zero-padded filenames.
 """
 from __future__ import annotations
 
@@ -381,7 +372,6 @@ def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: 
                 f"GW{gw_from:02d}_*.csv", f"GW{gw_from:02d}_*.parquet"]
     for pat in patterns:
         for p in sorted(season_dir.glob(pat)):
-            # extract last number after underscore and before extension
             try:
                 stem = p.stem  # e.g., "GW5_7"
                 to_str = stem.split("_")[-1].replace("GW", "")
@@ -442,7 +432,10 @@ def _load_minutes_dual(path: Path) -> pd.DataFrame:
     """
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        df = pd.read_csv(path, parse_dates=["date_sched"] if "date_sched" in pd.read_csv(path, nrows=0).columns else None)
+        # read header first to decide parse_dates
+        hdr = pd.read_csv(path, nrows=0)
+        parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
+        df = pd.read_csv(path, parse_dates=parse_cols)
     elif suffix in (".parquet", ".pq"):
         df = pd.read_parquet(path)
         if "date_sched" in df.columns:
@@ -469,7 +462,7 @@ def _load_roster_pairs(teams_json: Optional[Path],
         return None
     p = Path(teams_json)
     if not p.exists():
-        logging.warning("teams_json not found at %s — skipping roster gate.", p)
+        logging.warning("teams_json not found at %s — skipping roster gate.")
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -527,6 +520,38 @@ def _apply_roster_gate(df: pd.DataFrame,
     return df.loc[mask_ok].copy()
 
 
+# ───────────────────────────── GA output helpers (NEW) ─────────────────────────────
+
+def _ga_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
+                  zero_pad: bool, out_format: str) -> List[Path]:
+    a = _fmt_gw(gw_from, zero_pad); b = _fmt_gw(gw_to, zero_pad)
+    season_dir = base_dir / str(season)
+    season_dir.mkdir(parents=True, exist_ok=True)
+    stem = season_dir / f"GW{a}_{b}"
+    if out_format == "csv":
+        return [Path(str(stem) + ".csv")]
+    if out_format == "parquet":
+        return [Path(str(stem) + ".parquet")]
+    return [Path(str(stem) + ".csv"), Path(str(stem) + ".parquet")]
+
+
+def _write_ga(df: pd.DataFrame, paths: List[Path]) -> List[str]:
+    written: List[str] = []
+    for p in paths:
+        if p.suffix.lower() == ".csv":
+            tmp = df.copy()
+            if "date_sched" in tmp.columns:
+                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            tmp.to_csv(p, index=False)
+            written.append(str(p))
+        elif p.suffix.lower() == ".parquet":
+            df.to_parquet(p, index=False)
+            written.append(str(p))
+        else:
+            raise ValueError(f"Unsupported output extension: {p.suffix}")
+    return written
+
+
 # ───────────────────────────── Main ─────────────────────────────
 
 def _parse_cap_per90(s: Optional[str]) -> Dict[str, float]:
@@ -563,13 +588,19 @@ def main():
     ap.add_argument("--fix-root", type=Path, default=Path("data/processed/registry/fixtures"))
     ap.add_argument("--team-fixtures-filename", default="fixture_calendar.csv")
 
-    # NEW: minutes-csv optional; add minutes-root
+    # Minutes input
     ap.add_argument("--minutes-csv", type=Path, help="Explicit minutes file (CSV or Parquet). Overrides auto-resolution.")
     ap.add_argument("--minutes-root", type=Path, default=Path("data/predictions/minutes"),
                     help="Root containing <season>/GW<from>_<to>.csv|parquet")
 
-    ap.add_argument("--model-dir", type=Path, required=True, help="Folder with trained G/A artifacts (a specific version)")
+    # GA output (NEW)
     ap.add_argument("--out-dir", type=Path, default=Path("data/predictions/goals_assists"))
+    ap.add_argument("--out-format", choices=["csv", "parquet", "both"], default="csv",
+                    help="Output format for G/A predictions (default: csv)")
+    ap.add_argument("--zero-pad-filenames", action="store_true",
+                    help="Write filenames as GW05_07 instead of GW5_7")
+
+    ap.add_argument("--model-dir", type=Path, required=True, help="Folder with trained G/A artifacts (a specific version)")
     ap.add_argument("--apply-calibration", action="store_true")
     ap.add_argument("--skip-gk", action="store_true")
     ap.add_argument("--cap-per90", type=str, default="", help='Optional per-POS cap, e.g. "GK:0.10,DEF:0.35,MID:1.00,FWD:1.40"')
@@ -741,7 +772,6 @@ def main():
         fut["opp_def_z_venue"] = np.nan
 
     # Last-known snapshot features (days_since_last; optional prev_minutes)
-    # Build minimal pull set (EWMs/rolls + minutes for prev_minutes)
     pull_cols = {c for c in pf_hist.columns if ("_ewm" in c or "_roll" in c)}
     pull_cols |= {"minutes"}  # for prev_minutes only
     snap_cols = list(pull_cols)
@@ -777,7 +807,7 @@ def main():
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
         fut = fut.merge(last_prev, how="left", on=["season", "player_id"], validate="many_to_one")
 
-    # >>> NEW: merge ALL last-known per-player EWMs/rolls into fut (serve-time feature parity)
+    # Merge ALL last-known per-player EWMs/rolls into fut (serve-time feature parity)
     last_feat = last.drop(columns=["minutes"], errors="ignore")
     feat_like = [c for c in last_feat.columns if c not in ("season", "player_id")]
     if feat_like:
@@ -997,10 +1027,16 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
 
-    season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
-    out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
-    out.to_csv(out_path, index=False, date_format="%Y-%m-%d")
+    out_paths = _ga_out_paths(
+        base_dir=args.out_dir,
+        season=args.future_season,
+        gw_from=gw_from_eff,
+        gw_to=gw_to_eff,
+        zero_pad=args.zero_pad_filenames,
+        out_format=args.out_format,
+    )
+    written_paths = _write_ga(out, out_paths)
 
     # Light sanity log (99.5th pct) to spot any remaining spikes quickly
     try:
@@ -1019,7 +1055,7 @@ def main():
         "scored_gws": [int(x) for x in target_gws],
         "as_of": str(as_of_ts),
         "minutes_in": str(minutes_path),
-        "out": str(out_path)
+        "out": written_paths
     }
     print(json.dumps(diag, indent=2))
 
