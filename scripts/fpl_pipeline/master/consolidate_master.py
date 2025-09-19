@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 scripts.fpl_pipeline.master.consolidate_master
 
@@ -42,6 +43,7 @@ py -m scripts.fpl_pipeline.master.consolidate_master ^
   --prices-dir   data/processed/registry/prices ^
   --out-json     data/processed/registry/master_fpl.json ^
   --league       "ENG-Premier League" ^
+  --season latest  # or --seasons 2024-25,2025-26 ^
   --log-level    INFO
 """
 from __future__ import annotations
@@ -52,10 +54,12 @@ import logging
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import pandas as pd
 from unidecode import unidecode
+
+# ────────────────────────── Position maps ──────────────────────────
 
 FPL_POS_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 FBREF_TO_FPL_POS = {"GK": "GKP", "DF": "DEF", "MF": "MID", "FW": "FWD"}
@@ -63,6 +67,8 @@ FBREF_TO_FPL_POS = {"GK": "GKP", "DF": "DEF", "MF": "MID", "FW": "FWD"}
 SEASON_RE_SHORT = re.compile(r"^\d{4}-\d{2}$")
 SEASON_RE_LONG  = re.compile(r"^\d{4}-\d{4}$")
 _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"), "-")
+
+# ────────────────────────── Season helpers ──────────────────────────
 
 def norm_dashes(s: str) -> str:
     return (s or "").translate(_DASHES)
@@ -84,6 +90,54 @@ def season_long(s: str) -> str:
         return f"{start}-{end}"
     return s
 
+def _looks_like_season(name: str) -> bool:
+    # allow 2-2, 4-2, 4-4 digit patterns with a dash
+    return re.fullmatch(r"\d{2,4}-\d{2,4}", norm_dashes(name)) is not None
+
+def _season_sort_key_name(name: str) -> tuple[int, str]:
+    longf = season_long(name)
+    m = re.match(r"^(\d{4})-(\d{4})$", longf)
+    if m:
+        return (int(m.group(1)), longf)
+    return (-1, name)
+
+def _match_season_dir(dirs: List[Path], sel: str) -> Optional[Path]:
+    tgt_long = season_long(sel)
+    tgt_short = season_short(tgt_long)
+    # direct hit
+    for d in dirs:
+        if d.name == tgt_long or d.name == tgt_short:
+            return d
+    # compare long-forms
+    for d in dirs:
+        if season_long(d.name) == tgt_long:
+            return d
+    return None
+
+def _parse_seasons_multi(dirs: List[Path], seasons_arg: str) -> List[Path]:
+    """
+    Parse comma-separated season selectors (e.g., '2024-25,2025-26').
+    Returns a list of matching dirs (unique, in the order given).
+    """
+    tokens = [t.strip() for t in seasons_arg.split(",") if t.strip()]
+    if not tokens:
+        return []
+    out: List[Path] = []
+    seen = set()
+    for tok in tokens:
+        m = _match_season_dir(dirs, tok)
+        if not m:
+            raise SystemExit(
+                f"Requested season {tok!r} not found. "
+                f"Available: {[d.name for d in dirs]}"
+            )
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+# ────────────────────────── IO helpers ──────────────────────────
+
 def read_json_flex(p: Path):
     for enc in ("utf-8","utf-8-sig","cp1252","latin-1"):
         try:
@@ -99,6 +153,8 @@ def write_json_utf8(p: Path, obj) -> None:
 def read_csv(p: Path) -> pd.DataFrame:
     return pd.read_csv(p)
 
+# ────────────────────────── Name/pos helpers ──────────────────────────
+
 def canonical_lower(s: str) -> str:
     s = unidecode(str(s or "")).strip().lower()
     s = re.sub(r"\s+", " ", s)
@@ -108,7 +164,6 @@ def coerce_element_type(val) -> Optional[int]:
     """Accept ints (1..4), numeric strings, or role strings GK/GKP/DEF/DF/MID/MF/FWD/FW."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
-    # numeric fast-path
     try:
         iv = int(val)
         if iv in (1,2,3,4):
@@ -119,7 +174,6 @@ def coerce_element_type(val) -> Optional[int]:
     if s.isdigit():
         iv = int(s)
         return iv if iv in (1,2,3,4) else None
-    # string roles
     if s in {"GK","GKP"}: return 1
     if s in {"DF","DEF","D"}: return 2
     if s in {"MF","MID","M"}: return 3
@@ -132,7 +186,6 @@ def coerce_fpl_pos_from_row(row: pd.Series) -> Optional[str]:
         sp = str(row["fpl_pos"]).strip().upper()
         if sp in {"GKP","DEF","MID","FWD"}:
             return sp
-        # map GK/DF/MF/FW too
         if sp in FBREF_TO_FPL_POS:
             return FBREF_TO_FPL_POS[sp]
     # element_type
@@ -181,20 +234,31 @@ def load_prices_for_season(prices_dir: Path, season_short_str: str) -> Dict[str,
                 fp = fpa; break
     if fp.is_file():
         data = read_json_flex(fp)
-        # Ensure keys are strings
         out = {}
         for pid, gmap in (data or {}).items():
             out[str(pid)] = {str(k): float(v) for k, v in gmap.items()}
         return out
     return {}
 
+# ────────────────────────── Main ──────────────────────────
+
 def main():
-    ap = argparse.ArgumentParser(description="Consolidate FBref master + FPL season files + prices into master_fpl.json.")
+    ap = argparse.ArgumentParser(
+        description="Consolidate FBref master + FPL season files + prices into master_fpl.json."
+    )
     ap.add_argument("--fbref-master", type=Path, required=True)
-    ap.add_argument("--proc-root",    type=Path, required=True, help="data/processed/fpl with <season>/season/cleaned_players.csv")
-    ap.add_argument("--prices-dir",   type=Path, required=True, help="prices registry dir produced by prices_from_merged.py")
-    ap.add_argument("--out-json",     type=Path, required=True, help="output master_fpl.json")
+    ap.add_argument("--proc-root",    type=Path, required=True,
+                    help="data/processed/fpl with <season>/season/cleaned_players.csv")
+    ap.add_argument("--prices-dir",   type=Path, required=True,
+                    help="prices registry dir produced by prices_from_merged.py")
+    ap.add_argument("--out-json",     type=Path, required=True,
+                    help="output master_fpl.json")
     ap.add_argument("--league",       default="ENG-Premier League")
+    ap.add_argument("--season",       type=str, default="all",
+                    help="Season selector: 'all' (default), 'latest', or a specific like '2025-26'/'2025-2026'")
+    ap.add_argument("--seasons",      type=str, default="",
+                    help="Comma list of specific seasons (short or long), e.g. '2024-25,2025-26'. "
+                         "If provided, takes precedence over --season.")
     ap.add_argument("--log-level",    default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
 
@@ -207,9 +271,13 @@ def main():
     # ---------- Load FBref master (pid keyed) ----------
     raw_master = read_json_flex(args.fbref_master)
     if isinstance(raw_master, list):
-        fb_players = {str(rec.get("player_id") or rec.get("id")): rec for rec in raw_master if rec.get("player_id") or rec.get("id")}
+        fb_players = {
+            str(rec.get("player_id") or rec.get("id")): rec
+            for rec in raw_master if rec.get("player_id") or rec.get("id")
+        }
     else:
-        fb_players = {str(pid): dict(rec, player_id=str(pid)) for pid, rec in raw_master.items()}
+        fb_players = {str(pid): dict(rec, player_id=str(pid))
+                      for pid, rec in raw_master.items()}
 
     # Normalize FBref career keys to SHORT season keys for output
     for pid, rec in fb_players.items():
@@ -223,17 +291,43 @@ def main():
             fixed[season_short(k)] = dict(v) if isinstance(v, dict) else {"team": v}
         rec["career"] = fixed
 
-    # ---------- Iterate seasons under proc-root ----------
-    seasons_dirs = [d for d in sorted(args.proc_root.iterdir()) if d.is_dir()]
-    missing_by_season: Dict[str, list] = defaultdict(list)
+    # ---------- Season selection under proc-root ----------
+    if not args.proc_root.exists():
+        raise SystemExit(f"--proc-root does not exist: {args.proc_root}")
+    all_dirs = [d for d in args.proc_root.iterdir() if d.is_dir()]
+    season_dirs = [d for d in all_dirs if _looks_like_season(d.name)]
+    season_dirs = sorted(season_dirs, key=lambda p: _season_sort_key_name(p.name))
+    if not season_dirs:
+        logging.warning("No season-like folders under %s", args.proc_root)
+        return
 
-    # name-part tallies
+    # If --seasons is provided, it wins. Else use --season.
+    if args.seasons.strip():
+        seasons_dirs = _parse_seasons_multi(season_dirs, args.seasons.strip())
+    else:
+        sel = (args.season or "all").strip().lower()
+        if sel == "all":
+            seasons_dirs = season_dirs
+        elif sel == "latest":
+            seasons_dirs = [season_dirs[-1]]
+        else:
+            match = _match_season_dir(season_dirs, args.season.strip())
+            if not match:
+                raise SystemExit(
+                    f"Season {args.season!r} not found under {args.proc_root}. "
+                    f"Available: {[d.name for d in season_dirs]}"
+                )
+            seasons_dirs = [match]
+
+    logging.info("Processing seasons: %s", [d.name for d in seasons_dirs])
+
+    # ---------- Accumulators ----------
+    missing_by_season: Dict[str, list] = defaultdict(list)
     fn_candidates: Dict[str, Counter] = defaultdict(Counter)
     sn_candidates: Dict[str, Counter] = defaultdict(Counter)
-
-    # season → price map
     season_prices: Dict[str, Dict[str, Dict[str, float]]] = {}
 
+    # ---------- Iterate selected seasons ----------
     for sdir in seasons_dirs:
         season = sdir.name
         short = season_short(season)
@@ -258,7 +352,7 @@ def main():
             if not pid:
                 continue
 
-            # collect name parts
+            # collect name parts (counts)
             fn = row.get("first_name") or ""
             sn = row.get("second_name") or ""
             if fn: fn_candidates[pid][fn] += 1
@@ -286,7 +380,6 @@ def main():
             team = master_season.get("team") or (row.get("team") if pd.notna(row.get("team")) else None)
 
             out_srec = {"team": team, "position": pos, "fpl_pos": fpl_pos}
-            # carry league if present in FBref for that season
             if "league" in master_season:
                 out_srec["league"] = master_season.get("league")
             career[short] = out_srec
