@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""
 defense_forecast.py — leak-free forecaster for CS, DCP, and exp_gc using trained defense heads
-Now with optional roster gating from master_teams.json and team-level exp_gc.
+Now with minutes auto-resolve (CSV/Parquet), legacy fixture metadata, roster gating, and dual writer.
 
 Inputs
 ------
@@ -14,19 +14,19 @@ Inputs
     - artifacts/gc_features_team.json   (optional; defaults to cs_features_team if missing)
     - artifacts/dcp_features.json       (authoritative feature order for DCP per-90 head)
 
-• Minutes forecast CSV (from minutes_forecast.py):
+• Minutes forecast (from minutes_forecast.py) — auto-resolved by GW window or given explicitly:
     - Must include: season, player_id, team_id, pos, date_sched, pred_minutes
-    - Should include: gw_played or gw_orig or gw     (any one works)
-    - Nice-to-have: prob_played60_cal/prob_played60 (else fallback from E[min])
+    - Should include: gw_played or gw_orig or gw (any one works)
+    - Nice-to-have: p_start/p_cameo/pred_start_head/pred_bench_cameo_head (for mixture DCP)
     - Nice-to-have: fdr, is_home (else venue inferred via fixtures)
-    - Nice-to-have for mixture DCP: p_start, p_cameo, pred_start_head, pred_bench_cameo_head
 
 • Registry features (history + up to --as-of for current season):
     - players_form.csv  (for last-known *_roll/_ewm DCP features)
     - team_form.csv     (for team_def_xga_venue[_z], team_possession_venue, opp_att_z_venue)
 
-• Team fixtures (for venue map if minutes CSV doesn’t provide it):
-    - fixtures/<season>/<filename> (default: fixture_calendar.csv) with is_home and a GW column
+• Team fixtures for legacy metadata & venue:
+    - <fix-root>/<season>/<team-fixtures-filename> (default: fixture_calendar.csv)
+      needs: fbref_id, team, opponent_id, is_home, home, away, date_sched/date_played, gw column, etc.
 
 Roster gating (optional)
 ------------------------
@@ -36,26 +36,25 @@ Roster gating (optional)
 
 Output
 ------
-<out-dir>/<SEASON>/GW<from>_<to>.csv with columns:
-  season, gw_orig, date_sched, player_id, team_id, player, pos,
-  pred_minutes, prob_played60_use,
-  team_att_z_venue, team_def_xga_venue, team_def_xga_venue_z, team_possession_venue, opp_att_z_venue, fdr, venue_bin,
+<out-dir>/<SEASON>/GW<from>_<to>.csv|parquet with columns (metadata-first):
+  season, gw_played, gw_orig, date_sched, game_id, team_id, team, opponent_id, opponent, is_home,
+  player_id, player, pos, fdr, venue_bin,
   p_teamCS, prob_cs,
   lambda90, expected_dc, prob_dcp,
-  exp_gc                      ← NEW (team-level E[GA], replicated per player)
-[+ optional: lambda_match if --dump-lambdas]
+  exp_gc,
+  [optional: lambda_match if --dump-lambdas]
 
 Notes
 -----
 • No retraining; strictly uses artifacts.
 • No future leakage: player *_roll/_ewm come from last row strictly before --as-of.
-• GK: included in CS; excluded from DCP (prob_dcp/expected_dc set NaN) unless --include-gk-dcp is passed.
+• GK: included in CS; excluded from DCP unless --include-gk-dcp is passed.
 """
 
 from __future__ import annotations
 import argparse, json, logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -214,12 +213,17 @@ def _map_team_context(tf: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
 
     return out
 
-def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> Optional[pd.DataFrame]:
+def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFrame:
     path = fix_root / season / filename
     if not path.exists():
-        return None
+        raise FileNotFoundError(f"Missing team fixtures: {path}")
     tf = pd.read_csv(path)
-    tf["season"] = season
+    for dc in ("date_sched","date_played"):
+        if dc in tf.columns:
+            tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
+    for c in ("gw_played","gw_orig","gw"):
+        if c in tf.columns:
+            tf[c] = pd.to_numeric(tf[c], errors="coerce")
     if "is_home" not in tf.columns:
         if "was_home" in tf.columns:
             tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1","true","yes"]).astype(int)
@@ -227,17 +231,13 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> Optional[
             tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype(int)
         else:
             tf["is_home"] = 0
-    for dc in ("date_sched","date_played"):
-        if dc in tf.columns:
-            tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
-    for c in ("gw_played","gw_orig","gw"):
-        if c in tf.columns:
-            tf[c] = pd.to_numeric(tf[c], errors="coerce")
     if "team_id" not in tf.columns:
         for alt in ("team","teamId","team_code"):
             if alt in tf.columns:
                 tf = tf.rename(columns={alt:"team_id"})
                 break
+    tf["team_id"] = tf["team_id"].astype(str)
+    tf["season"] = season
     return tf
 
 def _gw_for_selection(df: pd.DataFrame) -> pd.Series:
@@ -255,7 +255,8 @@ def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str], as_of_t
     hist = df[du < as_of_ts].copy()
     if hist.empty:
         return pd.DataFrame(columns=["season","player_id"] + feature_cols)
-    hist = hist.sort_values(["player_id","season","date_played","gw_orig"])
+    gw_key = _pick_gw_col(hist.columns.tolist()) or "gw_orig"
+    hist = hist.sort_values(["player_id","season","date_played", gw_key])
     last = hist.groupby(["season","player_id"], as_index=False).tail(1).copy()
     keep = ["season","player_id"] + [c for c in feature_cols if c in last.columns]
     for c in feature_cols:
@@ -264,7 +265,7 @@ def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str], as_of_t
     return last[["season","player_id"] + feature_cols].copy()
 
 def _poisson_tail_prob_vec(lam: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """P(K >= k) for K ~ Poisson(lam). Handles NaN/negatives gracefully."""
+    """P(K >= k) for K ~ Poisson(lam)."""
     lam = np.asarray(lam, dtype=float)
     k = np.asarray(k, dtype=int)
     out = np.zeros_like(lam, dtype=float)
@@ -300,23 +301,20 @@ def _parse_k90(s: str) -> Dict[str, int]:
         out[k.strip().upper()] = int(v)
     return out
 
-# ---------- roster gating (same semantics as goals/assists) ----------
+
+# ---------- roster gating ----------
 
 def _norm_label(s: str) -> str:
     return str(s or "").lower().replace("-", " ").replace("_", " ").strip()
 
 def _load_roster_pairs(teams_json: Optional[Path],
                        season: str,
-                       league_filter: Optional[str]) -> Optional[set[tuple[str, str]]]:
-    """
-    Returns a set of allowed (team_id, player_id) pairs for the given season.
-    If teams_json is None / missing / invalid, returns None (no gating).
-    """
+                       league_filter: Optional[str]) -> Optional[Set[Tuple[str, str]]]:
     if not teams_json:
         return None
     p = Path(teams_json)
     if not p.exists():
-        logging.warning("teams_json not found at %s — skipping roster gate.", p)
+        logging.warning("teams_json not found at %s — skipping roster gate.")
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -325,15 +323,14 @@ def _load_roster_pairs(teams_json: Optional[Path],
         return None
 
     lf = _norm_label(league_filter) if league_filter else ""
-    allowed: set[tuple[str, str]] = set()
+    allowed: Set[Tuple[str, str]] = set()
 
     for team_id, obj in (data or {}).items():
         season_info = (obj or {}).get("career", {}).get(season)
         if not season_info:
             continue
-        if lf:
-            if _norm_label(season_info.get("league", "")) != lf:
-                continue
+        if lf and _norm_label(season_info.get("league", "")) != lf:
+            continue
         players = season_info.get("players", []) or []
         for pl in players:
             pid = str(pl.get("id", "")).strip()
@@ -345,15 +342,11 @@ def _load_roster_pairs(teams_json: Optional[Path],
     return allowed or None
 
 def _apply_roster_gate(df: pd.DataFrame,
-                       allowed_pairs: Optional[set[tuple[str, str]]],
+                       allowed_pairs: Optional[Set[Tuple[str, str]]],
                        season: str,
                        where: str,
                        out_artifacts_dir: Optional[Path] = None,
                        require_on_roster: bool = False) -> pd.DataFrame:
-    """
-    Keep only rows with (team_id, player_id) inside allowed_pairs.
-    If require_on_roster is True and any rows are dropped, raise RuntimeError.
-    """
     if allowed_pairs is None or df.empty:
         return df
     tid = df.get("team_id").astype(str)
@@ -370,6 +363,116 @@ def _apply_roster_gate(df: pd.DataFrame,
         if require_on_roster:
             raise RuntimeError(f"--require-on-roster set: {dropped} {where} rows are not on the {season} roster.")
     return df.loc[mask_ok].copy()
+
+
+# ---------- minutes resolver (auto) & dual loader ----------
+
+def _fmt_gw(n: int, zero_pad: bool) -> str:
+    return f"{int(n):02d}" if zero_pad else f"{int(n)}"
+
+def _candidate_minutes_paths(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> List[Path]:
+    season_dir = minutes_root / str(future_season)
+    cands: List[Path] = []
+    for zp in (False, True):
+        a = _fmt_gw(gw_from, zp)
+        b = _fmt_gw(gw_to,   zp)
+        cands.append(season_dir / f"GW{a}_{b}.csv")
+        cands.append(season_dir / f"GW{a}_{b}.parquet")
+    return cands
+
+def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> Optional[Path]:
+    season_dir = minutes_root / str(future_season)
+    if not season_dir.exists():
+        return None
+    patterns = [f"GW{gw_from}_*.csv", f"GW{gw_from}_*.parquet",
+                f"GW{gw_from:02d}_*.csv", f"GW{gw_from:02d}_*.parquet"]
+    for pat in patterns:
+        for p in sorted(season_dir.glob(pat)):
+            try:
+                stem = p.stem
+                to_val = int(stem.split("_")[-1].replace("GW",""))
+                if to_val == int(gw_to):
+                    return p
+            except Exception:
+                continue
+    return None
+
+def _resolve_minutes_path(args: argparse.Namespace, gw_from: int, gw_to: int) -> Path:
+    if args.minutes_csv:
+        p = Path(args.minutes_csv)
+        if not p.exists():
+            raise FileNotFoundError(f"--minutes-csv not found: {p}")
+        return p
+
+    for cand in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
+        if cand.exists():
+            return cand
+
+    fb = _glob_fallback(args.minutes_root, args.future_season, gw_from, gw_to)
+    if fb:
+        return fb
+
+    season_dir = args.minutes_root / str(args.future_season)
+    msg = [
+        f"Minutes file not found for GW window {gw_from}-{gw_to}.",
+        f"Looked under: {season_dir}",
+        "Tried candidates:",
+    ]
+    for c in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
+        msg.append(f"  - {c}")
+    msg += [
+        "Also tried glob fallback: GW{from}_*.{csv,parquet} (with and without zero-padding).",
+        "Fix by either:",
+        "  • generating that file, or",
+        "  • pointing directly via --minutes-csv <path>, or",
+        "  • adjusting --minutes-root / GW window."
+    ]
+    raise FileNotFoundError("\n".join(msg))
+
+def _load_minutes_dual(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        hdr = pd.read_csv(path, nrows=0)
+        parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
+        df = pd.read_csv(path, parse_dates=parse_cols)
+    elif suffix in (".parquet", ".pq"):
+        df = pd.read_parquet(path)
+        if "date_sched" in df.columns:
+            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
+    else:
+        raise ValueError(f"Unsupported minutes file extension: {suffix}. Use .csv or .parquet")
+    return df
+
+
+# ---------- file writing helpers ----------
+
+def _def_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
+                   zero_pad: bool, out_format: str) -> List[Path]:
+    a = _fmt_gw(gw_from, zero_pad); b = _fmt_gw(gw_to, zero_pad)
+    season_dir = base_dir / str(season)
+    season_dir.mkdir(parents=True, exist_ok=True)
+    stem = season_dir / f"GW{a}_{b}"
+    if out_format == "csv":
+        return [Path(str(stem) + ".csv")]
+    if out_format == "parquet":
+        return [Path(str(stem) + ".parquet")]
+    return [Path(str(stem) + ".csv"), Path(str(stem) + ".parquet")]
+
+def _write_def(df: pd.DataFrame, paths: List[Path]) -> List[str]:
+    written: List[str] = []
+    for p in paths:
+        if p.suffix.lower() == ".csv":
+            tmp = df.copy()
+            if "date_sched" in tmp.columns:
+                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            tmp.to_csv(p, index=False)
+            written.append(str(p))
+        elif p.suffix.lower() == ".parquet":
+            df.to_parquet(p, index=False)
+            written.append(str(p))
+        else:
+            raise ValueError(f"Unsupported output extension: {p.suffix}")
+    return written
 
 
 # ----------------------------- main -------------------------------------------
@@ -392,9 +495,16 @@ def main():
     ap.add_argument("--form-version", required=True)
     ap.add_argument("--fix-root", type=Path, default=Path("data/processed/registry/fixtures"))
     ap.add_argument("--team-fixtures-filename", default="fixture_calendar.csv")
-    ap.add_argument("--minutes-csv", type=Path, required=True)
-    ap.add_argument("--model-dir", type=Path, required=True, help="Folder with trained DEFENSE artifacts (a specific version)")
+
+    # Minutes input (auto-resolve)
+    ap.add_argument("--minutes-csv", type=Path, help="Explicit minutes file (CSV or Parquet). Overrides auto-resolution.")
+    ap.add_argument("--minutes-root", type=Path, default=Path("data/predictions/minutes"),
+                    help="Root containing <season>/GW<from>_<to>.csv|parquet")
+
+    # Output
     ap.add_argument("--out-dir", type=Path, default=Path("data/predictions/defense"))
+    ap.add_argument("--out-format", choices=["csv","parquet","both"], default="csv")
+    ap.add_argument("--zero-pad-filenames", action="store_true")
 
     # Policy / inference tweaks
     ap.add_argument("--dcp-k90", type=str, default="DEF:10;MID:12;FWD:12")
@@ -402,6 +512,9 @@ def main():
     ap.add_argument("--include-gk-dcp", action="store_true", help="If set, computes DCP for GK (otherwise NaN)")
     ap.add_argument("--dump-lambdas", action="store_true", help="Include lambda_match column")
     ap.add_argument("--log-level", default="INFO")
+
+    # Artifacts
+    ap.add_argument("--model-dir", type=Path, required=True, help="Folder with trained DEFENSE artifacts (a specific version)")
 
     # Roster gating
     ap.add_argument("--teams-json", type=Path, help="Path to master_teams.json containing per-season rosters")
@@ -420,7 +533,7 @@ def main():
                 if str(args.as_of).lower() in ("now","auto","today")
                 else pd.Timestamp(args.as_of, tz=tz))
 
-    # Prepare season dirs for artifacts early (for roster audit dumps)
+    # output dirs for artifacts
     season_dir = args.out_dir / f"{args.future_season}"
     artifacts_dir = season_dir / "artifacts"
 
@@ -442,7 +555,6 @@ def main():
         except Exception:
             logging.warning("Failed loading isotonic calibration; proceeding without.")
 
-    # Optional GC regressor
     gc_model_path = args.model_dir / "team_gc_lgbm.joblib"
     gc_model = None
     if gc_model_path.exists():
@@ -468,34 +580,32 @@ def main():
     tf = _load_team_form(args.features_root, args.form_version, seasons_all)
     team_ctx = _map_team_context(tf)
 
-    # --- Minutes target window ---
-    minutes = pd.read_csv(args.minutes_csv, parse_dates=["date_sched"])
+    # --- Resolve minutes file & window (auto) ---
+    gw_from_req = args.gw_from if args.gw_from is not None else args.as_of_gw
+    gw_to_req   = args.gw_to   if args.gw_to   is not None else (gw_from_req + max(1, args.n_future) - 1)
+    minutes_path = _resolve_minutes_path(args, int(gw_from_req), int(gw_to_req))
+    minutes = _load_minutes_dual(minutes_path)
     if "season" not in minutes.columns:
         minutes["season"] = args.future_season
 
     gw_sel = _gw_for_selection(minutes)
     avail_gws = sorted(pd.unique(gw_sel.dropna().astype(int)))
-    gw_from_req = int(args.gw_from) if args.gw_from is not None else int(args.as_of_gw)
-    gw_to_req = int(args.gw_to) if args.gw_to is not None else (gw_from_req + max(1, args.n_future) - 1)
-    # Fix: compute n_future safely
-    gw_to_req   = int(args.gw_to) if args.gw_to is not None else (gw_from_req + max(1, args.n_future) - 1)
-    target_gws  = [g for g in avail_gws if gw_from_req <= g <= gw_to_req]
+    avail_gws = [int(x) for x in avail_gws]
+    target_gws = [int(g) for g in avail_gws if g >= int(gw_from_req)][:int(args.n_future)]
     if not target_gws:
-        raise RuntimeError(f"No target GWs in [{gw_from_req}, {gw_to_req}] from minutes CSV. Available: {avail_gws}")
+        raise RuntimeError(f"No target GWs >= {gw_from_req} in minutes file ({minutes_path}). Available: {avail_gws}")
     if args.strict_n_future and len(target_gws) < args.n_future:
         raise RuntimeError(f"Only {len(target_gws)} GW(s) available; wanted {args.n_future}. Available: {avail_gws}")
 
-    # restrict minutes to target_gws
     minutes = minutes[gw_sel.isin(target_gws)].copy()
     if minutes.empty:
         raise RuntimeError("No rows after GW filtering.")
-    # ensure no duplicate columns
     if minutes.columns.duplicated().any():
         dups = minutes.columns[minutes.columns.duplicated()].tolist()
         logging.warning("Minutes had duplicate columns; dropping earlier duplicates: %s", set(dups))
         minutes = minutes.loc[:, ~minutes.columns.duplicated(keep="last")]
 
-    # --- Roster gating (authoritative filter for what we score) ---
+    # --- Roster gating (authoritative filter) ---
     allowed_pairs = _load_roster_pairs(
         teams_json=args.teams_json,
         season=args.future_season,
@@ -512,34 +622,45 @@ def main():
     if minutes.empty:
         raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
 
-    # --- Venue / FDR merge ---
-    gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
+    # --- Merge team fixtures for venue + legacy metadata ---
+    team_fix = _load_team_fixtures(args.fix_root, args.future_season, args.team_fixtures_filename)
 
-    if "is_home" not in minutes.columns:
-        team_fix = _load_team_fixtures(args.fix_root, args.future_season, args.team_fixtures_filename)
-        if team_fix is not None:
-            gw_key_t = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
-            vmap = (team_fix[["season","team_id",gw_key_t,"is_home"]]
-                    .dropna(subset=[gw_key_t,"team_id"])
-                    .drop_duplicates())
-            vmap = vmap.rename(columns={gw_key_t: gw_key_m})
-            minutes = minutes.merge(vmap, on=["season","team_id",gw_key_m], how="left", validate="many_to_one")
-        else:
-            minutes["is_home"] = 0
-    minutes["venue_bin"] = minutes["is_home"].fillna(0).astype(int)
+    gw_key_m = _pick_gw_col(minutes.columns.tolist()) or "gw_orig"
+    gw_key_t = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+
+    minutes[gw_key_m] = pd.to_numeric(minutes[gw_key_m], errors="coerce")
+    team_fix[gw_key_t] = pd.to_numeric(team_fix[gw_key_t], errors="coerce")
+    minutes["team_id"] = minutes["team_id"].astype(str)
+    team_fix["team_id"] = team_fix["team_id"].astype(str)
+
+    # Map is_home from fixtures (robust)
+    vmap = (team_fix[["season","team_id",gw_key_t,"is_home"]]
+            .dropna(subset=[gw_key_t,"team_id"])
+            .drop_duplicates()
+            .rename(columns={gw_key_t: gw_key_m}))
+    minutes = minutes.merge(vmap, how="left", on=["season","team_id",gw_key_m], validate="many_to_one")
+
+    # venue_bin & fdr defaults
+    venue_fallback = (minutes["venue"].astype(str).str.lower().eq("home").astype(int)
+                      if "venue" in minutes.columns else 0)
+    minutes["venue_bin"] = (
+        pd.to_numeric(minutes.get("is_home"), errors="coerce")
+          .fillna(venue_fallback)
+          .fillna(0)
+          .astype(int)
+    )
     if "fdr" not in minutes.columns:
         minutes["fdr"] = 0.0
 
-    # --- Build team rows for CS/GC features (keep minutes' GW key as-is) ---
+    # --- Team rows for CS/GC features (uses minutes' GW key) ---
     team_rows = (minutes[["season", gw_key_m, "team_id", "is_home", "venue_bin", "fdr", "date_sched"]]
                  .drop_duplicates()
                  .rename(columns={gw_key_m: "gw_orig"}))
 
     if team_ctx is not None:
-        # venue-aware merge on (season, gw_orig, team_id, is_home)
         team_rows = team_rows.merge(
             team_ctx,
-            on=["season", "gw_orig", "team_id", "is_home"],
+            on=["season","gw_orig","team_id","is_home"],
             how="left",
             validate="many_to_one",
         )
@@ -565,7 +686,7 @@ def main():
     p_team = np.clip(iso_cs.transform(p_team_raw), 0, 1) if iso_cs is not None else p_team_raw
     team_rows["p_teamCS"] = p_team
 
-    # Assemble X_gc in artifact order (may be same as cs_feats)
+    # GC regressor (optional)
     if gc_model is not None:
         Xgc = pd.DataFrame(index=team_rows.index)
         for f in gc_feats:
@@ -583,7 +704,7 @@ def main():
     else:
         team_rows["exp_gc_team"] = np.nan
 
-    # --- Player last snapshot for DCP *_roll/EWM features (leak-free) ---
+    # --- Player last snapshot for DCP features (leak-free) ---
     pull_cols = [c for c in dcp_feats if c not in ("venue_bin","fdr",
                                                    "team_possession_venue","opp_att_z_venue",
                                                    "team_def_xga_venue","team_def_xga_venue_z","team_att_z_venue")]
@@ -593,35 +714,53 @@ def main():
 
     # --- Build per-player future frame ---
     fut = minutes.copy()
-    # attach team CS/GC probs & context
-    team_rows_for_merge = team_rows.rename(columns={"gw_orig": gw_key_m})
     fut = fut.merge(
-        team_rows_for_merge[["season", gw_key_m, "team_id", "p_teamCS", "exp_gc_team",
-                             "team_def_xga_venue","team_def_xga_venue_z",
-                             "team_possession_venue","team_att_z_venue","opp_att_z_venue"]],
+        team_rows.rename(columns={"gw_orig": gw_key_m})[["season", gw_key_m, "team_id", "p_teamCS", "exp_gc_team",
+                                                         "team_def_xga_venue","team_def_xga_venue_z",
+                                                         "team_possession_venue","team_att_z_venue","opp_att_z_venue"]],
         on=["season", gw_key_m, "team_id"], how="left", validate="many_to_one"
     )
-    # attach last-known player feature snapshot
     fut = fut.merge(last, on=["season","player_id"], how="left", validate="many_to_one")
 
-    # Deduplicate any accidental column name collisions (keep rightmost)
     if fut.columns.duplicated().any():
         dups = fut.columns[fut.columns.duplicated()].tolist()
         logging.warning("Future frame had duplicate columns; keeping last occurrence: %s", set(dups))
         fut = fut.loc[:, ~fut.columns.duplicated(keep="last")]
 
-    # p60: prefer existing column(s); else fallback from E[min]
-    p60_col = None
-    for c in ("prob_played60_cal","prob_played60_raw","prob_played60","p60"):
-        if c in fut.columns:
-            p60_col = c; break
-    if p60_col is None:
-        fut["prob_played60_use"] = np.clip((pd.to_numeric(fut["pred_minutes"], errors="coerce") - 30.0) / 60.0, 0.0, 1.0)
-    else:
-        fut["prob_played60_use"] = pd.to_numeric(fut[p60_col], errors="coerce")
-        miss = fut["prob_played60_use"].isna()
-        if miss.any():
-            fut.loc[miss, "prob_played60_use"] = np.clip((pd.to_numeric(fut.loc[miss,"pred_minutes"], errors="coerce") - 30.0) / 60.0, 0.0, 1.0)
+    # --- Legacy metadata attach from fixtures: game_id/team/opponent_id/opponent ---
+    # Prepare small fixture frame to merge on (season, team_id, gw_key)
+    fix_keep = ["season","team_id",gw_key_t,"fbref_id","team","opponent_id","is_home","home","away"]
+    fix_keep = [c for c in fix_keep if c in team_fix.columns]
+    fix_small = (team_fix[fix_keep]
+                 .dropna(subset=[gw_key_t,"team_id"])
+                 .drop_duplicates()
+                 .rename(columns={gw_key_t: gw_key_m}))
+    fut = fut.merge(
+        fix_small,
+        how="left",
+        on=["season","team_id", gw_key_m],
+        validate="many_to_one",
+        suffixes=("", "_fix")
+    )
+    # Derive 'opponent' if not provided
+    if "opponent" not in fut.columns or fut["opponent"].isna().all():
+        if {"home","away","is_home"}.issubset(fut.columns):
+            ih = pd.to_numeric(fut["is_home"], errors="coerce").fillna(0).astype(int)
+            fut["opponent"] = np.where(ih == 1, fut.get("away"), fut.get("home"))
+
+    # --- p60: prefer columns; else fallback from E[min] ---
+    if "prob_played60_use" not in fut.columns:
+        p60_col = None
+        for c in ("prob_played60_cal","prob_played60_raw","prob_played60","p60"):
+            if c in fut.columns:
+                p60_col = c; break
+        if p60_col is None:
+            fut["prob_played60_use"] = np.clip((pd.to_numeric(fut["pred_minutes"], errors="coerce") - 30.0) / 60.0, 0.0, 1.0)
+        else:
+            fut["prob_played60_use"] = pd.to_numeric(fut[p60_col], errors="coerce")
+            miss = fut["prob_played60_use"].isna()
+            if miss.any():
+                fut.loc[miss, "prob_played60_use"] = np.clip((pd.to_numeric(fut.loc[miss,"pred_minutes"], errors="coerce") - 30.0) / 60.0, 0.0, 1.0)
 
     # Player CS probability
     fut["prob_cs"] = pd.to_numeric(fut["p_teamCS"], errors="coerce") * pd.to_numeric(fut["prob_played60_use"], errors="coerce")
@@ -675,64 +814,99 @@ def main():
         p_s = _poisson_tail_prob_vec(np.where(np.isfinite(lam_s), lam_s, 0.0), k_s)
         p_b = _poisson_tail_prob_vec(np.where(np.isfinite(lam_b), lam_b, 0.0), k_b)
 
-        # Mixture probability and mixture mean
         prob_dcp = ps * p_s + (1.0 - ps) * pc * p_b
         expected_dc = ps * lam_s + (1.0 - ps) * pc * lam_b
         lam_match = ps * lam_s + (1.0 - ps) * pc * lam_b
-
     else:
         lam_match = lam90 * (m_pred / 90.0)
         k_match = _k_from_minutes(pos, m_pred)
         prob_dcp = _poisson_tail_prob_vec(np.where(np.isfinite(lam_match), lam_match, 0.0), k_match)
         expected_dc = lam_match
 
-    # Respect GK policy
     if not args.include_gk_dcp:
         gk_mask = (pos == "GK")
         prob_dcp[gk_mask] = np.nan
         expected_dc[gk_mask] = np.nan
         lam_match[gk_mask] = np.nan
 
-    # --- Assemble output ---
-    out_cols = {
-        "season": fut["season"].values,
-        # Output column must be named gw_orig, but we DO NOT rename in-frame to avoid duplicates
-        "gw_orig": pd.to_numeric(fut[gw_key_m], errors="coerce").values,
-        "date_sched": fut["date_sched"].values,
-        "player_id": fut["player_id"].values,
-        "team_id": fut.get("team_id", pd.Series([np.nan]*len(fut))).values,
-        "player": fut.get("player", pd.Series([np.nan]*len(fut))).values,
-        "pos": fut["pos"].values,
-        "pred_minutes": fut["pred_minutes"].values,
-        "prob_played60_use": fut["prob_played60_use"].values,
-        # context (handy for downstream QA)
-        "team_att_z_venue": fut.get("team_att_z_venue", pd.Series([np.nan]*len(fut))).values,
-        "team_def_xga_venue": fut.get("team_def_xga_venue", pd.Series([np.nan]*len(fut))).values,
-        "team_def_xga_venue_z": fut.get("team_def_xga_venue_z", pd.Series([np.nan]*len(fut))).values,
-        "team_possession_venue": fut.get("team_possession_venue", pd.Series([np.nan]*len(fut))).values,
-        "opp_att_z_venue": fut.get("opp_att_z_venue", pd.Series([np.nan]*len(fut))).values,
-        "fdr": fut.get("fdr", pd.Series([np.nan]*len(fut))).values,
-        "venue_bin": fut.get("venue_bin", pd.Series([np.nan]*len(fut))).values,
-        # outputs
-        "p_teamCS": fut["p_teamCS"].values,
-        "prob_cs": fut["prob_cs"].values,
-        "lambda90": lam90,
-        "expected_dc": expected_dc,
-        "prob_dcp": prob_dcp,
-        "exp_gc": fut.get("exp_gc_team", pd.Series([np.nan]*len(fut))).values,  # NEW
-    }
-    out = pd.DataFrame(out_cols)
+    # ---------------------- Assemble output (legacy metadata first) ----------------------
+    def pick_col(df: pd.DataFrame, *names: str):
+        for n in names:
+            if n in df.columns:
+                return df[n].values
+        return np.full(len(df), np.nan, dtype=object)
+
+    opponent_id_vals    = pick_col(fut, "opponent_id", "opp_team_id", "opp_id")
+    opponent_name_vals  = pick_col(fut, "opponent", "opp_team", "opp_name")
+    game_id_vals        = pick_col(fut, "fbref_id", "fixture_id", "game_id")
+    team_name_vals      = pick_col(fut, "team", "team_name", "team_short", "team_long")
+
+    gw_played_vals = pd.to_numeric(fut.get("gw_played", np.nan), errors="coerce").values
+    gw_orig_vals   = pd.to_numeric(fut.get(gw_key_m, np.nan), errors="coerce").values
+
+    out = pd.DataFrame({
+        # --- Legacy/fixture metadata (match minutes & GA) ---
+        "season":            fut["season"].values,
+        "gw_played":         gw_played_vals,
+        "gw_orig":           gw_orig_vals,
+        "date_sched":        pd.to_datetime(fut["date_sched"], errors="coerce").dt.normalize().values,
+        "game_id":           game_id_vals,
+        "team_id":           fut.get("team_id", pd.Series([np.nan]*len(fut))).astype(str).values,
+        "team":              team_name_vals,
+        "opponent_id":       opponent_id_vals,
+        "opponent":          opponent_name_vals,
+        "is_home":           pd.to_numeric(fut.get("is_home", np.nan), errors="coerce").fillna(0).astype(int).values,
+
+        # --- Player context ---
+        "player_id":         fut["player_id"].astype(str).values,
+        "player":            fut.get("player", pd.Series([np.nan]*len(fut))).values,
+        "pos":               fut["pos"].astype(str).values,
+        "fdr":               pd.to_numeric(fut.get("fdr", np.nan), errors="coerce").values,
+        "venue_bin":         pd.to_numeric(fut.get("venue_bin", np.nan), errors="coerce").values,
+
+        # --- Team defense heads & player CS ---
+        "p_teamCS":          pd.to_numeric(fut["p_teamCS"], errors="coerce").clip(0,1).values,
+        "prob_cs":           pd.to_numeric(fut["prob_cs"], errors="coerce").clip(0,1).values,
+
+        # --- DCP heads ---
+        "lambda90":          lam90,
+        "expected_dc":       expected_dc,
+        "prob_dcp":          prob_dcp,
+
+        # --- Team exp GC repeated per player ---
+        "exp_gc":            pd.to_numeric(fut.get("exp_gc_team", np.nan), errors="coerce").values,
+    })
+
     if args.dump_lambdas:
         out["lambda_match"] = lam_match
 
+    # Stable order (meta → player/gates → preds)
+    desired_order = [
+        "season","gw_played","gw_orig","date_sched","game_id",
+        "team_id","team","opponent_id","opponent","is_home",
+        "player_id","player","pos","fdr","venue_bin",
+        "p_teamCS","prob_cs",
+        "lambda90","expected_dc","prob_dcp",
+        "exp_gc","lambda_match"
+    ]
+    keep_cols = [c for c in desired_order if c in out.columns]
+    out = out[keep_cols].copy()
+
+    # sort, write
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in out.columns]
     if sort_keys:
-        out = out.sort_values(sort_keys).reset_index(drop=True)
+        out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
 
-    season_dir.mkdir(parents=True, exist_ok=True)
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
-    out_path = season_dir / f"GW{gw_from_eff}_{gw_to_eff}.csv"
-    out.to_csv(out_path, index=False)
+    out_paths = _def_out_paths(
+        base_dir=args.out_dir,
+        season=args.future_season,
+        gw_from=gw_from_eff,
+        gw_to=gw_to_eff,
+        zero_pad=args.zero_pad_filenames,
+        out_format=args.out_format,
+    )
+    written_paths = _write_def(out, out_paths)
 
     diag = {
         "rows": int(len(out)),
@@ -741,9 +915,10 @@ def main():
         "available_gws": [int(x) for x in avail_gws],
         "scored_gws": [int(x) for x in target_gws],
         "as_of": str(as_of_ts),
-        "out": str(out_path),
+        "minutes_in": str(minutes_path),
+        "out": written_paths,
         "has_iso_cs": bool(iso_cs is not None),
-        "has_gc": bool(gc_model is not None),              # NEW
+        "has_gc": bool(gc_model is not None),
         "dcp_models": list(dcp_models.keys()),
         "mixture_used": bool(have_mix),
         "roster_gate": {
