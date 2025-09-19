@@ -1,4 +1,4 @@
-#clean_and_enrich.py
+# clean_and_enrich.py
 from __future__ import annotations
 
 import argparse
@@ -89,6 +89,40 @@ def write_csv_utf8(p: Path, df: pd.DataFrame) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(p, index=False, encoding="utf-8")
 
+# ───────────────────────── Season selection helpers ─────────────────────────
+
+def _season_sort_key(p: Path) -> tuple[int, str]:
+    """
+    Sort directories by starting year when they look like seasons.
+    Accepts 'YYYY-YY' or 'YYYY-YYYY'. Unknown formats come first.
+    """
+    name = p.name
+    longf = season_longform(name)
+    m = re.match(r"^(\d{4})-(\d{4})$", longf)
+    if m:
+        return (int(m.group(1)), longf)
+    return (-1, name)
+
+def _looks_like_season(name: str) -> bool:
+    # allow 2-2, 4-2, 4-4 patterns
+    return re.fullmatch(r"\d{2,4}-\d{2,4}", name) is not None
+
+def _match_season_dir(all_dirs: List[Path], sel: str) -> Optional[Path]:
+    """
+    Try to match 'sel' against directory names using both short/long forms.
+    """
+    target_long = season_longform(sel)
+    target_short = season_shortform(target_long)
+    # direct name match first
+    for d in all_dirs:
+        if d.name == target_long or d.name == target_short:
+            return d
+    # compare longform of dir names
+    for d in all_dirs:
+        if season_longform(d.name) == target_long:
+            return d
+    return None
+
 # ───────────────────────── Master & overrides ─────────────────────────
 
 def load_fbref_master(master_path: Path) -> Tuple[Dict[str, dict], Dict[str, str]]:
@@ -151,8 +185,6 @@ def _token_variants(key: str) -> List[str]:
         vs.append(f"{toks[0]} {toks[-1]}")            # first + last
         vs.append(" ".join(toks[1:]))                 # drop first
         vs.append(" ".join(toks[:-1]))                # drop last
-    # "last, first" → "first last" handled at canonical() time if commas removed,
-    # but if raw contained a comma, canonical would have removed it. Variants cover enough.
     return list(dict.fromkeys(vs))
 
 def _fuzzy_best(name: str, keys: List[str], threshold: int) -> Optional[str]:
@@ -341,13 +373,23 @@ def enrich_season(season_dir: Path,
 # ───────────────────────── CLI ─────────────────────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Enrich FPL season players with FBref metadata (names are FBref canonical).")
-    ap.add_argument("--raw-root", type=Path, required=True, help="Processed FPL root with <season>/season/cleaned_players.csv")
-    ap.add_argument("--proc-root", type=Path, required=True, help="Output root (usually same as --raw-root)")
-    ap.add_argument("--fbref-master", type=Path, required=True, help="FBref master players JSON (source of truth)")
-    ap.add_argument("--overrides", type=Path, default=None, help="Manual overrides JSON (e.g., 'first | last': 'pid')")
-    ap.add_argument("--threshold", type=int, default=85, help="Fuzzy minimum (0-100)")
-    ap.add_argument("--fail-if-unmatched", type=float, default=10.0, help="Fail run if unmatched percentage exceeds this value")
+    ap = argparse.ArgumentParser(
+        description="Enrich FPL season players with FBref metadata (names are FBref canonical)."
+    )
+    ap.add_argument("--raw-root", type=Path, required=True,
+                    help="Processed FPL root with <season>/season/cleaned_players.csv")
+    ap.add_argument("--proc-root", type=Path, required=True,
+                    help="Output root (usually same as --raw-root)")
+    ap.add_argument("--fbref-master", type=Path, required=True,
+                    help="FBref master players JSON (source of truth)")
+    ap.add_argument("--overrides", type=Path, default=None,
+                    help="Manual overrides JSON (e.g., 'first | last': 'pid')")
+    ap.add_argument("--threshold", type=int, default=85,
+                    help="Fuzzy minimum (0-100)")
+    ap.add_argument("--fail-if-unmatched", type=float, default=10.0,
+                    help="Fail run if unmatched percentage exceeds this value")
+    ap.add_argument("--season", type=str, default="all",
+                    help="Which season to process: 'all' (default), 'latest', or a specific season like '2025-26'/'2025-2026'")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
 
@@ -360,10 +402,33 @@ def main() -> None:
     pid2rec, key2pid = load_fbref_master(args.fbref_master)
     overrides = load_overrides(args.overrides)
 
-    seasons = [d for d in sorted(args.raw_root.iterdir()) if d.is_dir()]
-    if not seasons:
-        logging.warning("No seasons under %s", args.raw_root)
+    # Discover available season directories under --raw-root
+    if not args.raw_root.exists():
+        raise SystemExit(f"--raw-root does not exist: {args.raw_root}")
+
+    all_dirs = [d for d in args.raw_root.iterdir() if d.is_dir()]
+    season_dirs = [d for d in all_dirs if _looks_like_season(d.name)]
+    season_dirs = sorted(season_dirs, key=_season_sort_key)
+
+    if not season_dirs:
+        logging.warning("No season-like folders under %s", args.raw_root)
         return
+
+    sel = (args.season or "all").strip().lower()
+    if sel == "all":
+        seasons = season_dirs
+    elif sel == "latest":
+        seasons = [season_dirs[-1]]
+    else:
+        match = _match_season_dir(season_dirs, args.season.strip())
+        if not match:
+            raise SystemExit(
+                f"Requested season {args.season!r} not found under {args.raw_root}. "
+                f"Available: {[d.name for d in season_dirs]}"
+            )
+        seasons = [match]
+
+    logging.info("Processing season folder(s): %s", [d.name for d in seasons])
 
     for season_dir in seasons:
         logging.info("Season %s …", season_dir.name)
