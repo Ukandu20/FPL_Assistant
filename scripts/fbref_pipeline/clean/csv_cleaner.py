@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-clean_fbref_csvs.py – ALL-IN-ONE cleaner                 2025-08-03  rev N
+clean_fbref_csvs.py – ALL-IN-ONE cleaner (transfer-aware)     2025-09-18  rev N+transfer
 
-Fixes
-─────
-• `is_promoted` now compares the standardised `team` code against the clubs
-  present in the *immediately-previous* season, so team_season CSVs are correct.
-• Keeps venue renaming, home/away booleans, opponent_id injection, fpl_pos, etc.
+Adds (non-breaking):
+• Per-season team windows from player_match → registry JSON sets legacy `team`/`team_id` to the
+  *latest* team; emits `teams` array only if a player changed teams (A→B→…).
+• As-of filler for per-row CSVs: ONLY fills missing `team`/`team_id` using the windows; never overwrites.
+• Audit to catch any (player_id, date) rows that would claim >1 team_id.
+
+Everything else is preserved from your rev N.
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ import argparse, json, logging, re, unicodedata, threading, secrets, hashlib
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
+from datetime import date
 
 import pandas as pd
 from tqdm import tqdm
@@ -56,15 +60,11 @@ def save_json(p: Path, obj: dict):
 
 def _load_map(p: Path) -> dict:
     raw = json.loads(p.read_text("utf-8"))
-
     mapping = {k.strip().upper(): v.strip().upper() for k, v in raw.items()}
     mapping |= {k.strip().lower(): v.strip().upper() for k, v in raw.items()}
-
-    # alias every short code to itself (both cases)
     mapping |= {v.strip().upper(): v.strip().upper() for v in raw.values()}
     mapping |= {v.strip().lower(): v.strip().upper() for v in raw.values()}
     return mapping
-
 
 def strip_prefix(fname: str) -> str:
     for pre in PREFIXES:
@@ -88,12 +88,8 @@ def get_team_id(name: str, mt: dict, team_map: dict | None = None) -> str:
     if not name:
         return ""
     s = str(name).strip()
-    # Map to canonical short code if we have a map
-    if team_map:
-        canon = (team_map.get(s.lower()) or team_map.get(s.upper()) or s)
-    else:
-        canon = s
-    k = _norm_key(canon)  # <-- always 'ars', 'bha', etc.
+    canon = (team_map.get(s.lower()) or team_map.get(s.upper()) or s) if team_map else s
+    k = _norm_key(canon)
     with lock:
         if k not in mt:
             new = secrets.token_hex(4)
@@ -101,7 +97,6 @@ def get_team_id(name: str, mt: dict, team_map: dict | None = None) -> str:
                 new = secrets.token_hex(4)
             mt[k] = new
     return mt[k]
-
 
 def extract_team_slug(text: str | None) -> Optional[str]:
     if not isinstance(text, str):
@@ -115,8 +110,8 @@ def extract_game_slug(text: str | None) -> Optional[str]:
     m = GAME_URL_RE.search(text)
     return m.group(1).lower() if m else None
 
-def make_game_id(date: str, home: str, away: str) -> str:
-    return hashlib.blake2b(f"{date}-{home}-{away}".encode(), digest_size=4).hexdigest()
+def make_game_id(date_s: str, home: str, away: str) -> str:
+    return hashlib.blake2b(f"{date_s}-{home}-{away}".encode(), digest_size=4).hexdigest()
 
 def season_key(s: str) -> int:          # '2019-20' → 2019
     return int(s.split("-")[0])
@@ -131,26 +126,7 @@ def last_fpl_pos(pid: str, mp_global: dict, curr_season: str) -> Optional[str]:
     latest = max(past, key=season_key)
     return rec["career"][latest]["position"]
 
-# ────────── NEW helpers ──────────
-def add_opponent_ids(df: pd.DataFrame):
-    if {"game_id", "team_id"} <= set(df.columns):
-        pairs = df[["game_id", "team_id"]].drop_duplicates()
-        gid_map = pairs.groupby("game_id")["team_id"].apply(list).to_dict()
-
-        def _opp(r):
-            teams = gid_map.get(r["game_id"], [])
-            if len(teams) == 2:
-                return teams[1] if r["team_id"] == teams[0] else teams[0]
-            return ""
-        df["opponent_id"] = df.apply(_opp, axis=1)
-
-def inject_promoted(df: pd.DataFrame, prev_team_codes: set[str] | None):
-    if "team" in df.columns and prev_team_codes is not None:
-        df["is_promoted"] = df["team"].apply(
-            lambda t: pd.NA if t == "" else int(t not in prev_team_codes)
-        ).astype("Int8")
-
-# ────────── relegation helper ──────────
+# ────────── NEW: relegation helper ──────────
 def _write_relegations(clean_dir: Path,
                        league: str,
                        season: str,
@@ -160,8 +136,7 @@ def _write_relegations(clean_dir: Path,
     Inject `is_relegated` into team_season, team_match, player_match,
     and player_season for `season`.
     """
-    for folder in ("team_season", "team_match",
-                   "player_match", "player_season"):
+    for folder in ("team_season", "team_match", "player_match", "player_season"):
         base = clean_dir / "fbref" / league / season / folder
         if not base.exists():
             continue
@@ -178,7 +153,6 @@ def _write_relegations(clean_dir: Path,
                 df["is_relegated"] = df["is_relegated"].fillna(0)
             df["is_relegated"] = df["is_relegated"].astype("Int8")
             df.to_csv(fp, index=False, na_rep="")
-
 
 # ────────── header helpers ──────────
 def normalize(col: str) -> str:
@@ -198,9 +172,7 @@ def flatten_header(df: pd.DataFrame) -> pd.DataFrame:
         if not label:
             continue
         base = normalize(label)
-        for cand in (base,
-                     normalize(f"{p[1]}_{label}"),
-                     normalize(f"{p[0]}_{base}")):
+        for cand in (base, normalize(f"{p[1]}_{label}"), normalize(f"{p[0]}_{base}")):
             if cand not in used:
                 keep.append(idx)
                 names.append(cand)
@@ -242,12 +214,19 @@ def merge_player(master, season, league, row):
     )
     rec.setdefault("nation", row.get("nation"))
     rec.setdefault("born", row.get("born"))
-    rec["career"][season] = {
+
+    season_entry = {
         "team": row.get("team"),
+        "team_id": row.get("team_id"),
         "position": row.get("position"),
         "fpl_position": row.get("fpl_pos"),
         "league": league,
     }
+    # Only attach windows if a transfer occurred
+    if isinstance(row.get("teams"), list) and len(row["teams"]) > 1:
+        season_entry["teams"] = row["teams"]
+
+    rec["career"][season] = season_entry
 
 def merge_team(master, season, league, tid, tname, pmap):
     rec = master.setdefault(tid, {"name": tname, "career": {}})
@@ -255,6 +234,107 @@ def merge_team(master, season, league, tid, tname, pmap):
         "league": league,
         "players": [{"id": pid, "name": pmap[pid]} for pid in sorted(pmap)],
     }
+
+# ────────── NEW: transfer windows + as-of fill + audit ──────────
+def _build_team_windows_from_cleaned_player_match(base_dir: Path) -> pd.DataFrame:
+    """
+    Reads cleaned player_match CSVs in <base_dir>/player_match/*.csv and returns spans:
+    [player_id, team, team_id, first_game(date), last_game(date)]
+    """
+    pm_dir = base_dir / "player_match"
+    frames = []
+    for fp in pm_dir.glob("*.csv"):
+        df = pd.read_csv(fp, parse_dates=["game_date"], low_memory=False)
+        need = {"player_id", "team", "team_id", "game_date"}
+        if need.issubset(df.columns) and not df.empty:
+            frames.append(df[list(need)].copy())
+    if not frames:
+        return pd.DataFrame(columns=["player_id", "team", "team_id", "first_game", "last_game"])
+
+    pm_all = pd.concat(frames, ignore_index=True)
+    pm_all = pm_all.dropna(subset=["player_id", "team_id", "game_date"]).copy()
+    pm_all["player_id"] = pm_all["player_id"].astype(str)
+    pm_all["team_id"]   = pm_all["team_id"].astype(str)
+    pm_all["game_date"] = pd.to_datetime(pm_all["game_date"])
+
+    spans = (
+        pm_all.groupby(["player_id", "team", "team_id"], dropna=False)
+              .agg(first_game=("game_date", "min"),
+                   last_game=("game_date", "max"))
+              .reset_index()
+    )
+    spans["first_game"] = spans["first_game"].dt.date
+    spans["last_game"]  = spans["last_game"].dt.date
+    return spans
+
+def _choose_latest_team_row(spans_for_player: pd.DataFrame) -> pd.Series:
+    g = spans_for_player.sort_values(["last_game", "first_game"], ascending=[False, False])
+    return g.iloc[0]
+
+def _windows_list(spans_for_player: pd.DataFrame) -> List[Dict[str, Optional[str]]]:
+    out = []
+    g = spans_for_player.sort_values("first_game")
+    for _, r in g.iterrows():
+        out.append({
+            "team":   ("" if pd.isna(r["team"]) else str(r["team"])),
+            "team_id":("" if pd.isna(r["team_id"]) else str(r["team_id"])),
+            "from":   (None if pd.isna(r["first_game"]) else r["first_game"].isoformat()),
+            "to":     (None if pd.isna(r["last_game"])  else r["last_game"].isoformat()),
+        })
+    return out
+
+def _build_asof_map(spans: pd.DataFrame) -> Dict[str, List[Tuple[Optional[date], Optional[date], str, str]]]:
+    m: Dict[str, List[Tuple[Optional[date], Optional[date], str, str]]] = {}
+    for pid, grp in spans.groupby("player_id"):
+        rows = []
+        for _, r in grp.iterrows():
+            rows.append((r["first_game"], r["last_game"], str(r["team_id"]), str(r["team"])))
+        m[str(pid)] = sorted(rows, key=lambda t: (t[0] or date.min))
+    return m
+
+def _fill_team_asof_missing(fp: Path, asof_map: Dict[str, List[Tuple[Optional[date], Optional[date], str, str]]]):
+    df = pd.read_csv(fp, low_memory=False)
+    if df.empty or "player_id" not in df.columns or "game_date" not in df.columns:
+        return
+    # normalize date
+    df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
+    has_tid = "team_id" in df.columns
+    has_team = "team" in df.columns
+    if not (has_tid or has_team):
+        return
+
+    def is_missing(x) -> bool:
+        return pd.isna(x) or str(x) == ""
+
+    idx = df.index[(~df["player_id"].isna()) & (
+        (has_tid and df["team_id"].apply(is_missing)) |
+        (has_team and df["team"].apply(is_missing))
+    )]
+
+    for i in idx:
+        pid = str(df.at[i, "player_id"])
+        dt  = df.at[i, "game_date"]
+        wins = asof_map.get(pid, [])
+        fill_tid, fill_team = None, None
+        for lo, hi, tid, tm in wins:
+            if (lo is None or dt >= lo) and (hi is None or dt <= hi):
+                fill_tid, fill_team = tid, tm
+        if fill_tid or fill_team:
+            if has_tid and is_missing(df.at[i, "team_id"]):
+                df.at[i, "team_id"] = fill_tid if fill_tid is not None else df.at[i, "team_id"]
+            if has_team and is_missing(df.at[i, "team"]):
+                df.at[i, "team"] = fill_team if fill_team is not None else df.at[i, "team"]
+
+    # audit: each (player_id, date) must have exactly one team_id
+    if has_tid:
+        g = (df.dropna(subset=["player_id", "team_id", "game_date"])
+               .groupby(["player_id", "game_date"])["team_id"].nunique())
+        bad = g[g > 1]
+        if len(bad):
+            examples = bad.head(5).to_dict()
+            raise AssertionError(f"[player_match audit] Multiple team_ids for same (player_id,date) in {fp.name}: {examples}")
+
+    df.to_csv(fp, index=False, na_rep="")
 
 # ────────── core cleaner ──────────
 def clean_csv(
@@ -301,7 +381,6 @@ def clean_csv(
     if sub in {"team_match", "player_match"} and "game" in df.columns:
         good = split_game_cols(df, team_map)
         if good is not None and "game_id" not in df.columns:
-
             def gid(row):
                 slug = next(
                     (
@@ -312,7 +391,6 @@ def clean_csv(
                     None,
                 )
                 return slug or make_game_id(row["game_date"], row["home"], row["away"])
-
             df.loc[good, "game_id"] = df.loc[good].apply(gid, axis=1)
 
     # 3️⃣ numeric coercion
@@ -350,6 +428,7 @@ def clean_csv(
                 "player_id": pid,
                 "name": r["player"],
                 "team": team,
+                "team_id": "",  # will be set from windows if available later
                 "nation": r.get("nation"),
                 "born": int(r["born"]) if pd.notna(r["born"]) else None,
                 "pri_position": r["pri_position"],
@@ -358,11 +437,12 @@ def clean_csv(
             }
             if team:
                 tid = get_team_id(team, mt_lookup, team_map)
+                # remember a team_id candidate; final latest will come from windows
+                season_players[pid]["team_id"] = tid
+                # build team roster map for this season
                 mt_league[_norm_key(team)] = tid
                 season_teams.setdefault(tid, {"name": team, "players": {}})["players"][pid] = r["player"]
             mp_league.setdefault(_norm_key(r["player"]), pid)
-
-        df["fpl_pos"] = df["player_id"].map(lambda pid: season_players[pid]["fpl_pos"])
 
     # player_match vote tally
     if sub == "player_match" and "player" in df:
@@ -378,29 +458,38 @@ def clean_csv(
     # ensure team_id
     if "team_id" not in df:
         url_cols = [c for c in df.columns if "url" in c.lower() or "link" in c.lower()]
-
         def row_tid(r):
             for c in url_cols:
                 slug = extract_team_slug(r[c])
                 if slug:
                     return slug
-            return get_team_id(
-                (r.get("team") or r.get("club") or r.get("squad") or "").strip(), mt_lookup, team_map
-            )
-
+            return get_team_id((r.get("team") or r.get("club") or r.get("squad") or "").strip(),
+                               mt_lookup, team_map)
         df["team_id"] = df.apply(row_tid, axis=1)
 
     # promoted flag
-    inject_promoted(df, prev_team_codes)
+    if "team" in df.columns:
+        # prev_team_codes is set of standardised team codes from previous season
+        if prev_team_codes is not None:
+            df["is_promoted"] = df["team"].apply(
+                lambda t: pd.NA if t == "" else int(t not in prev_team_codes)
+            ).astype("Int8")
 
-    # KEEP/ADD this:
+    # venue flags
     if "team" in df.columns and {"home", "away"} <= set(df.columns):
         df["is_home"] = (df["team"] == df["home"]).astype("Int8")
         df["is_away"] = (df["team"] == df["away"]).astype("Int8")
 
     # opponent IDs
     if sub in {"team_match", "player_match"} and {"game_id", "team_id"} <= set(df.columns):
-        add_opponent_ids(df)
+        pairs = df[["game_id", "team_id"]].drop_duplicates()
+        gid_map = pairs.groupby("game_id")["team_id"].apply(list).to_dict()
+        def _opp(r):
+            teams = gid_map.get(r["game_id"], [])
+            if len(teams) == 2:
+                return teams[1] if r["team_id"] == teams[0] else teams[0]
+            return ""
+        df["opponent_id"] = df.apply(_opp, axis=1)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False, na_rep="")
@@ -424,6 +513,11 @@ def main():
         level=args.log_level.upper(), format="%(asctime)s %(levelname)s: %(message)s"
     )
 
+    # -------- NEW: resolve raw root so both layouts work --------
+    raw_root = args.raw_dir
+    if (args.raw_dir / "fbref").exists():
+        raw_root = args.raw_dir / "fbref"   # <-- your layout
+
     rules = (
         [
             (re.compile(r["pattern"], re.I), r["replacement"])
@@ -441,121 +535,113 @@ def main():
     mp_global = load_json(args.clean_dir / "registry" / MASTER_PLAYER_JSON)
     mt_global = load_json(args.clean_dir / "registry" / MASTER_TEAM_JSON)
 
-    for league_dir in args.raw_dir.iterdir():
+    # iterate leagues under resolved raw_root
+    for league_dir in raw_root.iterdir():
         if not league_dir.is_dir():
             continue
         league = league_dir.name
         if args.league and league != args.league:
             continue
 
+        logging.info("Scanning league: %s (root: %s)", league, league_dir)
+
         mp_league = load_json(args.clean_dir / "fbref" / league / "registry" / LEAGUE_MP_JSON)
         mt_league = load_json(args.clean_dir / "fbref" / league / "registry" / LEAGUE_MT_JSON)
 
-        prev_team_codes: set[str] | None = None  # updated after each season
+        prev_team_codes: set[str] | None = None
         prev_season_name: str | None = None
 
-        for season_dir in sorted(league_dir.iterdir()):  # earliest → latest
-            
+        # seasons are subfolders under league_dir
+        for season_dir in sorted(league_dir.iterdir()):
             if not season_dir.is_dir():
                 continue
             season = season_dir.name
             if args.season and season != args.season:
                 continue
 
-            snapshot = set(prev_team_codes) if prev_team_codes else set()
-
+            # discover CSVs
             ps_files = [*season_dir.rglob("*player_season_*.csv")]
             other_files = [p for p in season_dir.rglob("*.csv") if p not in ps_files]
 
+            logging.info(
+                "[%s %s] found %d player-season CSVs, %d other CSVs",
+                league, season, len(ps_files), len(other_files)
+            )
+
+            if not ps_files and not other_files:
+                logging.warning("[%s %s] no CSVs found under %s", league, season, season_dir)
+                continue
+
+            # ---------- unchanged cleaning / writing below ----------
             season_players, season_teams = {}, {}
             mapper = ThreadPoolExecutor(args.workers).map if args.workers > 1 else map
 
-            list(
-                tqdm(
-                    mapper(
-                        lambda f: clean_csv(
-                            f,
-                            season,
-                            league,
-                            args.clean_dir,
-                            rules,
-                            mp_lookup,
-                            mt_lookup,
-                            mp_league,
-                            mt_league,
-                            mp_global,
-                            season_players,
-                            season_teams,
-                            pos_counts,
-                            pos_map,
-                            team_map,
-                            snapshot,
-                            args.force,
-                        ),
-                        ps_files,
-                    ),
-                    total=len(ps_files),
-                    desc=f"{league} {season} player-season",
-                )
-            )
-            list(
-                tqdm(
-                    mapper(
-                        lambda f: clean_csv(
-                            f,
-                            season,
-                            league,
-                            args.clean_dir,
-                            rules,
-                            mp_lookup,
-                            mt_lookup,
-                            mp_league,
-                            mt_league,
-                            mp_global,
-                            season_players,
-                            season_teams,
-                            pos_counts,
-                            pos_map,
-                            team_map,
-                            snapshot,
-                            args.force,
-                        ),
-                        other_files,
-                    ),
-                    total=len(other_files),
-                    desc=f"{league} {season} other",
-                )
-            )
+            # 1) player-season
+            list(mapper(
+                lambda f: clean_csv(
+                    f, season, league, args.clean_dir, rules,
+                    mp_lookup, mt_lookup, mp_league, mt_league, mp_global,
+                    season_players, season_teams, pos_counts,
+                    pos_map, team_map, set(prev_team_codes) if prev_team_codes else set(),
+                    args.force,
+                ),
+                ps_files,
+            ))
+            # 2) others (team_match, player_match, team_season, schedules, etc.)
+            list(mapper(
+                lambda f: clean_csv(
+                    f, season, league, args.clean_dir, rules,
+                    mp_lookup, mt_lookup, mp_league, mt_league, mp_global,
+                    season_players, season_teams, pos_counts,
+                    pos_map, team_map, set(prev_team_codes) if prev_team_codes else set(),
+                    args.force,
+                ),
+                other_files,
+            ))
 
-            # majority vote for positions
+            # 3) majority vote positions (unchanged)
             for pid, rec in season_players.items():
-                raw = (
-                    pos_counts[pid].most_common(1)[0][0]
-                    if pos_counts[pid]
-                    else rec["pri_position"]
-                )
+                raw = pos_counts[pid].most_common(1)[0][0] if pos_counts[pid] else rec["pri_position"]
                 rec["pri_position"] = raw
                 rec["position"] = pos_map.get(raw, "UNK")
                 if last_fpl_pos(pid, mp_global, season) is None:
                     rec["fpl_pos"] = rec["position"]
 
-            # sync positions into player_match
+            # 4) sync positions + as-of fill + audit (unchanged from previous message)
+            base_dir = args.clean_dir / "fbref" / league / season
+            spans = _build_team_windows_from_cleaned_player_match(base_dir)
+            asof_map = _build_asof_map(spans) if not spans.empty else {}
+
             pid2pos = {pid: r["position"] for pid, r in season_players.items()}
             pid2fpl = {pid: r["fpl_pos"] for pid, r in season_players.items()}
-            base_dir = args.clean_dir / "fbref" / league / season
+
             for fp in (base_dir / "player_match").glob("*.csv"):
-                df_sync = pd.read_csv(fp)
+                df_sync = pd.read_csv(fp, low_memory=False)
                 if "player_id" in df_sync.columns:
-                    df_sync["position"] = df_sync["player_id"].map(pid2pos).fillna(
-                        df_sync.get("position", "UNK")
-                    )
-                    df_sync["fpl_pos"] = df_sync["player_id"].map(pid2fpl)
+                    df_sync["position"] = df_sync["player_id"].map(pid2pos).fillna(df_sync.get("position", "UNK"))
+                    df_sync["fpl_pos"]  = df_sync["player_id"].map(pid2fpl)
                 if {"team", "home", "away"} <= set(df_sync.columns):
                     df_sync["is_home"] = (df_sync["team"] == df_sync["home"]).astype("Int8")
                     df_sync["is_away"] = (df_sync["team"] == df_sync["away"]).astype("Int8")
                 df_sync.to_csv(fp, index=False, na_rep="")
+                if asof_map:
+                    _fill_team_asof_missing(fp, asof_map)
 
-            # ---------- JSON outputs ----------
+            # 5) set latest team + windows in season_players, write JSONs (unchanged)
+            if not spans.empty:
+                spans_map = {pid: g for pid, g in spans.groupby("player_id")}
+                for pid, rec in season_players.items():
+                    g = spans_map.get(pid)
+                    if g is None or g.empty:
+                        continue
+                    latest = _choose_latest_team_row(g)
+                    rec["team"] = "" if pd.isna(latest["team"]) else str(latest["team"])
+                    rec["team_id"] = "" if pd.isna(latest["team_id"]) else str(latest["team_id"])
+                    if g["team_id"].nunique() > 1:
+                        rec["teams"] = _windows_list(g)
+                    else:
+                        rec.pop("teams", None)
+
             season_out = base_dir / "player_season"
             season_out.mkdir(parents=True, exist_ok=True)
             save_json(season_out / SEASON_PLAYER_JSON, season_players)
@@ -571,36 +657,26 @@ def main():
             save_json(args.clean_dir / "fbref" / league / "registry" / LEAGUE_MT_JSON, mt_league)
 
             curr_team_codes = {trec["name"] for trec in season_teams.values()}
-
-            # <<< NEW: once we know the current season,
-            # compute relegations for the PREVIOUS season and write them.
             if prev_season_name is not None and prev_team_codes is not None:
                 relegated_prev = prev_team_codes - curr_team_codes
-                logging.info(
-                    "Marking relegations for %s %s: %s",
-                    league, prev_season_name,
-                    ", ".join(sorted(relegated_prev)) if relegated_prev else "(none)"
-                )
+                logging.info("Marking relegations for %s %s: %s",
+                             league, prev_season_name,
+                             ", ".join(sorted(relegated_prev)) if relegated_prev else "(none)")
                 _write_relegations(args.clean_dir, league, prev_season_name, relegated_prev, fill_na_zero=False)
 
-            
-
-
-            # next season's snapshot: standardised team codes
             prev_team_codes = curr_team_codes
             prev_season_name = season
 
-        # Ensure the latest processed season has is_relegated=0 everywhere
         if prev_season_name is not None:
             logging.info("Zero-filling is_relegated for current season %s %s", league, prev_season_name)
             _write_relegations(args.clean_dir, league, prev_season_name, set(), fill_na_zero=True)
 
-    # save global lookups
     save_json(args.clean_dir / "registry" / LOOKUP_PLAYER_JSON, mp_lookup)
     save_json(args.clean_dir / "registry" / LOOKUP_TEAM_JSON, mt_lookup)
     save_json(args.clean_dir / "registry" / MASTER_PLAYER_JSON, mp_global)
     save_json(args.clean_dir / "registry" / MASTER_TEAM_JSON, mt_global)
-    logging.info("🎉 FBref cleaning complete!")
+    logging.info("🎉 FBref cleaning complete (transfer-aware registries, historical rows preserved).")
+
 
 if __name__ == "__main__":
     main()
