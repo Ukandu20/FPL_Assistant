@@ -22,6 +22,8 @@ NEW:
 • Auto-name outputs from the GW window and dual writer (CSV/Parquet):
   - --out-format {csv,parquet,both} (default: csv)
   - --zero-pad-filenames to emit GW05_07 instead of GW5_7
+• Legacy metadata in output (sourced from fixture_calendar.csv):
+  - game_id (fbref_id), team, opponent_id, opponent
 """
 
 import argparse, json, logging
@@ -123,6 +125,9 @@ def load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFra
                 break
 
     tf["season"] = season
+    # ensure string team_id for stable joins
+    if "team_id" in tf.columns:
+        tf["team_id"] = tf["team_id"].astype(str)
     return tf
 
 def build_asof_squad(hist: pd.DataFrame, as_of_ts: pd.Timestamp, tz: str | None) -> pd.DataFrame:
@@ -415,6 +420,71 @@ def _write_minutes(out: pd.DataFrame, paths: List[Path]) -> List[str]:
             raise ValueError(f"Unsupported output extension: {p.suffix}")
     return written
 
+# ----------------------------- Legacy metadata attach (NEW) -------------------
+
+def _attach_legacy_meta(df_pred: pd.DataFrame, team_fix: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach legacy metadata to df_pred from team fixtures:
+      - game_id (fbref_id), team, opponent_id, opponent (home/away derived)
+    Join keys: (season, team_id, gw_key), where gw_key is gw_played>0 → gw_orig>0 → gw>0.
+    """
+    if df_pred.empty or team_fix.empty:
+        # Ensure columns exist even if empty
+        for col in ["fbref_id", "team", "opponent_id", "opponent"]:
+            if col not in df_pred.columns:
+                df_pred[col] = np.nan
+        return df_pred
+
+    df = df_pred.copy()
+
+    # normalize join keys
+    gw_df = _pick_gw_col(df.columns.tolist()) or "gw_orig"
+    gw_tf = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+
+    for c in [gw_df]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    tf = team_fix.copy()
+    for c in [gw_tf]:
+        if c in tf.columns:
+            tf[c] = pd.to_numeric(tf[c], errors="coerce")
+
+    if "team_id" in df.columns:
+        df["team_id"] = df["team_id"].astype(str)
+    if "team_id" in tf.columns:
+        tf["team_id"] = tf["team_id"].astype(str)
+
+    # select and rename for merge
+    keep = ["season", "team_id", gw_tf, "fbref_id", "team", "opponent_id", "is_home", "home", "away"]
+    keep = [c for c in keep if c in tf.columns]
+    tf_small = (tf[keep]
+                .dropna(subset=[gw_tf, "team_id"])
+                .drop_duplicates())
+    if gw_tf != gw_df:
+        tf_small = tf_small.rename(columns={gw_tf: gw_df})
+
+    merged = df.merge(
+        tf_small,
+        how="left",
+        on=["season", "team_id", gw_df],
+        validate="many_to_one",
+        copy=False,
+        suffixes=("", "_fix")
+    )
+
+    # Compute opponent if missing; prefer fixture names for team/opponent
+    if "opponent" not in merged.columns or merged["opponent"].isna().all():
+        if {"home", "away", "is_home"}.issubset(merged.columns):
+            ih = pd.to_numeric(merged["is_home"], errors="coerce").fillna(0).astype(int)
+            merged["opponent"] = np.where(ih == 1, merged.get("away"), merged.get("home"))
+
+    # Ensure columns exist
+    for col in ["fbref_id", "team", "opponent_id", "opponent"]:
+        if col not in merged.columns:
+            merged[col] = np.nan
+
+    return merged
+
 # ----------------------------- main ------------------------------------------
 
 def main():
@@ -494,7 +564,8 @@ def main():
                 else coerce_ts(args.as_of, args.as_of_tz))
 
     # If player future rows are missing for future season, synthesize from team fixtures
-    team_fix = load_team_fixtures(fix_root, args.future_season, args.team_fixtures_filenames if hasattr(args, "team_fixtures_filenames") else args.team_fixtures_filename)
+    team_fix = load_team_fixtures(fix_root, args.future_season,
+                                  args.team_fixtures_filenames if hasattr(args, "team_fixtures_filenames") else args.team_fixtures_filename)
     gwn_team = gw_coalesce_for_future(team_fix)
     avail_gws = sorted(pd.unique(gwn_team.dropna().astype(int)))
     target_gws = [g for g in avail_gws if g >= gw_from_req][:args.n_future]
@@ -614,6 +685,9 @@ def main():
     )
     if df_pred.empty:
         raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
+
+    # --------- NEW: attach legacy metadata (from team fixture calendar) ---------
+    df_pred = _attach_legacy_meta(df_pred, team_fix)
 
     # Bench caps from historical bench cameos (position)
     hist = df.loc[pre_asof_mask].copy()
@@ -781,9 +855,13 @@ def main():
     # Build output (metadata first, then predictions)
     out_cols = {
         "season": df_pred["season"].values,
+        "game_id": df_pred.get("fbref_id", pd.Series([np.nan]*len(df_pred))).values,
         "player_id": df_pred["player_id"].values,
         "player": df_pred.get("player", np.nan).values,
         "team_id": df_pred.get("team_id", np.nan).values,
+        "team": df_pred.get("team", pd.Series([np.nan]*len(df_pred))).values,
+        "opponent_id": df_pred.get("opponent_id", pd.Series([np.nan]*len(df_pred))).values,
+        "opponent": df_pred.get("opponent", pd.Series([np.nan]*len(df_pred))).values,
         "pos": df_pred["pos"].values,
         "date_sched": df_pred.get("date_sched", pd.NaT).values,
         "p_start": p_start, "p60": p60, "p_cameo": p_cameo, "p_play": p_play,
@@ -805,7 +883,7 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
 
-    # ---------- NEW: auto-name output + dual writer ----------
+    # ---------- auto-name output + dual writer ----------
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _out_paths(
         base_dir=out_dir,
