@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-points_forecast.py — upcoming fixtures — v1.7
+points_forecast.py — upcoming fixtures — v1.8 (output rev)
 
-What's new vs v1.6
-------------------
-• Auto-resolve inputs: you can provide roots (minutes/goals_assists/defense/saves),
-  a season and GW window, and the script will pick GW{from}_{to}.csv|parquet (zero-padded supported).
-• Dual loader: seamlessly reads CSV or Parquet for all inputs; date columns parsed/normalized.
-• Legacy metadata passthrough: carry team/opponent/opponent_id/is_home/fbref_id (game_id) into output,
-  preferring GA → MIN as fallback, with nearest-date ties resolved safely.
-• Zero padding & window helpers, without breaking existing explicit-path flags.
-
-v1.6 recap (unchanged)
+Output changes vs v1.7
 ----------------------
-• Probability-first GA/AST; minutes gating for saves; concede penalty included; DCP exposure, etc.
+• No versioned run folders. Writes GW-windowed files mirroring defense_forecast style:
+    <out-dir>/<FUTURE_SEASON>/GW{from}_{to}.csv|parquet   (zero-pad controlled by --zero-pad-filenames)
+• Select format via --out-format {csv,parquet,both}.
+• The cumulative stack file is now <out-dir>/expected_points.csv (used to be expected_points_merged.csv).
+• Artifacts (e.g., roster drop audits) go under <out-dir>/<FUTURE_SEASON>/artifacts.
+
+All scoring/math and inputs auto-resolve behaviors are unchanged.
 """
 
 from __future__ import annotations
@@ -25,36 +22,7 @@ from typing import List, Dict, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-SCHEMA_VERSION = "future.v1.7"
-
-# ───────────────────────── versioning & pointers ─────────────────────────
-
-def _resolve_version(base_dir: Path, requested: Optional[str], auto: bool) -> str:
-    base_dir.mkdir(parents=True, exist_ok=True)
-    if auto or not requested or requested.lower() == "auto":
-        existing = [p.name for p in base_dir.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)]
-        nxt = (max(int(s[1:]) for s in existing) + 1) if existing else 1
-        ver = f"v{nxt}"
-        logging.info("[version] auto -> %s", ver)
-        return ver
-    if re.fullmatch(r"v\d+", requested):
-        return requested
-    if requested.isdigit():
-        return f"v{requested}"
-    raise ValueError("--version must look like v3 (or use --auto-version)")
-
-def _write_latest_pointer(root: Path, version: str) -> None:
-    latest = root / "latest"
-    target = root / version
-    try:
-        if latest.exists() or latest.is_symlink():
-            try: latest.unlink()
-            except Exception: pass
-        os.symlink(target.name, latest, target_is_directory=True)
-        logging.info("[latest] symlink -> %s", version)
-    except (OSError, NotImplementedError):
-        (root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
-        logging.info("[latest] wrote LATEST_VERSION.txt -> %s", version)
+SCHEMA_VERSION = "future.v1.8"
 
 # ───────────────────────── IO & normalization ─────────────────────────
 
@@ -69,7 +37,6 @@ def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_datetime(df[c], errors="coerce")
     if "season" in df.columns:
         df["season"] = df["season"].astype(str)
-    # Don't coerce gw_orig to Int64 early—keep numeric and normalize later
     if "gw_orig" in df.columns:
         df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce")
     for c in ("player_id", "team_id"):
@@ -112,7 +79,7 @@ def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(tmp, index=False)
     os.replace(tmp, path)
 
-# ───────────────────────── GW window auto-resolve ─────────────────────────
+# ───────────────────────── GW window auto-resolve (inputs) ─────────────────────────
 
 def _fmt_gw(n: int, zero_pad: bool) -> str:
     return f"{int(n):02d}" if zero_pad else f"{int(n)}"
@@ -162,6 +129,7 @@ def _resolve_input_path(explicit: Optional[Path],
     )
 
 # ───────────────────────── math helpers (unchanged) ─────────────────────────
+# ... [unchanged helpers from your v1.7 script] ...
 
 def _round_for_output(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -242,6 +210,7 @@ def _poisson_sf_vectorized(lam: np.ndarray, k_threshold: int) -> np.ndarray:
     return np.clip(sf, 0.0, 1.0)
 
 # ───────────────────────── KEY & merge helpers ─────────────────────────
+# (unchanged; trimmed for brevity – identical to v1.7)
 
 def _pick_first_date_col(df: pd.DataFrame, prefs: tuple[str, ...]) -> str | None:
     for c in prefs:
@@ -289,6 +258,7 @@ def _merge_with_nearest_date(base: pd.DataFrame,
     return m.drop(columns=drop_cols)
 
 # ───────────────────────── roster gate helpers ─────────────────────────
+# (unchanged from v1.7)
 
 def _build_roster_keyset(teams_json: Optional[Path],
                          seasons: List[str],
@@ -346,7 +316,7 @@ def _apply_roster_gate(base: pd.DataFrame,
             raise RuntimeError(f"--require-on-roster set: {dropped} rows are not on the roster.")
     return base.loc[keep].copy()
 
-# ───────────────────────── merged writer ─────────────────────────
+# ───────────────────────── merged writer (renamed output) ─────────────────────────
 
 def _align_union_columns(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     all_cols = list(dict.fromkeys([*a.columns, *b.columns]))
@@ -375,8 +345,51 @@ def _update_merged_csv(new_df: pd.DataFrame,
             merged[c] = np.nan
     merged = merged.sort_values(by=[c for c in sort_cols if c in merged.columns])
     merged = _round_for_output(merged)
-    _atomic_write_csv(merged, merged_path)
+
+    # Write CSV atomically (date formatting to YYYY-MM-DD where possible)
+    if "date_sched" in merged.columns and pd.api.types.is_datetime64_any_dtype(merged["date_sched"]):
+        merged_csv = merged.copy()
+        merged_csv["date_sched"] = pd.to_datetime(merged_csv["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+        merged_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = merged_path.with_suffix(".csv.tmp")
+        merged_csv.to_csv(tmp, index=False)
+        os.replace(tmp, merged_path)
+    else:
+        _atomic_write_csv(merged, merged_path)
+
     logging.info("[merged] updated %s (rows=%d)", merged_path.resolve(), len(merged))
+
+# ───────────────────────── output helpers (mirror defense_forecast) ─────────────────────────
+
+def _out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
+               zero_pad: bool, out_format: str) -> List[Path]:
+    a = _fmt_gw(gw_from, zero_pad); b = _fmt_gw(gw_to, zero_pad)
+    season_dir = base_dir / str(season)
+    season_dir.mkdir(parents=True, exist_ok=True)
+    stem = season_dir / f"GW{a}_{b}"
+    if out_format == "csv":
+        return [Path(str(stem) + ".csv")]
+    if out_format == "parquet":
+        return [Path(str(stem) + ".parquet")]
+    return [Path(str(stem) + ".csv"), Path(str(stem) + ".parquet")]
+
+def _write_points(df: pd.DataFrame, paths: List[Path]) -> List[str]:
+    written: List[str] = []
+    for p in paths:
+        if p.suffix.lower() == ".csv":
+            tmp = df.copy()
+            if "date_sched" in tmp.columns:
+                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.to_csv(p, index=False)
+            written.append(str(p))
+        elif p.suffix.lower() == ".parquet":
+            p.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(p, index=False)
+            written.append(str(p))
+        else:
+            raise ValueError(f"Unsupported output extension: {p.suffix}")
+    return written
 
 # ───────────────────────── main ─────────────────────────
 
@@ -389,7 +402,7 @@ def main():
     ap.add_argument("--saves", type=Path, default=None, help="Explicit saves CSV/Parquet")
     ap.add_argument("--defense", type=Path, default=None, help="Explicit defense CSV/Parquet")
 
-    # NEW: Auto-resolve roots + window (optional if explicit files are given)
+    # Auto-resolve roots + window (optional if explicit files are given)
     ap.add_argument("--minutes-root", type=Path, help="Root dir for minutes (…/<season>/GWx_y.{csv,parquet})")
     ap.add_argument("--ga-root", type=Path, help="Root dir for goals_assists")
     ap.add_argument("--saves-root", type=Path, help="Root dir for saves")
@@ -398,13 +411,11 @@ def main():
     ap.add_argument("--future-season", type=str, help="Season for auto-resolve (e.g., 2025-2026)")
     ap.add_argument("--gw-from", type=int, help="GW window start (for auto-resolve)")
     ap.add_argument("--gw-to", type=int, help="GW window end (for auto-resolve)")
-    ap.add_argument("--zero-pad-filenames", action="store_true", help="Use GW05_07 instead of GW5_7 when resolving")
+    ap.add_argument("--zero-pad-filenames", action="store_true", help="Use GW05_07 instead of GW5_7 when resolving & writing")
 
-    # Output / version
+    # Output (mirrors defense_forecast): no versioning
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--version", type=str, default=None)
-    ap.add_argument("--auto-version", action="store_true")
-    ap.add_argument("--write-latest", action="store_true")
+    ap.add_argument("--out-format", choices=["csv","parquet","both"], default="csv")
 
     # Policy / roster
     ap.add_argument("--discipline-priors", type=str, default=None,
@@ -420,11 +431,9 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
                         format="%(levelname)s: %(message)s")
 
-    # Resolve version/dirs
-    version = _resolve_version(args.out_dir, args.version, args.auto_version)
-    out_dir = args.out_dir / version
-    out_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir = out_dir / "artifacts"
+    # Season output root (defense style)
+    season_dir = args.out_dir / f"{args.future_season}" if args.future_season else args.out_dir
+    artifacts_dir = season_dir / "artifacts"
 
     # ---- Resolve input files (explicit > auto-resolve) ----
     def res(tag, explicit, root):
@@ -489,17 +498,14 @@ def main():
     if base.empty:
         raise RuntimeError("No rows remain after roster gating.")
 
-    # Identity & legacy meta from GA first (best source), then MIN as fallback
-    # 1) From GA
+    # Identity & legacy meta from GA first, then MIN
     if ga_df is not None and len(ga_df):
         id_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time"]
         right = ga_df[KEY + [c for c in id_keep if c in ga_df.columns]]
         base = _merge_with_nearest_date(base, right, KEY, [c for c in id_keep if c in right.columns], tag="GA:identity+meta")
-    # 2) Fill any gaps from MIN
     fill_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time"]
     right2 = min_df[KEY + [c for c in fill_keep if c in min_df.columns]]
     base = _merge_with_nearest_date(base, right2, KEY, [c for c in fill_keep if c in right2.columns], tag="MIN:meta-fallback")
-
     for c in ("player","pos"):
         if c not in base.columns: base[c] = np.nan
 
@@ -514,19 +520,13 @@ def main():
         right = tmp[KEY + keep + [c for c in RIGHT_DATE_PREFS if c in tmp.columns]]
         base = _merge_with_nearest_date(base, right, KEY, keep, tag="GA:probs_means")
     else:
-        base["p_goal"] = np.nan
-        base["p_assist"] = np.nan
-        base["xg_mean"] = np.nan
-        base["xa_mean"] = np.nan
+        base["p_goal"] = np.nan; base["p_assist"] = np.nan; base["xg_mean"] = np.nan; base["xa_mean"] = np.nan
 
-    p_goal = pd.to_numeric(base.get("p_goal"), errors="coerce")
-    p_asst = pd.to_numeric(base.get("p_assist"), errors="coerce")
-    lam_goal = _lambda_from_p(p_goal)
-    lam_asst = _lambda_from_p(p_asst)
+    p_goal = pd.to_numeric(base.get("p_goal"), errors="coerce"); p_asst = pd.to_numeric(base.get("p_assist"), errors="coerce")
+    lam_goal = _lambda_from_p(p_goal); lam_asst = _lambda_from_p(p_asst)
     lam_goal = lam_goal.where(lam_goal.notna() & (lam_goal > 0), pd.to_numeric(base.get("xg_mean"), errors="coerce"))
     lam_asst = lam_asst.where(lam_asst.notna() & (lam_asst > 0), pd.to_numeric(base.get("xa_mean"), errors="coerce"))
-    lam_goal = lam_goal.fillna(0.0).clip(lower=0.0)
-    lam_asst = lam_asst.fillna(0.0).clip(lower=0.0)
+    lam_goal = lam_goal.fillna(0.0).clip(lower=0.0); lam_asst = lam_asst.fillna(0.0).clip(lower=0.0)
 
     # Defense signals (CS/GA + DCP)
     if def_df is not None and len(def_df):
@@ -534,19 +534,15 @@ def main():
         tmp["p_cs"]         = _select_prob_series(tmp, ["prob_cs","p_teamCS"])
         tmp["lambda90"]     = pd.to_numeric(tmp.get("lambda90", np.nan), errors="coerce")
         tmp["exp_gc"]       = pd.to_numeric(tmp.get("exp_gc",   np.nan), errors="coerce")
-        tmp["p_dcp"]     = _select_prob_series(tmp, ["prob_dcp","p_dcp","dcp_prob"])
+        tmp["p_dcp"]        = _select_prob_series(tmp, ["prob_dcp","p_dcp","dcp_prob"])
         tmp["lambda90_dcp"] = _choose_first_num(tmp, ["lambda90_dcp","dcp_lambda90","dcp_p90","lambda_dcp90"], default=np.nan)
-        tmp["exp_dc"]  = pd.to_numeric(tmp.get("expected_dc", np.nan), errors="coerce")
+        tmp["exp_dc"]       = pd.to_numeric(tmp.get("expected_dc", np.nan), errors="coerce")
         keep = ["p_cs","lambda90","exp_gc","p_dcp","lambda90_dcp","exp_dc"]
         right = tmp[KEY + keep + [c for c in RIGHT_DATE_PREFS if c in tmp.columns]]
         base = _merge_with_nearest_date(base, right, KEY, keep, tag="DEF")
     else:
-        base["p_cs"] = np.nan
-        base["lambda90"] = np.nan
-        base["exp_gc"] = np.nan
-        base["p_dcp"] = np.nan
-        base["lambda90_dcp"] = np.nan
-        base["exp_dc"] = np.nan
+        for c in ["p_cs","lambda90","exp_gc","p_dcp","lambda90_dcp","exp_dc"]:
+            base[c] = np.nan
 
     # Saves (GK) — prefer per-match λ; else per-90 scaled by minutes
     if sav_df is not None and len(sav_df):
@@ -571,7 +567,7 @@ def main():
     base["xp_appearance"] = pd.to_numeric(base.get("exp_minutes_points", np.nan), errors="coerce")
     base["xp_appearance"] = base["xp_appearance"].where(base["xp_appearance"].notna(), base["p1"] + base["p60"])
 
-    # Goals & assists EP (prob-first with fallback to means)
+    # Goals & assists EP
     goal_pts_vec = _pos_points_vector(base["pos"], kind="goal")
     base["xp_goals"]   = goal_pts_vec * lam_goal.to_numpy()
     base["xp_assists"] = 3.0 * lam_asst.to_numpy()
@@ -661,20 +657,15 @@ def main():
     if "date_sched" in base.columns:
         base["date_sched"] = pd.to_datetime(base["date_sched"], errors="coerce").dt.normalize()
 
-    # Output columns (place date_sched right after season; include legacy meta if present)
+    # Output columns
     out_cols = list(dict.fromkeys([
         *FORCED_KEY, "player", "pos",
-        # legacy meta (keep if available)
         "date_sched", "date_played", "kickoff_time",
         "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id",
-        # minutes/appearance
         "pred_minutes", "p1", "p60",
-        # GA/AST audit
         "p_goal", "p_assist", "xg_mean", "xa_mean",
-        # defense & dcp
         "team_prob_cs", "team_ga_lambda90", "team_exp_gc",
         "prob_dcp", "expected_dc",
-        # components
         "xp_appearance","xp_goals","xp_assists","xp_clean_sheets",
         "xp_concede_penalty","xp_saves_points","xp_discipline_prior","xp_dcp_bonus",
         "xPts",
@@ -690,14 +681,30 @@ def main():
     out = base[out_cols].copy().sort_values(by=sort_cols)
     out_rounded = _round_for_output(out)
 
-    # Write per-run (versioned)
-    fp = out_dir / "expected_points.csv"
-    _atomic_write_csv(out_rounded, fp)
-    logging.info("[write] upcoming expected points -> %s (rows=%d)", fp.resolve(), len(out_rounded))
+    # Determine GW window for output naming (robust even with explicit inputs)
+    gw_series = pd.to_numeric(out_rounded.get("gw_orig"), errors="coerce").dropna().astype(int)
+    if len(gw_series):
+        gw_from_eff, gw_to_eff = int(gw_series.min()), int(gw_series.max())
+    else:
+        gw_from_eff = int(args.gw_from) if args.gw_from is not None else 0
+        gw_to_eff   = int(args.gw_to)   if args.gw_to   is not None else 0
 
-    # Update merged unless suppressed
+    # Write per-window file(s) (defense_forecast style)
+    out_paths = _out_paths(
+        base_dir=args.out_dir,             # ← just the base
+        season=args.future_season or "",   # ← let _out_paths add the season
+        gw_from=gw_from_eff,
+        gw_to=gw_to_eff,
+        zero_pad=args.zero_pad_filenames,
+        out_format=args.out_format,
+    )
+
+    written = _write_points(out_rounded, out_paths)
+    logging.info("[write] upcoming expected points -> %s (rows=%d)", ", ".join(written), len(out_rounded))
+
+    # Update cumulative combined file unless suppressed (renamed to expected_points.csv)
     if not args.no_merged:
-        merged_fp = args.out_dir / "expected_points_merged.csv"
+        merged_fp = args.out_dir / "expected_points.csv"
         _update_merged_csv(out_rounded, merged_fp, FORCED_KEY, sort_cols)
 
     # Logs
@@ -707,37 +714,22 @@ def main():
                      (pd.to_numeric(base.get('p_assist'), errors='coerce').fillna(0) > 0).sum())
     logging.info("[GA] non-zero λ -> goals=%d, assists=%d", nonzero_ga, nonzero_as)
 
-    meta = {
-        "schema": SCHEMA_VERSION,
-        "build_ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "version": version,
-        "key": FORCED_KEY,
+    # Simple diagnostic print (defense_forecast style)
+    diag = {
+        "rows": int(len(out_rounded)),
+        "season": str(args.future_season),
+        "gw_window": {"from": int(gw_from_eff), "to": int(gw_to_eff)},
         "inputs": {
             "minutes": str(minutes_path),
             "goals_assists": str(ga_path),
             "saves": str(sav_path) if sav_path else None,
             "defense": str(def_path) if def_path else None,
         },
-        "component_columns": ["xp_appearance","xp_goals","xp_assists","xp_clean_sheets","xp_saves_points","xp_dcp_bonus","xPts"],
-        "signals_used": {
-            "appearance": ["exp_minutes_points (preferred)", "fallback: p_play + p60 (with p60 ≤ p_play)"],
-            "goals": ["λ_goal = −ln(1 − p_goal) if present; else pred_goals_mean"],
-            "assists": ["λ_assist = −ln(1 − p_assist) if present; else pred_assists_mean"],
-            "clean_sheet_prob": ["team_prob_cs ← (prob_cs | p_teamCS)"],
-            "ga_lambda": ["team_ga_lambda90 ← lambda90 (per90)", "team_exp_gc ← exp_gc (per match)", "fallback: -log(prob_cs)"],
-            "saves_points_formula": "xp_saves_points = p1 × E[floor(S/3)], S ~ Poisson(λ)",
-            "dcp": [
-                "prob_dcp ← (prob_dcp|p_dcp|dcp_prob); fallback P(DC≥thr) via Poisson with λ_on=lambda90_dcp×min/90",
-                "expected_dc ← defense.expected_dc or lambda90_dcp×min/90",
-                "DCP bonus: +2 * prob_dcp_outfield; thr DEF=10, MID/FWD=12"
-            ],
-        },
-        "output_fields": {"total": "xPts (1 dp)", "others": "2 dp"}
+        "out": written,
+        "merged_out": (str(args.out_dir / "expected_points.csv") if not args.no_merged else None),
+        "schema": SCHEMA_VERSION,
     }
-    (out_dir / "expected_points.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    if args.write_latest:
-        _write_latest_pointer(args.out_dir, version)
+    print(json.dumps(diag, indent=2))
 
 if __name__ == "__main__":
     main()
