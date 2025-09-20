@@ -3,56 +3,11 @@ r"""
 defense_forecast.py — leak-free forecaster for CS, DCP, and exp_gc using trained defense heads
 Now with minutes auto-resolve (CSV/Parquet), legacy fixture metadata, roster gating, and dual writer.
 
-Inputs
-------
-• Trained artifacts from defense_model_builder.py:
-    - team_cs_lgbm.txt                  (LightGBM Booster; team-level CS classifier)
-    - cs_isotonic.joblib                (optional isotonic calibration for team CS)
-    - team_gc_lgbm.joblib               (optional LightGBM Regressor; expected goals conceded)
-    - dcp_DEF_lgbm.joblib, dcp_MID_lgbm.joblib, dcp_FWD_lgbm.joblib  (LGBMRegressor per-90)
-    - artifacts/cs_features_team.json   (authoritative feature order for CS team head)
-    - artifacts/gc_features_team.json   (optional; defaults to cs_features_team if missing)
-    - artifacts/dcp_features.json       (authoritative feature order for DCP per-90 head)
-
-• Minutes forecast (from minutes_forecast.py) — auto-resolved by GW window or given explicitly:
-    - Must include: season, player_id, team_id, pos, date_sched, pred_minutes
-    - Should include: gw_played or gw_orig or gw (any one works)
-    - Nice-to-have: p_start/p_cameo/pred_start_head/pred_bench_cameo_head (for mixture DCP)
-    - Nice-to-have: fdr, is_home (else venue inferred via fixtures)
-
-• Registry features (history + up to --as-of for current season):
-    - players_form.csv  (for last-known *_roll/_ewm DCP features)
-    - team_form.csv     (for team_def_xga_venue[_z], team_possession_venue, opp_att_z_venue)
-
-• Team fixtures for legacy metadata & venue:
-    - <fix-root>/<season>/<team-fixtures-filename> (default: fixture_calendar.csv)
-      needs: fbref_id, team, opponent_id, is_home, home, away, date_sched/date_played, gw column, etc.
-
-Roster gating (optional)
-------------------------
-• --teams-json points to master_teams.json with per-season rosters.
-• --league-filter narrows to a specific league label.
-• --require-on-roster forces a hard error if any rows are not on roster (else soft drop + audit CSV).
-
-Output
-------
-<out-dir>/<SEASON>/GW<from>_<to>.csv|parquet with columns (metadata-first):
-  season, gw_played, gw_orig, date_sched, game_id, team_id, team, opponent_id, opponent, is_home,
-  player_id, player, pos, fdr, venue_bin,
-  p_teamCS, prob_cs,
-  lambda90, expected_dc, prob_dcp,
-  exp_gc,
-  [optional: lambda_match if --dump-lambdas]
-
-Notes
------
-• No retraining; strictly uses artifacts.
-• No future leakage: player *_roll/_ewm come from last row strictly before --as-of.
-• GK: included in CS; excluded from DCP unless --include-gk-dcp is passed.
+[see original docstring for details]
 """
 
 from __future__ import annotations
-import argparse, json, logging
+import argparse, json, logging, math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -60,7 +15,6 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import joblib
-
 
 # ----------------------------- helpers ----------------------------------------
 
@@ -200,11 +154,9 @@ def _map_team_context(tf: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
                "team_def_xga_venue","team_def_xga_venue_z",
                "team_possession_venue","team_att_z_venue","opp_att_z_venue"]])
 
-    # numeric
     for c in ["team_def_xga_venue","team_def_xga_venue_z","team_possession_venue","team_att_z_venue","opp_att_z_venue"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # Deduplicate on the full key (important for DGWs)
     dups = out.duplicated(["season","gw_orig","team_id","is_home"]).sum()
     if dups:
         logging.warning("team_ctx has %d duplicate rows across (season, gw_orig, team_id, is_home); keeping last.", dups)
@@ -266,77 +218,55 @@ def _last_snapshot_per_player(df: pd.DataFrame, feature_cols: List[str], as_of_t
 
 def _poisson_tail_prob_vec(lam: np.ndarray, k: np.ndarray) -> np.ndarray:
     """P(K >= k) for K ~ Poisson(lam)."""
-    lam = np.asarray(lam, dtype=float)
-    k = np.asarray(k, dtype=int)
+    lam = np.asarray(lam, dtype=float); k = np.asarray(k, dtype=int)
     out = np.zeros_like(lam, dtype=float)
 
     def tail_one(l, kk):
-        if not np.isfinite(l) or l <= 0:
-            return 0.0 if kk > 0 else 1.0
-        if kk <= 0:
-            return 1.0
-        term = np.exp(-l) * (l ** kk) / np.math.factorial(kk)
-        s = term
-        i = kk + 1
+        if not np.isfinite(l) or l <= 0: return 0.0 if kk > 0 else 1.0
+        if kk <= 0: return 1.0
+        term = math.exp(-l) * (l ** kk) / math.factorial(kk)
+        s = term; i = kk + 1
         for _ in range(200):
-            term *= (l / i)
-            s += term
-            if term < 1e-12:
-                break
+            term *= (l / i); s += term
+            if term < 1e-12: break
             i += 1
         return float(min(max(s, 0.0), 1.0))
-
-    for i in range(lam.shape[0]):
-        out[i] = tail_one(lam[i], int(k[i]))
+    for i in range(lam.shape[0]): out[i] = tail_one(lam[i], int(k[i]))
     return out
 
 def _parse_k90(s: str) -> Dict[str, int]:
     out = {"DEF":10, "MID":12, "FWD":12}
-    if not s:
-        return out
+    if not s: return out
     for part in s.split(";"):
-        if not part.strip():
-            continue
-        k, v = part.split(":")
-        out[k.strip().upper()] = int(v)
+        if not part.strip(): continue
+        k, v = part.split(":"); out[k.strip().upper()] = int(v)
     return out
 
-
 # ---------- roster gating ----------
-
 def _norm_label(s: str) -> str:
     return str(s or "").lower().replace("-", " ").replace("_", " ").strip()
 
 def _load_roster_pairs(teams_json: Optional[Path],
                        season: str,
                        league_filter: Optional[str]) -> Optional[Set[Tuple[str, str]]]:
-    if not teams_json:
-        return None
+    if not teams_json: return None
     p = Path(teams_json)
     if not p.exists():
-        logging.warning("teams_json not found at %s — skipping roster gate.")
-        return None
+        logging.warning("teams_json not found at %s — skipping roster gate."); return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        logging.warning("Failed to parse teams_json (%s): %s — skipping roster gate.", p, e)
-        return None
+        logging.warning("Failed to parse teams_json (%s): %s — skipping roster gate.", p, e); return None
 
     lf = _norm_label(league_filter) if league_filter else ""
     allowed: Set[Tuple[str, str]] = set()
-
     for team_id, obj in (data or {}).items():
         season_info = (obj or {}).get("career", {}).get(season)
-        if not season_info:
-            continue
-        if lf and _norm_label(season_info.get("league", "")) != lf:
-            continue
-        players = season_info.get("players", []) or []
-        for pl in players:
+        if not season_info: continue
+        if lf and _norm_label(season_info.get("league", "")) != lf: continue
+        for pl in season_info.get("players", []) or []:
             pid = str(pl.get("id", "")).strip()
-            if pid:
-                allowed.add((str(team_id), pid))
-
+            if pid: allowed.add((str(team_id), pid))
     if not allowed:
         logging.warning("Roster map for %s produced 0 allowed pairs (league=%r).", season, league_filter)
     return allowed or None
@@ -347,10 +277,8 @@ def _apply_roster_gate(df: pd.DataFrame,
                        where: str,
                        out_artifacts_dir: Optional[Path] = None,
                        require_on_roster: bool = False) -> pd.DataFrame:
-    if allowed_pairs is None or df.empty:
-        return df
-    tid = df.get("team_id").astype(str)
-    pid = df.get("player_id").astype(str)
+    if allowed_pairs is None or df.empty: return df
+    tid = df.get("team_id").astype(str); pid = df.get("player_id").astype(str)
     pairs = list(zip(tid.to_numpy(), pid.to_numpy()))
     mask_ok = np.fromiter(((a, b) in allowed_pairs for (a, b) in pairs), count=len(pairs), dtype=bool)
 
@@ -364,9 +292,7 @@ def _apply_roster_gate(df: pd.DataFrame,
             raise RuntimeError(f"--require-on-roster set: {dropped} {where} rows are not on the {season} roster.")
     return df.loc[mask_ok].copy()
 
-
 # ---------- minutes resolver (auto) & dual loader ----------
-
 def _fmt_gw(n: int, zero_pad: bool) -> str:
     return f"{int(n):02d}" if zero_pad else f"{int(n)}"
 
@@ -374,59 +300,43 @@ def _candidate_minutes_paths(minutes_root: Path, future_season: str, gw_from: in
     season_dir = minutes_root / str(future_season)
     cands: List[Path] = []
     for zp in (False, True):
-        a = _fmt_gw(gw_from, zp)
-        b = _fmt_gw(gw_to,   zp)
+        a = _fmt_gw(gw_from, zp); b = _fmt_gw(gw_to,   zp)
         cands.append(season_dir / f"GW{a}_{b}.csv")
         cands.append(season_dir / f"GW{a}_{b}.parquet")
     return cands
 
 def _glob_fallback(minutes_root: Path, future_season: str, gw_from: int, gw_to: int) -> Optional[Path]:
     season_dir = minutes_root / str(future_season)
-    if not season_dir.exists():
-        return None
+    if not season_dir.exists(): return None
     patterns = [f"GW{gw_from}_*.csv", f"GW{gw_from}_*.parquet",
                 f"GW{gw_from:02d}_*.csv", f"GW{gw_from:02d}_*.parquet"]
     for pat in patterns:
         for p in sorted(season_dir.glob(pat)):
             try:
-                stem = p.stem
-                to_val = int(stem.split("_")[-1].replace("GW",""))
-                if to_val == int(gw_to):
-                    return p
-            except Exception:
-                continue
+                stem = p.stem; to_val = int(stem.split("_")[-1].replace("GW",""))
+                if to_val == int(gw_to): return p
+            except Exception: continue
     return None
 
 def _resolve_minutes_path(args: argparse.Namespace, gw_from: int, gw_to: int) -> Path:
     if args.minutes_csv:
         p = Path(args.minutes_csv)
-        if not p.exists():
-            raise FileNotFoundError(f"--minutes-csv not found: {p}")
+        if not p.exists(): raise FileNotFoundError(f"--minutes-csv not found: {p}")
         return p
-
     for cand in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
-        if cand.exists():
-            return cand
-
+        if cand.exists(): return cand
     fb = _glob_fallback(args.minutes_root, args.future_season, gw_from, gw_to)
-    if fb:
-        return fb
-
+    if fb: return fb
     season_dir = args.minutes_root / str(args.future_season)
-    msg = [
-        f"Minutes file not found for GW window {gw_from}-{gw_to}.",
-        f"Looked under: {season_dir}",
-        "Tried candidates:",
-    ]
+    msg = [f"Minutes file not found for GW window {gw_from}-{gw_to}.",
+           f"Looked under: {season_dir}", "Tried candidates:"]
     for c in _candidate_minutes_paths(args.minutes_root, args.future_season, gw_from, gw_to):
         msg.append(f"  - {c}")
-    msg += [
-        "Also tried glob fallback: GW{from}_*.{csv,parquet} (with and without zero-padding).",
-        "Fix by either:",
-        "  • generating that file, or",
-        "  • pointing directly via --minutes-csv <path>, or",
-        "  • adjusting --minutes-root / GW window."
-    ]
+    msg += ["Also tried glob fallback: GW{from}_*.{csv,parquet} (with and without zero-padding).",
+            "Fix by either:",
+            "  • generating that file, or",
+            "  • pointing directly via --minutes-csv <path>, or",
+            "  • adjusting --minutes-root / GW window."]
     raise FileNotFoundError("\n".join(msg))
 
 def _load_minutes_dual(path: Path) -> pd.DataFrame:
@@ -443,9 +353,86 @@ def _load_minutes_dual(path: Path) -> pd.DataFrame:
         raise ValueError(f"Unsupported minutes file extension: {suffix}. Use .csv or .parquet")
     return df
 
+# ---------- FDR (venue-consistent, DGW-safe) ----------
+def _find_fdr_cols(cols: set[str]) -> tuple[str, str]:
+    home_aliases = ["fdr_home", "team_fdr_home", "def_fdr_home", "fdrH"]
+    away_aliases = ["fdr_away", "team_fdr_away", "def_fdr_away", "fdrA"]
+    home = next((c for c in home_aliases if c in cols), None)
+    away = next((c for c in away_aliases if c in cols), None)
+    if not home or not away:
+        raise RuntimeError(
+            f"FDR columns not found in team_form. Tried {home_aliases} and {away_aliases}. Got: {sorted(cols)}"
+        )
+    return home, away
+
+def _ensure_is_home(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "is_home" in out.columns:
+        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    if "was_home" in out.columns:
+        out["is_home"] = pd.to_numeric(out["was_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    if "venue" in out.columns:
+        out["is_home"] = out["venue"].astype(str).str.lower().eq("home").astype(int)
+        return out
+    raise RuntimeError("No venue columns found to compute is_home.")
+
+def attach_fdr_consistent(df: pd.DataFrame,
+                          seasons_all: List[str],
+                          features_root: Path,
+                          version: str,
+                          team_form: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Attach integer FDR using (season, team_id, GW, is_home). DGW-safe: collapse duplicates by max.
+    """
+    if df.empty:
+        return df
+    df = _ensure_is_home(df)
+    df["team_id"] = df["team_id"].astype(str)
+    for c in ("gw_played","gw_orig","gw"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    gw_df = _pick_gw_col(df.columns.tolist())
+    if gw_df is None:
+        raise RuntimeError("attach_fdr_consistent: no GW column among ['gw_played','gw_orig','gw'].")
+
+    tf_all = team_form.copy() if team_form is not None else _load_team_form(features_root, version, seasons_all)
+    if tf_all is None or tf_all.empty:
+        raise FileNotFoundError("attach_fdr_consistent: team_form not available to attach FDR.")
+
+    tf_all["team_id"] = tf_all.get("team_id", pd.Series(index=tf_all.index, dtype=object)).astype(str)
+    for c in ("gw_played","gw_orig","gw"):
+        if c in tf_all.columns:
+            tf_all[c] = pd.to_numeric(tf_all[c], errors="coerce")
+
+    home_col, away_col = _find_fdr_cols(set(tf_all.columns))
+    gw_tf = _pick_gw_col(tf_all.columns.tolist())
+    if gw_tf is None:
+        raise RuntimeError("attach_fdr_consistent: no GW column in team_form.")
+
+    base = tf_all[["season","team_id",gw_tf,home_col,away_col]].dropna(subset=["team_id",gw_tf])
+    home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+    away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+    form_long = pd.concat([home_rows, away_rows], ignore_index=True)
+    if gw_tf != gw_df:
+        form_long = form_long.rename(columns={gw_tf: gw_df})
+
+    form_long = (form_long.groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"].max())
+
+    merged = df.merge(form_long, how="left", on=["season","team_id",gw_df,"is_home"], validate="many_to_one", copy=False)
+    if merged["fdr_side"].isna().any():
+        miss = merged.loc[merged["fdr_side"].isna(), ["season","team_id",gw_df,"is_home"]].drop_duplicates()
+        logging.error("attach_fdr_consistent: missing FDR for %d rows. Examples:\n%s",
+                      len(miss), miss.head(20).to_string(index=False))
+        raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs. Check keys/coverage.")
+
+    merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="raise").astype(int)
+    merged.drop(columns=["fdr_side"], inplace=True, errors="ignore")
+    return merged
 
 # ---------- file writing helpers ----------
-
 def _def_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
                    zero_pad: bool, out_format: str) -> List[Path]:
     a = _fmt_gw(gw_from, zero_pad); b = _fmt_gw(gw_to, zero_pad)
@@ -473,7 +460,6 @@ def _write_def(df: pd.DataFrame, paths: List[Path]) -> List[str]:
         else:
             raise ValueError(f"Unsupported output extension: {p.suffix}")
     return written
-
 
 # ----------------------------- main -------------------------------------------
 
@@ -605,7 +591,7 @@ def main():
         logging.warning("Minutes had duplicate columns; dropping earlier duplicates: %s", set(dups))
         minutes = minutes.loc[:, ~minutes.columns.duplicated(keep="last")]
 
-    # --- Roster gating (authoritative filter) ---
+    # --- Roster gating ---
     allowed_pairs = _load_roster_pairs(
         teams_json=args.teams_json,
         season=args.future_season,
@@ -633,14 +619,14 @@ def main():
     minutes["team_id"] = minutes["team_id"].astype(str)
     team_fix["team_id"] = team_fix["team_id"].astype(str)
 
-    # Map is_home from fixtures (robust)
+    # Map is_home from fixtures
     vmap = (team_fix[["season","team_id",gw_key_t,"is_home"]]
             .dropna(subset=[gw_key_t,"team_id"])
             .drop_duplicates()
             .rename(columns={gw_key_t: gw_key_m}))
     minutes = minutes.merge(vmap, how="left", on=["season","team_id",gw_key_m], validate="many_to_one")
 
-    # venue_bin & fdr defaults
+    # venue_bin AFTER is_home
     venue_fallback = (minutes["venue"].astype(str).str.lower().eq("home").astype(int)
                       if "venue" in minutes.columns else 0)
     minutes["venue_bin"] = (
@@ -649,8 +635,16 @@ def main():
           .fillna(0)
           .astype(int)
     )
-    if "fdr" not in minutes.columns:
-        minutes["fdr"] = 0.0
+
+    # -------- Venue-consistent, DGW-safe FDR attach (INT) --------
+    minutes = attach_fdr_consistent(
+        df=minutes,
+        seasons_all=seasons_all,
+        features_root=args.features_root,
+        version=args.form_version,
+        team_form=tf
+    )
+    minutes["fdr"] = pd.to_numeric(minutes["fdr"], errors="raise").astype(int)
 
     # --- Team rows for CS/GC features (uses minutes' GW key) ---
     team_rows = (minutes[["season", gw_key_m, "team_id", "is_home", "venue_bin", "fdr", "date_sched"]]
@@ -728,7 +722,6 @@ def main():
         fut = fut.loc[:, ~fut.columns.duplicated(keep="last")]
 
     # --- Legacy metadata attach from fixtures: game_id/team/opponent_id/opponent ---
-    # Prepare small fixture frame to merge on (season, team_id, gw_key)
     fix_keep = ["season","team_id",gw_key_t,"fbref_id","team","opponent_id","is_home","home","away"]
     fix_keep = [c for c in fix_keep if c in team_fix.columns]
     fix_small = (team_fix[fix_keep]
@@ -742,7 +735,6 @@ def main():
         validate="many_to_one",
         suffixes=("", "_fix")
     )
-    # Derive 'opponent' if not provided
     if "opponent" not in fut.columns or fut["opponent"].isna().all():
         if {"home","away","is_home"}.issubset(fut.columns):
             ih = pd.to_numeric(fut["is_home"], errors="coerce").fillna(0).astype(int)
@@ -805,12 +797,8 @@ def main():
         ms = np.clip(pd.to_numeric(fut["pred_start_head"], errors="coerce").fillna(0).to_numpy(), 0, None)
         mb = np.clip(pd.to_numeric(fut["pred_bench_cameo_head"], errors="coerce").fillna(0).to_numpy(), 0, None)
 
-        lam_s = lam90 * (ms / 90.0)
-        lam_b = lam90 * (mb / 90.0)
-
-        k_s = _k_from_minutes(pos, ms)
-        k_b = _k_from_minutes(pos, mb)
-
+        lam_s = lam90 * (ms / 90.0); lam_b = lam90 * (mb / 90.0)
+        k_s = _k_from_minutes(pos, ms); k_b = _k_from_minutes(pos, mb)
         p_s = _poisson_tail_prob_vec(np.where(np.isfinite(lam_s), lam_s, 0.0), k_s)
         p_b = _poisson_tail_prob_vec(np.where(np.isfinite(lam_b), lam_b, 0.0), k_b)
 
@@ -861,7 +849,7 @@ def main():
         "player_id":         fut["player_id"].astype(str).values,
         "player":            fut.get("player", pd.Series([np.nan]*len(fut))).values,
         "pos":               fut["pos"].astype(str).values,
-        "fdr":               pd.to_numeric(fut.get("fdr", np.nan), errors="coerce").values,
+        "fdr":               pd.to_numeric(fut.get("fdr", np.nan), errors="raise").astype(int).values,
         "venue_bin":         pd.to_numeric(fut.get("venue_bin", np.nan), errors="coerce").values,
 
         # --- Team defense heads & player CS ---
@@ -880,7 +868,6 @@ def main():
     if args.dump_lambdas:
         out["lambda_match"] = lam_match
 
-    # Stable order (meta → player/gates → preds)
     desired_order = [
         "season","gw_played","gw_orig","date_sched","game_id",
         "team_id","team","opponent_id","opponent","is_home",
@@ -892,7 +879,6 @@ def main():
     keep_cols = [c for c in desired_order if c in out.columns]
     out = out[keep_cols].copy()
 
-    # sort, write
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in out.columns]
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
