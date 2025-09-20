@@ -20,6 +20,7 @@ Key fixes vs prior rev:
 
 NEW (legacy meta like minutes_forecast):
 • Attach game_id (fbref_id), team, opponent_id, opponent from fixture_calendar.csv.
+• Venue-consistent, DGW-safe FDR attach; `fdr` is INT and part of legacy metadata.
 """
 from __future__ import annotations
 
@@ -563,6 +564,107 @@ def _attach_legacy_meta(df_pred: pd.DataFrame, team_fix: pd.DataFrame) -> pd.Dat
     return merged
 
 
+# ───────────────────────────── Venue-consistent, DGW-safe FDR attach ─────────────────────────────
+
+def _find_fdr_cols(cols: set[str]) -> tuple[str, str]:
+    home_aliases = ["fdr_home", "team_fdr_home", "def_fdr_home", "fdrH"]
+    away_aliases = ["fdr_away", "team_fdr_away", "def_fdr_away", "fdrA"]
+    home = next((c for c in home_aliases if c in cols), None)
+    away = next((c for c in away_aliases if c in cols), None)
+    if not home or not away:
+        raise RuntimeError(
+            f"FDR columns not found in team_form. "
+            f"Tried {home_aliases} and {away_aliases}. Got: {sorted(cols)}"
+        )
+    return home, away
+
+
+def _ensure_is_home(df: pd.DataFrame) -> pd.DataFrame:
+    if "is_home" in df.columns:
+        out = df.copy()
+        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    out = df.copy()
+    if "was_home" in out.columns:
+        out["is_home"] = pd.to_numeric(out["was_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    if "venue" in out.columns:
+        out["is_home"] = out["venue"].astype(str).str.lower().eq("home").astype(int)
+        return out
+    raise RuntimeError("No venue columns found to compute is_home.")
+
+
+def attach_fdr_consistent(df: pd.DataFrame,
+                          seasons_all: List[str],
+                          features_root: Path,
+                          version: str,
+                          team_form: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Attach integer FDR using (season, team_id, GW, is_home). DGW-safe: collapse duplicates by max.
+    """
+    if df.empty:
+        return df
+
+    df = _ensure_is_home(df)
+    df["team_id"] = df["team_id"].astype(str)
+    for c in ("gw_played", "gw_orig", "gw"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    gw_df = _pick_gw_col(df.columns.tolist())
+    if gw_df is None:
+        raise RuntimeError("attach_fdr_consistent: no GW column among ['gw_played','gw_orig','gw'].")
+
+    if team_form is None:
+        tf_all = _load_team_form(features_root, version, seasons_all)
+    else:
+        tf_all = team_form.copy()
+
+    if tf_all is None or tf_all.empty:
+        raise FileNotFoundError("attach_fdr_consistent: team_form not available to attach FDR.")
+
+    tf_all["team_id"] = tf_all.get("team_id", pd.Series(index=tf_all.index, dtype=object)).astype(str)
+    for c in ("gw_played", "gw_orig", "gw"):
+        if c in tf_all.columns:
+            tf_all[c] = pd.to_numeric(tf_all[c], errors="coerce")
+
+    home_col, away_col = _find_fdr_cols(set(tf_all.columns))
+    gw_tf = _pick_gw_col(tf_all.columns.tolist())
+    if gw_tf is None:
+        raise RuntimeError("attach_fdr_consistent: no GW column in team_form.")
+
+    base = tf_all[["season", "team_id", gw_tf, home_col, away_col]].dropna(subset=["team_id", gw_tf])
+    home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season", "team_id", gw_tf, "is_home", "fdr_side"]]
+    away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season", "team_id", gw_tf, "is_home", "fdr_side"]]
+    form_long = pd.concat([home_rows, away_rows], ignore_index=True)
+
+    if gw_tf != gw_df:
+        form_long = form_long.rename(columns={gw_tf: gw_df})
+
+    # Collapse DGW duplicates conservatively
+    form_long = (form_long
+                 .groupby(["season", "team_id", gw_df, "is_home"], as_index=False)["fdr_side"]
+                 .max())
+
+    merged = df.merge(
+        form_long,
+        how="left",
+        on=["season", "team_id", gw_df, "is_home"],
+        validate="many_to_one",
+        copy=False
+    )
+
+    if merged["fdr_side"].isna().any():
+        miss = merged.loc[merged["fdr_side"].isna(), ["season", "team_id", gw_df, "is_home"]].drop_duplicates()
+        logging.error("attach_fdr_consistent: missing FDR for %d rows. Examples:\n%s",
+                      len(miss), miss.head(20).to_string(index=False))
+        raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs. Check keys/coverage.")
+
+    merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="raise").astype(int)
+    merged.drop(columns=["fdr_side"], inplace=True, errors="ignore")
+    return merged
+
+
 # ───────────────────────────── Main ─────────────────────────────
 
 def _parse_cap_per90(s: Optional[str]) -> Dict[str, float]:
@@ -739,8 +841,17 @@ def main():
 
     # Build future scoring frame
     fut = minutes.copy()
-    if "fdr" not in fut.columns:
-        fut["fdr"] = np.nan
+
+    # -------- NEW: Venue-consistent, DGW-safe FDR attach (INT) --------
+    fut = attach_fdr_consistent(
+        df=fut,
+        seasons_all=seasons_all,
+        features_root=args.features_root,
+        version=args.form_version,
+        team_form=tf
+    )
+    # Ensure int dtype (attach_fdr_consistent guarantees no NaNs)
+    fut["fdr"] = pd.to_numeric(fut["fdr"], errors="raise").astype(int)
 
     # Roster gate
     allowed_pairs = _load_roster_pairs(
@@ -772,7 +883,7 @@ def main():
         fut["team_att_z_venue"] = np.nan
         fut["opp_def_z_venue"] = np.nan
 
-    # --- NEW: attach legacy metadata from fixtures (fbref_id→game_id, team, opponent_id, opponent)
+    # --- Attach legacy metadata from fixtures (fbref_id→game_id, team, opponent_id, opponent)
     fut = _attach_legacy_meta(fut, team_fix)
 
     # Last-known snapshot features
@@ -942,7 +1053,9 @@ def main():
 
     gw_played_vals = pd.to_numeric(fut.get("gw_played", np.nan), errors="coerce").values
     gw_orig_vals   = pd.to_numeric(fut.get("gw_orig",   fut.get("gw", np.nan)), errors="coerce").values
-    fdr_vals       = pd.to_numeric(fut.get("fdr", np.nan), errors="coerce").values
+
+    # fdr now guaranteed non-null int
+    fdr_vals       = pd.to_numeric(fut.get("fdr", np.nan), errors="raise").astype(int).values
 
     p_start_vals = pd.to_numeric(fut.get("p_start", np.nan), errors="coerce").clip(0, 1).values
     p60_vals     = pd.to_numeric(fut.get("p60", np.nan), errors="coerce").clip(0, 1).values
