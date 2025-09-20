@@ -16,7 +16,7 @@ Reads fixtures from:
 Fallback for future rows from:
   <fix-root>/<season>/fixture_calendar.csv
 Reads FDR (optional) from:
-  <form-root>/<version>/<season>/<team|player>_form.csv
+  <form-root>/<version>/<season>/team_form.csv
 
 NEW:
 • Auto-name outputs from the GW window and dual writer (CSV/Parquet):
@@ -24,6 +24,9 @@ NEW:
   - --zero-pad-filenames to emit GW05_07 instead of GW5_7
 • Legacy metadata in output (sourced from fixture_calendar.csv):
   - game_id (fbref_id), team, opponent_id, opponent
+• FDR:
+  - Venue-consistent, DGW-safe attach using (season, team_id, GW, is_home).
+  - fdr emitted as INT and considered legacy metadata (with gw_played/gw_orig).
 """
 
 import argparse, json, logging
@@ -35,7 +38,7 @@ import joblib
 from typing import Optional, Dict, List, Tuple, Set
 
 from scripts.models.minutes_model_builder import (
-    _pick_gw_col, load_minutes, attach_fdr, make_features,
+    _pick_gw_col, load_minutes, make_features,
     train_regressor, train_cameo_minutes_by_pos,
     parse_pos_thresholds, per_position_bench_cap_from_train,
     predict_with_model, taper_start_minutes
@@ -163,7 +166,7 @@ def synthesize_future_player_rows(team_fix: pd.DataFrame,
     tf = tf[gwn_team.isin(target_gws)].copy()
     if tf.empty or squad.empty:
         return pd.DataFrame(columns=[
-            "season","gw_orig","gw_played","date_sched","player_id","player","team_id","pos","is_home",
+            "season","gw_orig","gw_played","gw","date_sched","player_id","player","team_id","pos","is_home",
             "minutes","is_starter","is_active","_is_synth"
         ])
 
@@ -485,6 +488,132 @@ def _attach_legacy_meta(df_pred: pd.DataFrame, team_fix: pd.DataFrame) -> pd.Dat
 
     return merged
 
+# ----------------------------- Venue-consistent, DGW-safe FDR attach ----------
+
+def _find_fdr_cols(cols: set[str]) -> tuple[str, str]:
+    home_aliases = ["fdr_home", "team_fdr_home", "def_fdr_home", "fdrH"]
+    away_aliases = ["fdr_away", "team_fdr_away", "def_fdr_away", "fdrA"]
+    home = next((c for c in home_aliases if c in cols), None)
+    away = next((c for c in away_aliases if c in cols), None)
+    if not home or not away:
+        raise RuntimeError(
+            f"FDR columns not found in team_form. "
+            f"Tried {home_aliases} and {away_aliases}. Got: {sorted(cols)}"
+        )
+    return home, away
+
+def _ensure_is_home(df: pd.DataFrame) -> pd.DataFrame:
+    if "is_home" in df.columns:
+        out = df.copy()
+        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    out = df.copy()
+    if "was_home" in out.columns:
+        out["is_home"] = pd.to_numeric(out["was_home"], errors="coerce").fillna(0).astype(int)
+        return out
+    if "venue" in out.columns:
+        out["is_home"] = out["venue"].astype(str).str.lower().eq("home").astype(int)
+        return out
+    raise RuntimeError("No venue columns found to compute is_home.")
+
+def attach_fdr_consistent(df: pd.DataFrame,
+                          seasons_all: List[str],
+                          form_root: Path,
+                          version: str,
+                          team_fix: pd.DataFrame) -> pd.DataFrame:
+    """
+    DGW-safe venue-consistent FDR attach:
+
+    1) Ensure df has is_home (derive/merge from team_fix if needed).
+    2) Load team_form for each season and pick GW key like scorer.
+    3) Expand team_form rows into a long table keyed by
+       (season, team_id, GW, is_home) with a single 'fdr_side':
+         - emit (is_home=1, fdr_side=fdr_home) and (is_home=0, fdr_side=fdr_away).
+    4) Collapse duplicates for the same key by worst-case (max fdr_side).
+    5) Merge many-to-one on (season, team_id, GW, is_home) and set df["fdr"] as INT.
+    """
+    if df.empty:
+        return df
+
+    # Ensure df has is_home; if missing, derive from team_fix
+    if "is_home" not in df.columns:
+        gw_df = _pick_gw_col(df.columns.tolist()) or "gw_orig"
+        gw_tf = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+        tf_small = team_fix[["season","team_id",gw_tf,"is_home"]].dropna(subset=[gw_tf,"team_id"]).drop_duplicates()
+        if gw_tf != gw_df:
+            tf_small = tf_small.rename(columns={gw_tf: gw_df})
+        df = df.merge(tf_small, how="left", on=["season","team_id",gw_df], validate="many_to_one")
+
+    df = _ensure_is_home(df)
+    df["team_id"] = df["team_id"].astype(str)
+    for c in ("gw_played","gw_orig","gw"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    gw_df = _pick_gw_col(df.columns.tolist())
+    if gw_df is None:
+        raise RuntimeError("attach_fdr_consistent: no GW column among ['gw_played','gw_orig','gw'].")
+
+    seasons_to_load = sorted(set(df["season"].astype(str)) & set(map(str, seasons_all)))
+    if not seasons_to_load:
+        raise RuntimeError("attach_fdr_consistent: df seasons do not overlap seasons_all.")
+
+    long_parts = []
+    for season in seasons_to_load:
+        fp = form_root / version / season / "team_form.csv"
+        if not fp.exists():
+            raise FileNotFoundError(f"attach_fdr_consistent: missing team_form: {fp}")
+        tf = pd.read_csv(fp)
+        tf["team_id"] = tf.get("team_id", pd.Series(index=tf.index, dtype=object)).astype(str)
+        for c in ("gw_played","gw_orig","gw"):
+            if c in tf.columns:
+                tf[c] = pd.to_numeric(tf[c], errors="coerce")
+
+        home_col, away_col = _find_fdr_cols(set(tf.columns))
+        gw_tf = _pick_gw_col(tf.columns.tolist())
+        if gw_tf is None:
+            raise RuntimeError(f"attach_fdr_consistent: no GW column in team_form: {fp}")
+
+        base = tf[["season","team_id",gw_tf,home_col,away_col]].dropna(subset=["team_id", gw_tf])
+        # expand to long: is_home=1 (home_col), is_home=0 (away_col)
+        home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+        home_rows = home_rows.rename(columns={away_col: "_drop"})
+        away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+        away_rows = away_rows.rename(columns={home_col: "_drop"})
+        part = pd.concat([home_rows, away_rows], ignore_index=True)
+
+        if gw_tf != gw_df:
+            part = part.rename(columns={gw_tf: gw_df})
+
+        long_parts.append(part)
+
+    form_long = pd.concat(long_parts, ignore_index=True)
+
+    # Collapse duplicates by worst-case difficulty (conservative)
+    form_long = (form_long
+                 .groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"]
+                 .max())
+
+    # Merge many-to-one on (season, team_id, GW, is_home)
+    merged = df.merge(
+        form_long,
+        how="left",
+        on=["season","team_id",gw_df,"is_home"],
+        validate="many_to_one",
+        copy=False
+    )
+
+    # Coerce to integer, fail loudly if any missing
+    if merged["fdr_side"].isna().any():
+        miss = merged.loc[merged["fdr_side"].isna(), ["season","team_id",gw_df,"is_home"]].drop_duplicates()
+        logging.error("attach_fdr_consistent: missing FDR for %d rows. Examples:\n%s",
+                      len(miss), miss.head(20).to_string(index=False))
+        raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs. Check keys/coverage.")
+
+    merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="coerce").astype("Int64")
+    merged = merged.drop(columns=["fdr_side"], errors="ignore")
+    return merged
+
 # ----------------------------- main ------------------------------------------
 
 def main():
@@ -621,9 +750,17 @@ def main():
     if not synth.empty:
         df = pd.concat([df, synth], ignore_index=True)
 
-    # Attach FDR **after** synthesis so future rows get it
+    # -------- VENUE-CONSISTENT, DGW-SAFE FDR ATTACH --------
     if args.use_fdr:
-        df = attach_fdr(df, seasons_all, Path(args.form_root), args.form_version, args.form_source)
+        df = attach_fdr_consistent(
+            df=df,
+            seasons_all=seasons_all,
+            form_root=Path(args.form_root),
+            version=args.form_version,
+            team_fix=team_fix
+        )
+        # hard cast to int now that attach_fdr_consistent guarantees no NaNs
+        df["fdr"] = pd.to_numeric(df["fdr"], errors="raise").astype(int)
 
     # Leakage control mask computed on the extended df
     date_used = build_date_used(df, args.as_of_tz)
@@ -686,8 +823,19 @@ def main():
     if df_pred.empty:
         raise RuntimeError("All rows were dropped by roster gating; nothing to score.")
 
-    # --------- NEW: attach legacy metadata (from team fixture calendar) ---------
+    # --------- attach legacy metadata (from team fixture calendar) -------------
     df_pred = _attach_legacy_meta(df_pred, team_fix)
+
+    # Final FDR integrity check on the scored slice
+    if args.use_fdr:
+        if "fdr" not in df_pred.columns or df_pred["fdr"].isna().any():
+            bad = df_pred.loc[df_pred.get("fdr").isna() if "fdr" in df_pred.columns else slice(None),
+                              [c for c in ["season","team_id","gw_played","gw_orig","gw","is_home"] if c in df_pred.columns]].drop_duplicates()
+            (artifacts_dir).mkdir(parents=True, exist_ok=True)
+            bad.to_csv(artifacts_dir / "missing_fdr_rows.csv", index=False)
+            raise RuntimeError("FDR required but missing in scoring slice; wrote artifacts/missing_fdr_rows.csv")
+        # enforce int dtype
+        df_pred["fdr"] = pd.to_numeric(df_pred["fdr"], errors="raise").astype(int)
 
     # Bench caps from historical bench cameos (position)
     hist = df.loc[pre_asof_mask].copy()
@@ -852,16 +1000,28 @@ def main():
     p_play = np.clip(p_start + (1.0 - p_start) * p_cameo, 0, 1)
     exp_minutes_points = np.clip(p_play + p60, 0, 2)
 
-    # Build output (metadata first, then predictions)
+    # -------- Build output (legacy metadata + predictions) --------
+    # Legacy metadata first
     out_cols = {
         "season": df_pred["season"].values,
         "game_id": df_pred.get("fbref_id", pd.Series([np.nan]*len(df_pred))).values,
-        "player_id": df_pred["player_id"].values,
-        "player": df_pred.get("player", np.nan).values,
         "team_id": df_pred.get("team_id", np.nan).values,
         "team": df_pred.get("team", pd.Series([np.nan]*len(df_pred))).values,
         "opponent_id": df_pred.get("opponent_id", pd.Series([np.nan]*len(df_pred))).values,
         "opponent": df_pred.get("opponent", pd.Series([np.nan]*len(df_pred))).values,
+        # gw columns (if present)
+    }
+    if "gw_played" in df_pred.columns: out_cols["gw_played"] = df_pred["gw_played"].values
+    if "gw_orig"   in df_pred.columns: out_cols["gw_orig"]   = df_pred["gw_orig"].values
+    if "gw"        in df_pred.columns: out_cols["gw"]        = df_pred["gw"].values
+    # fdr as integer in legacy metadata block
+    if args.use_fdr:
+        out_cols["fdr"] = df_pred["fdr"].astype(int).values
+
+    # Row identity and features
+    out_cols.update({
+        "player_id": df_pred["player_id"].values,
+        "player": df_pred.get("player", np.nan).values,
         "pos": df_pred["pos"].values,
         "date_sched": df_pred.get("date_sched", pd.NaT).values,
         "p_start": p_start, "p60": p60, "p_cameo": p_cameo, "p_play": p_play,
@@ -870,12 +1030,10 @@ def main():
         "pred_bench_head": pred_bench,
         "pred_minutes": minutes_pred,
         "exp_minutes_points": exp_minutes_points,
-        "fdr": df_pred.get("fdr", 0.0).values
-    }
-    if "gw_played" in df_pred.columns: out_cols["gw_played"] = df_pred["gw_played"].values
-    if "gw_orig"   in df_pred.columns: out_cols["gw_orig"]   = df_pred["gw_orig"].values
-    if "gw"        in df_pred.columns: out_cols["gw"]        = df_pred["gw"].values
-    if "_is_synth" in df_pred.columns: out_cols["_is_synth"] = df_pred["_is_synth"].fillna(0).astype(int).values
+    })
+    if "_is_synth" in df_pred.columns:
+        out_cols["_is_synth"] = df_pred["_is_synth"].fillna(0).astype(int).values
+
     out = pd.DataFrame(out_cols)
 
     # Optional: sort for readability
