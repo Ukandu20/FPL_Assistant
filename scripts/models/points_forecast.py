@@ -8,7 +8,7 @@ Output changes vs v1.7
 • No versioned run folders. Writes GW-windowed files mirroring defense_forecast style:
     <out-dir>/<FUTURE_SEASON>/GW{from}_{to}.csv|parquet   (zero-pad controlled by --zero-pad-filenames)
 • Select format via --out-format {csv,parquet,both}.
-• The cumulative stack file is now <out-dir>/expected_points.csv (used to be expected_points_merged.csv).
+• The cumulative stack file is now <out-dir>/expected_points.{csv,parquet} (was expected_points_merged.csv).
 • Artifacts (e.g., roster drop audits) go under <out-dir>/<FUTURE_SEASON>/artifacts.
 
 New in this revision
@@ -17,6 +17,14 @@ New in this revision
   - Pulls fdr from GA, MIN, DEF, and SAV files when present.
   - Per-row conflict resolution: GA → MIN → DEF → SAV priority; if sources disagree, choose the mode; tie → max.
   - Stored as pandas nullable Int64, preserving missing values cleanly in CSV/Parquet.
+
+Additional updates in this patch
+--------------------------------
+• Merged stack now mirrors --out-format:
+  - If `csv` → writes expected_points.csv
+  - If `parquet` → writes expected_points.parquet
+  - If `both` → writes both, kept in sync.
+• Louder warnings when DEF/SAV are omitted so users don’t accidentally run GA-only points.
 """
 
 from __future__ import annotations
@@ -318,7 +326,7 @@ def _apply_roster_gate(base: pd.DataFrame,
             raise RuntimeError(f"--require-on-roster set: {dropped} rows are not on the roster.")
     return base.loc[keep].copy()
 
-# ───────────────────────── merged writer (renamed output) ─────────────────────────
+# ───────────────────────── merged writer (format-aware) ─────────────────────────
 
 def _align_union_columns(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     all_cols = list(dict.fromkeys([*a.columns, *b.columns]))
@@ -329,37 +337,73 @@ def _align_union_columns(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[pd.DataFrame
         all_cols.insert(all_cols.index("season") + 1, "date_sched")
     return a2[all_cols], b2[all_cols], all_cols
 
-def _update_merged_csv(new_df: pd.DataFrame,
-                       merged_path: Path,
-                       key_cols: List[str],
-                       sort_cols: List[str]) -> None:
-    if merged_path.exists():
-        old = _read_any(merged_path, tag="MERGED")
-    else:
-        old = pd.DataFrame(columns=new_df.columns)
+def _read_existing_merged(stem: Path) -> pd.DataFrame:
+    """Try to read existing merged stack from <stem>.parquet then <stem>.csv; else empty."""
+    pq = stem.with_suffix(".parquet")
+    cs = stem.with_suffix(".csv")
+    if pq.exists():
+        try:
+            return _read_any(pq, tag="MERGED-PQ")
+        except Exception:
+            logging.warning("[merged] failed to read parquet; will try csv.")
+    if cs.exists():
+        try:
+            return _read_any(cs, tag="MERGED-CSV")
+        except Exception:
+            logging.warning("[merged] failed to read csv; starting fresh.")
+    return pd.DataFrame()
+
+def _update_merged(
+    new_df: pd.DataFrame,
+    merged_stem: Path,           # e.g., out_dir / "expected_points" (no extension)
+    key_cols: List[str],
+    sort_cols: List[str],
+    formats: List[str],          # subset of ["csv","parquet"]
+) -> List[str]:
+    """
+    Union-merge new_df into existing merged stack and write to every requested format.
+    Returns list of written file paths.
+    """
+    old = _read_existing_merged(merged_stem)
     old, new, all_cols = _align_union_columns(old, new_df)
+
     key_df = new[key_cols].drop_duplicates()
     old_mark = old.merge(key_df.assign(__hit__=1), on=key_cols, how="left")
     old_kept = old_mark[old_mark["__hit__"].isna()].drop(columns="__hit__")
     merged = pd.concat([old_kept, new], ignore_index=True, sort=False)
+
+    # ensure sort_cols exist
     for c in sort_cols:
         if c not in merged.columns:
             merged[c] = np.nan
     merged = merged.sort_values(by=[c for c in sort_cols if c in merged.columns])
     merged = _round_for_output(merged)
 
-    # Write CSV atomically (date formatting to YYYY-MM-DD where possible)
-    if "date_sched" in merged.columns and pd.api.types.is_datetime64_any_dtype(merged["date_sched"]):
-        merged_csv = merged.copy()
-        merged_csv["date_sched"] = pd.to_datetime(merged_csv["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
-        merged_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = merged_path.with_suffix(".csv.tmp")
-        merged_csv.to_csv(tmp, index=False)
-        os.replace(tmp, merged_path)
-    else:
-        _atomic_write_csv(merged, merged_path)
+    written: List[str] = []
+    # CSV writer with date formatting
+    if "csv" in formats:
+        out_csv = merged_stem.with_suffix(".csv")
+        if "date_sched" in merged.columns and pd.api.types.is_datetime64_any_dtype(merged["date_sched"]):
+            merged_csv = merged.copy()
+            merged_csv["date_sched"] = pd.to_datetime(merged_csv["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            out_csv.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out_csv.with_suffix(".csv.tmp")
+            merged_csv.to_csv(tmp, index=False)
+            os.replace(tmp, out_csv)
+        else:
+            _atomic_write_csv(merged, out_csv)
+        written.append(str(out_csv))
+        logging.info("[merged] updated %s (rows=%d)", out_csv.resolve(), len(merged))
 
-    logging.info("[merged] updated %s (rows=%d)", merged_path.resolve(), len(merged))
+    # Parquet writer (preserves nullable integers, categoricals, etc.)
+    if "parquet" in formats:
+        out_pq = merged_stem.with_suffix(".parquet")
+        out_pq.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(out_pq, index=False)
+        written.append(str(out_pq))
+        logging.info("[merged] updated %s (rows=%d)", out_pq.resolve(), len(merged))
+
+    return written
 
 # ───────────────────────── FDR harmonization helpers ─────────────────────────
 
@@ -464,7 +508,7 @@ def main():
 
     # Output (mirrors defense_forecast): no versioning
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--out-format", choices=["csv","parquet","both"], default="csv")
+    ap.add_argument("--out-format", choices=["csv","parquet","both"], default="both")
 
     # Policy / roster
     ap.add_argument("--discipline-priors", type=str, default=None,
@@ -493,6 +537,12 @@ def main():
     ga_path      = args.goals_assists if args.goals_assists else res("goals-assists", args.goals_assists, args.ga_root)
     sav_path     = args.saves if args.saves else (res("saves", args.saves, args.saves_root) if args.saves_root else None)
     def_path     = args.defense if args.defense else (res("defense", args.defense, args.defense_root) if args.defense_root else None)
+
+    # Louder guardrails if missing DEF/SAV
+    if def_path is None:
+        logging.warning("[DEF] not provided → clean sheets, GA penalties, and DCP will default to 0.")
+    if sav_path is None:
+        logging.warning("[SAV] not provided → GK saves points will default to 0.")
 
     # ---- Read inputs (dual loader) ----
     min_need = ["season","player_id","team_id","pos","gw_orig","pred_minutes"]
@@ -637,7 +687,7 @@ def main():
     base["p1"]  = base["p1"].where(base["p1"].notna(), (m > 0).astype(float))
     base["p60"] = base["p60"].where(base["p60"].notna(), np.clip(m/90.0, 0.0, 1.0))
     base["p60"] = np.minimum(base["p60"], base["p1"])
-    base["xp_appearance"] = pd.to_numeric(base.get("exp_minutes_points", np.nan), errors="coerce")
+    base["xp_appearance"] = pd.to_numeric(base.get("exp_minutes_points"), errors="coerce")
     base["xp_appearance"] = base["xp_appearance"].where(base["xp_appearance"].notna(), base["p1"] + base["p60"])
 
     # Goals & assists EP
@@ -778,10 +828,13 @@ def main():
     written = _write_points(out_rounded, out_paths)
     logging.info("[write] upcoming expected points -> %s (rows=%d)", ", ".join(written), len(out_rounded))
 
-    # Update cumulative combined file unless suppressed (renamed to expected_points.csv)
+    # Update cumulative combined file(s) unless suppressed (format-aware)
+    merged_written: Optional[List[str]] = None
     if not args.no_merged:
-        merged_fp = args.out_dir / "expected_points.csv"
-        _update_merged_csv(out_rounded, merged_fp, FORCED_KEY, sort_cols)
+        fmt_map = {"csv": ["csv"], "parquet": ["parquet"], "both": ["csv", "parquet"]}
+        merged_formats = fmt_map[args.out_format]
+        merged_stem = args.out_dir / "expected_points"
+        merged_written = _update_merged(out_rounded, merged_stem, FORCED_KEY, sort_cols, merged_formats)
 
     # Logs
     nonzero_ga = int((pd.to_numeric(base.get('xg_mean'), errors='coerce').fillna(0) > 0).sum() |
@@ -802,7 +855,7 @@ def main():
             "defense": str(def_path) if def_path else None,
         },
         "out": written,
-        "merged_out": (str(args.out_dir / "expected_points.csv") if not args.no_merged else None),
+        "merged_out": merged_written,
         "schema": SCHEMA_VERSION,
     }
     print(json.dumps(diag, indent=2))
