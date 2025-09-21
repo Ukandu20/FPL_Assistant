@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-points_forecast.py — upcoming fixtures — v1.8 (output rev)
+points_forecast.py — upcoming fixtures — v1.8 (output rev, with FDR harmonization)
 
 Output changes vs v1.7
 ----------------------
@@ -11,7 +11,12 @@ Output changes vs v1.7
 • The cumulative stack file is now <out-dir>/expected_points.csv (used to be expected_points_merged.csv).
 • Artifacts (e.g., roster drop audits) go under <out-dir>/<FUTURE_SEASON>/artifacts.
 
-All scoring/math and inputs auto-resolve behaviors are unchanged.
+New in this revision
+--------------------
+• fdr (fixture difficulty rating) is included in the output metadata and harmonized across inputs:
+  - Pulls fdr from GA, MIN, DEF, and SAV files when present.
+  - Per-row conflict resolution: GA → MIN → DEF → SAV priority; if sources disagree, choose the mode; tie → max.
+  - Stored as pandas nullable Int64, preserving missing values cleanly in CSV/Parquet.
 """
 
 from __future__ import annotations
@@ -128,8 +133,7 @@ def _resolve_input_path(explicit: Optional[Path],
         f"Tried:\n{tried}\nAlso tried glob fallback."
     )
 
-# ───────────────────────── math helpers (unchanged) ─────────────────────────
-# ... [unchanged helpers from your v1.7 script] ...
+# ───────────────────────── math helpers ─────────────────────────
 
 def _round_for_output(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -210,7 +214,6 @@ def _poisson_sf_vectorized(lam: np.ndarray, k_threshold: int) -> np.ndarray:
     return np.clip(sf, 0.0, 1.0)
 
 # ───────────────────────── KEY & merge helpers ─────────────────────────
-# (unchanged; trimmed for brevity – identical to v1.7)
 
 def _pick_first_date_col(df: pd.DataFrame, prefs: tuple[str, ...]) -> str | None:
     for c in prefs:
@@ -258,7 +261,6 @@ def _merge_with_nearest_date(base: pd.DataFrame,
     return m.drop(columns=drop_cols)
 
 # ───────────────────────── roster gate helpers ─────────────────────────
-# (unchanged from v1.7)
 
 def _build_roster_keyset(teams_json: Optional[Path],
                          seasons: List[str],
@@ -359,6 +361,53 @@ def _update_merged_csv(new_df: pd.DataFrame,
 
     logging.info("[merged] updated %s (rows=%d)", merged_path.resolve(), len(merged))
 
+# ───────────────────────── FDR harmonization helpers ─────────────────────────
+
+def _to_int_series(s: pd.Series) -> pd.Series:
+    """Coerce to pandas nullable Int64, preserving NA."""
+    x = pd.to_numeric(s, errors="coerce").round(0)
+    try:
+        return x.astype("Int64")
+    except Exception:
+        return x.astype("float").astype("Int64")
+
+def _resolve_fdr_rowwise(df: pd.DataFrame) -> pd.Series:
+    """
+    Choose fdr per row with priority: GA → MIN → DEF → SAV.
+    If multiple disagree, pick the mode; if still tied, pick max.
+    Returns Int64 series.
+    """
+    cand_cols = [c for c in ["fdr_ga","fdr_min","fdr_def","fdr_sav"] if c in df.columns]
+    if not cand_cols:
+        return pd.Series([pd.NA]*len(df), index=df.index, dtype="Int64")
+
+    chosen = df[cand_cols[0]].copy()
+    for c in cand_cols[1:]:
+        mask = chosen.isna()
+        if mask.any():
+            chosen[mask] = df.loc[mask, c]
+
+    # detect conflicts via rowwise min/max ignoring NAs
+    arrs = [df[c].astype("Int64") for c in cand_cols]
+    minv = arrs[0]
+    maxv = arrs[0]
+    for a in arrs[1:]:
+        minv = minv.combine(a, lambda l, r: r if pd.isna(l) else (l if pd.isna(r) else min(l, r)))
+        maxv = maxv.combine(a, lambda l, r: r if pd.isna(l) else (l if pd.isna(r) else max(l, r)))
+    conflict_mask = (~minv.isna()) & (~maxv.isna()) & (minv != maxv)
+    n_conflict = int(conflict_mask.sum())
+    if n_conflict:
+        logging.warning("[FDR] %d row(s) had conflicting FDR across inputs; resolving by mode→max with priority GA>MIN>DEF>SAV.", n_conflict)
+        for idx in df.index[conflict_mask]:
+            vals = [v for v in (df.at[idx, c] for c in cand_cols) if pd.notna(v)]
+            if vals:
+                counts: Dict[int,int] = {}
+                for v in vals:
+                    counts[int(v)] = counts.get(int(v), 0) + 1
+                best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]  # freq then value
+                chosen.at[idx] = best
+    return _to_int_series(chosen)
+
 # ───────────────────────── output helpers (mirror defense_forecast) ─────────────────────────
 
 def _out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
@@ -450,20 +499,20 @@ def main():
     min_df = _read_csv(minutes_path, min_need, tag="MIN")
     _coverage(min_df, ["season","gw_orig","player_id","team_id","p_play","p60","pred_minutes","exp_minutes_points",
                        "pos","player","date_sched","date_played","kickoff_time",
-                       "team","opponent","opponent_id","is_home","fbref_id","game_id"], "MIN")
+                       "team","opponent","opponent_id","is_home","fbref_id","game_id","fdr"], "MIN")
 
     ga_need = ["season","player_id","team_id","gw_orig"]
     ga_df = _read_csv(ga_path, ga_need, tag="GA")
     _coverage(ga_df, ["season","gw_orig","player_id","team_id",
-                      "p_goal","p_assist","prob_goal","prob_assist","p_goal_cal","p_assist_cal","prob_goal_cal","prob_assist_cal",
-                      "pred_goals_mean","pred_assists_mean",
+                      "p_goal","p_assist","prob_goal","prob_assist","p_goal_cal","prob_assist_cal","prob_goal_cal","prob_assist_cal",
+                      "pred_goals_mean","pred_assists_mean","fdr",
                       "player","pos","date_sched","date_played","kickoff_time",
                       "team","opponent","opponent_id","is_home","fbref_id","game_id"], "GA")
 
     def_df = None
     if def_path:
         def_df = _read_csv(def_path, tag="DEF")
-        _coverage(def_df, ["season","gw_orig","player_id","team_id",
+        _coverage(def_df, ["season","gw_orig","player_id","team_id","fdr",
                            "prob_cs","p_teamCS","lambda90","exp_gc",
                            "prob_dcp","p_dcp","dcp_prob",
                            "lambda90_dcp","dcp_lambda90","dcp_p90","lambda_dcp90",
@@ -473,7 +522,7 @@ def main():
     sav_df = None
     if sav_path:
         sav_df = _read_csv(sav_path, tag="SAV")
-        _coverage(sav_df, ["season","gw_orig","player_id","team_id","pred_saves_mean","pred_saves_poisson",
+        _coverage(sav_df, ["season","gw_orig","player_id","team_id","fdr","pred_saves_mean","pred_saves_poisson",
                            "pred_saves_p90_mean","pred_saves_p90_poisson","pred_minutes","player","pos",
                            "date_sched","date_played","kickoff_time"], "SAV")
 
@@ -500,14 +549,38 @@ def main():
 
     # Identity & legacy meta from GA first, then MIN
     if ga_df is not None and len(ga_df):
-        id_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time"]
+        id_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time","fdr"]
         right = ga_df[KEY + [c for c in id_keep if c in ga_df.columns]]
         base = _merge_with_nearest_date(base, right, KEY, [c for c in id_keep if c in right.columns], tag="GA:identity+meta")
-    fill_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time"]
+    fill_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time","fdr"]
     right2 = min_df[KEY + [c for c in fill_keep if c in min_df.columns]]
     base = _merge_with_nearest_date(base, right2, KEY, [c for c in fill_keep if c in right2.columns], tag="MIN:meta-fallback")
     for c in ("player","pos"):
         if c not in base.columns: base[c] = np.nan
+
+    # Collect FDR from each source into separate columns for consistency checks
+    # GA fdr (may have been merged in under name 'fdr')
+    if "fdr" in base.columns:
+        # If this 'fdr' came from GA merge (most recent), park as fdr_ga; we will pull minutes/def/sav next
+        base = base.rename(columns={"fdr": "fdr_ga"})
+    # Pull minutes fdr explicitly
+    if "fdr" in min_df.columns:
+        fmin = right2[KEY + ["fdr"]].rename(columns={"fdr": "fdr_min"})
+        base = _merge_with_nearest_date(base, fmin, KEY, ["fdr_min"], tag="MIN:fdr")
+    # DEF fdr
+    if def_df is not None and "fdr" in def_df.columns:
+        fdef = def_df[KEY + ["fdr"]].copy().rename(columns={"fdr":"fdr_def"})
+        base = _merge_with_nearest_date(base, fdef, KEY, ["fdr_def"], tag="DEF:fdr")
+    # SAV fdr
+    if sav_df is not None and "fdr" in sav_df.columns:
+        fsav = sav_df[KEY + ["fdr"]].copy().rename(columns={"fdr":"fdr_sav"})
+        base = _merge_with_nearest_date(base, fsav, KEY, ["fdr_sav"], tag="SAV:fdr")
+
+    # Normalize candidate FDRs to Int64 and resolve to a single 'fdr'
+    for cc in ["fdr_ga","fdr_min","fdr_def","fdr_sav"]:
+        if cc in base.columns:
+            base[cc] = _to_int_series(base[cc])
+    base["fdr"] = _resolve_fdr_rowwise(base)
 
     # GA probabilities & expectations
     if ga_df is not None and len(ga_df):
@@ -593,8 +666,8 @@ def main():
     # Saves EP (GK only) — gated by p1
     raw_lambda = pd.to_numeric(base.get("saves_lambda_raw"), errors="coerce")
     had_pm = bool(sav_df is not None and (
-        (sav_df is not None and "pred_saves_mean" in sav_df.columns) or
-        (sav_df is not None and "pred_saves_poisson" in sav_df.columns)
+        ("pred_saves_mean" in (sav_df.columns if sav_df is not None else [])) or
+        ("pred_saves_poisson" in (sav_df.columns if sav_df is not None else []))
     ))
     lam_saves = raw_lambda if had_pm else raw_lambda * np.clip(m/90.0, 0.0, None)
     lam_saves = lam_saves.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
@@ -661,7 +734,7 @@ def main():
     out_cols = list(dict.fromkeys([
         *FORCED_KEY, "player", "pos",
         "date_sched", "date_played", "kickoff_time",
-        "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id",
+        "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id", "fdr",
         "pred_minutes", "p1", "p60",
         "p_goal", "p_assist", "xg_mean", "xa_mean",
         "team_prob_cs", "team_ga_lambda90", "team_exp_gc",
@@ -679,6 +752,9 @@ def main():
             sort_cols.append(dc)
 
     out = base[out_cols].copy().sort_values(by=sort_cols)
+    # ensure 'fdr' stays Int64 in memory; writer will preserve it (CSV writes as int or blank)
+    if "fdr" in out.columns:
+        out["fdr"] = _to_int_series(out["fdr"])
     out_rounded = _round_for_output(out)
 
     # Determine GW window for output naming (robust even with explicit inputs)
