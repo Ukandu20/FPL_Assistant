@@ -1,38 +1,16 @@
 #!/usr/bin/env python3
 """
-Single-GW selector (MILP) — chip-aware, team validator, rich JSON output
+Single-GW selector (MILP) — chip-aware, sweep runner, team validator, rich JSON output.
 
-New in this revision
---------------------
-• Deterministic transfer controls:
-  - --exact-transfers K: force exactly K total transfers (buys).
-  - --max-total-transfers / --min-total-transfers: cap total transfers.
-  - Always cap totals to free_transfers + max_extra_transfers when hits are allowed.
-• Preflight feasibility:
-  - Detect missing owned rows and 3-per-team lower-bound; optional padding (--pad-missing-owned).
-  - --dry-run-validate prints diagnostics and exits (no solve).
-• Robust padding for missing owned (derives team code/id correctly from state + teams_json).
-• Hits consistency with exact totals (hits == max(0, exact - free_transfers)).
-• FH/WC: hits=0 and **free transfers are unaffected** (used=0; after=before; next=before+1, capped at 5).
-• Meta includes detailed FT accounting and transfer control settings.
-
-Existing Features
------------------
-- Chips: WC/FH(no hit cost & no FT cap), TC(multiplier), BB(all 15 count).
-- Team column: accepts 'team' (preferred) or legacy 'team_quota_key'.
-- Validates team codes vs --teams-json mapping (code -> team_id).
-- Human-readable output with UTF-8 names and xPts rounded to 1 dp.
-- Budget breakdown with bank_before/bank_after.
-- Formation string (DEF-MID-FWD), enriched transfers details.
-
-Usage
------
-python -m scripts.optimizers.single_gw \
-  --team-state data/processed/registry/state/team_state.json \
-  --optimizer-input data/aggregator/optimizer_input.parquet \
-  --teams-json data/processed/registry/_id_lookup_teams.json \
-  --out data/plans/gw04.json \
-  --gw 4 --allow-hits --max-extra-transfers 1 --exact-transfers 1
+This build:
+• EV auto-detection: picks the first non-empty among ['exp_pts_mean','xPts','xpts','exp_points'].
+• 'ha' renamed to 'venue' across output objects.
+• Robust handling of pd.NA in is_home and dtype-safe padding.
+• Sweep runner:
+    - NONE: produce K=1..FT (+hits to FT+H if requested).
+    - TC/BB: same K sweep as NONE, but saved under chips/TC/ and chips/BB/.
+    - WC/FH: run many solves with exact_transfers K=1..15 (hits==0), save any feasible results under chips/WC/ and chips/FH/.
+• Opponent/venue/fdr included per player and per transfer.
 """
 from __future__ import annotations
 
@@ -48,7 +26,10 @@ except Exception:
     raise SystemExit("pulp is required (pip install pulp).")
 
 TEAM_COL_CANDIDATES = ("team", "team_quota_key")
-MAX_FREE_TRANSFERS_STACK = 5  # cap for stacking free transfers
+MAX_FREE_TRANSFERS_STACK = 5
+
+OPP_COLS = ("opponent", "opponent_id", "is_home")
+FDR_COLS = ("fdr",)
 
 
 # ---------------- helpers ----------------
@@ -64,7 +45,7 @@ def _read_any(path: str) -> pd.DataFrame:
 
 
 def _parse_topk(s: str) -> Dict[str, int]:
-    out = {"GK": 5, "DEF": 15, "MID": 15, "FWD": 10}
+    out = {"GK": 20, "DEF": 60, "MID": 60, "FWD": 40}
     if not s:
         return out
     for part in s.split(","):
@@ -88,15 +69,26 @@ def _get_team_col_name(df: pd.DataFrame) -> str:
     raise ValueError("optimizer_input must include 'team' (preferred) or 'team_quota_key'.")
 
 
-def _load_team_lookup_json(path: Optional[str]) -> Optional[Dict[str, str]]:
-    if not path:
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    return {str(k).upper(): str(v) for k, v in d.items()}  # code -> team_id
+def _is_na_like(x) -> bool:
+    try:
+        return x is None or (isinstance(x, float) and np.isnan(x)) or pd.isna(x)
+    except Exception:
+        return x is None
 
 
-def _validate_teams(df: pd.DataFrame, state: dict, teams_json: Optional[str]) -> None:
+def _to_str(x) -> str:
+    return "" if _is_na_like(x) else str(x)
+
+
+def _first_nonempty_str(*vals) -> str:
+    for v in vals:
+        s = _to_str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _validate_teams(df: pd.DataFrame) -> None:
     team_col = _get_team_col_name(df)
     if "team_id" not in df.columns:
         raise ValueError("optimizer_input missing 'team_id'")
@@ -104,7 +96,6 @@ def _validate_teams(df: pd.DataFrame, state: dict, teams_json: Optional[str]) ->
     chk[team_col] = chk[team_col].astype(str).str.strip().str.upper()
     chk["team_id"] = chk["team_id"].astype(str)
 
-    # internal: single code per team_id in this file
     nunique = chk.groupby("team_id")[team_col].nunique()
     bad_ids = nunique[nunique > 1]
     if not bad_ids.empty:
@@ -113,27 +104,8 @@ def _validate_teams(df: pd.DataFrame, state: dict, teams_json: Optional[str]) ->
                    .reset_index(name="rows").sort_values(["team_id", "rows"], ascending=[True, False]))
         raise ValueError("Inconsistent team code per team_id:\n" + details.to_string(index=False))
 
-    # canonical mapping check
-    cmap = _load_team_lookup_json(teams_json)
-    if cmap:
-        unknown = chk[~chk[team_col].isin(cmap.keys())][[team_col]].drop_duplicates()
-        if not unknown.empty:
-            raise ValueError("Unknown team code(s) vs mapping:\n" + unknown.to_string(index=False))
-        tmp = chk.copy()
-        tmp["canon_team_id"] = tmp[team_col].map(cmap)
-        mism = tmp[tmp["canon_team_id"].notna() & (tmp["team_id"] != tmp["canon_team_id"])]
-        if not mism.empty:
-            slim = (mism.groupby([team_col, "team_id", "canon_team_id"])
-                    .size().reset_index(name="rows").sort_values("rows", ascending=False))
-            raise ValueError("team_id mismatch vs mapping (code -> team_id):\n" + slim.to_string(index=False))
 
-
-def _preflight_required_transfers(df: pd.DataFrame, state: dict, gw: int,
-                                  teams_json: Optional[str]) -> tuple:
-    """
-    Returns (missing_owned_ids, teamcap_excess_lb, lower_bound, details_df).
-    lower_bound = max(len(missing_owned_ids), teamcap_excess_lb).
-    """
+def _preflight_required_transfers(df: pd.DataFrame, state: dict, gw: int) -> tuple:
     team_col = _get_team_col_name(df)
     owned = pd.DataFrame(state.get("squad", []))
     if owned.empty:
@@ -144,11 +116,9 @@ def _preflight_required_transfers(df: pd.DataFrame, state: dict, gw: int,
                .assign(player_id=lambda x: x["player_id"].astype(str).str.strip()))
     j = owned.merge(present, on="player_id", how="left", suffixes=("_state", ""))
 
-    # A) Missing owned coverage
     missing = j[j[team_col].isna()]
     missing_ids = missing["player_id"].tolist()
 
-    # B) Team-cap lower bound (counts from input mapping)
     counts = (j.dropna(subset=[team_col])[team_col].astype(str).str.upper().value_counts())
     teamcap_excess_lb = int(sum(max(0, int(c) - 3) for c in counts.tolist()))
 
@@ -156,54 +126,18 @@ def _preflight_required_transfers(df: pd.DataFrame, state: dict, gw: int,
     return missing_ids, teamcap_excess_lb, lower_bound, j
 
 
-def _derive_code_and_id_from_state_row(row: pd.Series, cmap: Optional[Dict[str, str]]) -> Tuple[str, str]:
-    """
-    Returns (team_code, canonical_team_id).
-    - Prefers explicit team code if present in state (team_state or team).
-    - If state['team_id'] looks like a code (A–Z), treat as code; else treat as canonical id.
-    - Uses teams_json cmap (code -> team_id) to resolve the canonical id or reverse-lookup the code.
-    """
-    cmap = cmap or {}
-
-    # Prefer explicit team code from state (if your state ever includes one)
+def _derive_code_and_id_from_state_row(row: pd.Series) -> Tuple[str, str]:
     code = _first_nonempty_str(row.get("team_state"), row.get("team")).upper()
-
-    # State team_id (may actually be a code in your schema)
-    state_tid = _first_nonempty_str(row.get("team_id_state"), row.get("team_id"))
-    looks_like_code = bool(re.fullmatch(r"[A-Za-z]{2,4}", state_tid))  # e.g., "MCI", "ARS"
-
-    if not code and looks_like_code:
-        code = state_tid.upper()
-
-    # Canonical team_id
-    canon_id = ""
-    if code and code in cmap:
-        canon_id = str(cmap[code])
-    elif state_tid and not looks_like_code:
-        # Treat as canonical id; reverse-lookup code if missing
-        canon_id = state_tid
-        if not code:
-            for k, v in cmap.items():
-                if str(v) == state_tid:
-                    code = str(k).upper()
-                    break
-
+    canon_id = _first_nonempty_str(row.get("team_id_state"), row.get("team_id"))
     if not code or not canon_id:
         raise ValueError(
-            "Cannot derive team code/id from state row: "
-            f"team_state='{row.get('team_state')}', team='{row.get('team')}', "
-            f"team_id_state='{row.get('team_id_state')}', team_id='{row.get('team_id')}'. "
-            "Check teams_json and state."
+            "Cannot derive team code/id from state row; ensure team_state.json is migrated "
+            "(team_id canonical alphanumeric; short code in 'team')."
         )
     return code, canon_id
 
 
-
 def _preflight_budget_lb(df: pd.DataFrame, state: dict, gw: int, exact_transfers: Optional[int], missing_ids: List[str]) -> None:
-    """
-    If missing-owned exist and padding is off, check a simple necessary budget bound for exact_transfers.
-    Raises with an explanatory error if clearly impossible.
-    """
     if exact_transfers is None:
         return
     E = int(exact_transfers)
@@ -234,24 +168,6 @@ def _preflight_budget_lb(df: pd.DataFrame, state: dict, gw: int, exact_transfers
             "Fix: include missing owned in optimizer_input or use --pad-missing-owned."
         )
 
-def _is_na_like(x) -> bool:
-    try:
-        import pandas as pd, numpy as np  # already imported at top
-        return x is None or (isinstance(x, float) and np.isnan(x)) or pd.isna(x)
-    except Exception:
-        return x is None
-
-def _to_str(x) -> str:
-    return "" if _is_na_like(x) else str(x)
-
-def _first_nonempty_str(*vals) -> str:
-    for v in vals:
-        s = _to_str(v).strip()
-        if s:
-            return s
-    return ""
-
-
 
 # --------------- core MILP ----------------
 def solve_single_gw(
@@ -267,7 +183,6 @@ def solve_single_gw(
     formation_bounds: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]] = ((3, 5), (2, 5), (1, 3)),
     chip: Optional[str] = None,         # None|WC|FH|TC|BB
     tc_multiplier: float = 3.0,
-    teams_json: Optional[str] = None,   # path to _id_lookup_teams.json
     verbose: bool = False,
     # Deterministic transfer controls
     exact_transfers: Optional[int] = None,
@@ -292,13 +207,37 @@ def solve_single_gw(
 
     # Data
     df = _read_any(optimizer_input_path)
-    required = ["season", "gw", "player_id", "team_id", "pos", "price", "sell_price",
-                "p60", "exp_pts_mean", "exp_pts_var", "cs_prob", "is_dgw", "captain_uplift"]
-    missing = [c for c in required if c not in df.columns]
+
+    # Required core columns
+    core_required = [
+        "season", "gw", "player_id", "team_id", "pos", "price", "sell_price",
+        "p60", "exp_pts_var", "cs_prob", "is_dgw", "captain_uplift", "player",
+        "team", "opponent", "opponent_id", "is_home"
+    ]
+    missing = [c for c in core_required if c not in df.columns]
     if missing:
         raise ValueError(f"optimizer_input missing columns: {missing}")
-    _ = _get_team_col_name(df)
 
+    # EV detection (accept several column names)
+    ev_candidates = ["exp_pts_mean", "xPts", "xpts", "exp_points"]
+    ev_col = None
+    for c in ev_candidates:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().any() and (s.fillna(0).abs().sum() > 0):
+                ev_col = c
+                break
+    if ev_col is None:
+        df["__ev__"] = 0.0
+        ev_col = "__ev__"
+
+    # Optional FDR
+    has_fdr = any(c in df.columns for c in FDR_COLS)
+    fdr_col = next((c for c in FDR_COLS if c in df.columns), None)
+
+    team_col_name = _get_team_col_name(df)
+
+    # Filter GW
     if gw is not None:
         df = df[df["gw"] == gw].copy()
         if df.empty:
@@ -309,39 +248,43 @@ def solve_single_gw(
             raise ValueError("optimizer_input has multiple GWs; specify --gw")
         gw = int(gws[0])
 
-    # >>> Preflight feasibility BEFORE validation (we might pad then validate)
-    missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw, teams_json)
+    # Preflight feasibility
+    missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw)
 
-    # Optionally auto-pad missing owned so small-K exact scenarios remain feasible
+    # Optional auto-pad missing owned — preserve dtypes
     if missing_ids and pad_missing_owned:
-        cmap = _load_team_lookup_json(teams_json) or {}
-        team_col_name = _get_team_col_name(df)
-
         pads: List[dict] = []
+        all_cols = list(df.columns)
         for pid_m in missing_ids:
             row = owned_view.loc[owned_view["player_id"] == pid_m].iloc[0]
-            code, canon_team_id = _derive_code_and_id_from_state_row(row, cmap)
+            code, canon_team_id = _derive_code_and_id_from_state_row(row)
             pos_state = _first_nonempty_str(row.get("pos_state"), row.get("pos")).upper()
             name = _first_nonempty_str(row.get("name"))
             if not pos_state:
                 raise ValueError(f"Cannot pad missing owned {pid_m}: missing pos in state.")
-
             buy_p = float(row.get("buy_price") or row.get("sell_price") or 0.0)
             sell_p = float(row.get("sell_price") or row.get("buy_price") or 0.0)
-            pads.append({
+
+            pad_row = {c: np.nan for c in all_cols}
+            pad_row.update({
                 "season": season, "gw": gw, "player_id": pid_m,
                 team_col_name: code, "team_id": str(canon_team_id), "pos": pos_state,
                 "price": buy_p, "sell_price": sell_p,
-                "p60": 0.0, "exp_pts_mean": 0.0, "exp_pts_var": 0.0,
+                "p60": 0.0, ev_col: 0.0, "exp_pts_var": 0.0,
                 "cs_prob": 0.0, "is_dgw": 0, "captain_uplift": 0.0,
                 "player": name,
+                "opponent": np.nan, "opponent_id": np.nan, "is_home": np.nan,
             })
-        if pads:
-            df = pd.concat([df, pd.DataFrame(pads)], ignore_index=True)
-            # Recompute bounds after padding
-            missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw, teams_json)
+            if has_fdr and fdr_col:
+                pad_row[fdr_col] = np.nan
+            pads.append(pad_row)
 
-    # Dry-run diagnostics (no solve)
+        if pads:
+            df = pd.concat([df, pd.DataFrame(pads)[all_cols]], ignore_index=True)
+            # Recompute bounds after padding
+            missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw)
+
+    # Dry-run diagnostics
     if dry_run_validate:
         diag = {
             "gw": gw,
@@ -353,7 +296,7 @@ def solve_single_gw(
         print(json.dumps(diag, indent=2))
         return {"diagnostics": diag}
 
-    # If user forces exact K below the lower bound, fail loud & clear
+    # Exact K feasibility
     if exact_transfers is not None and lb > int(exact_transfers):
         raise ValueError(
             f"Infeasible: exact_transfers={exact_transfers} but minimum required={lb} "
@@ -361,35 +304,64 @@ def solve_single_gw(
             f"{'Use --pad-missing-owned or fix optimizer_input.' if missing_ids else 'Adjust K or fix team caps.'}"
         )
 
-    # If missing-owned remain and padding is off, check simple budget lower bound (explanatory)
     if missing_ids and not pad_missing_owned:
         _preflight_budget_lb(df, state, gw, exact_transfers, missing_ids)
 
-    # Now validate teams (also validates any padded rows)
-    _validate_teams(df, state=state, teams_json=teams_json)
+    _validate_teams(df)
 
-    # Candidate pool: all owned + topK per position by EV
-    team_col = _get_team_col_name(df)
+    # Candidate pool: all owned + topK per pos by EV
     df["owned"] = df["player_id"].astype(str).isin(squad_owned)
-    df[team_col] = df[team_col].astype(str).str.strip().str.upper()
+    df[team_col_name] = df[team_col_name].astype(str).str.strip().str.upper()
 
     keep_rows: List[pd.DataFrame] = []
-    kmap = topk or {"GK": 5, "DEF": 15, "MID": 15, "FWD": 10}
+    kmap = topk or {"GK": 20, "DEF": 60, "MID": 60, "FWD": 40}
     for pos_name, g in df.groupby("pos", as_index=False):
-        g = g.sort_values(["owned", "exp_pts_mean"], ascending=[False, False])
-        k = kmap.get(pos_name, 10)
+        g = g.sort_values(["owned", ev_col], ascending=[False, False])
+        k = kmap.get(pos_name, 50)
         keep_rows.append(pd.concat([g[g["owned"]], g[~g["owned"]].head(k)], ignore_index=True))
     pool = pd.concat(keep_rows, ignore_index=True).drop_duplicates("player_id").reset_index(drop=True)
 
-    # Arrays
+    # Arrays / safe dtypes
     pid = pool["player_id"].astype(str).tolist()
     pos = pool["pos"].astype(str).tolist()
-    teams = pool[team_col].astype(str).tolist()
+    teams = pool[team_col_name].astype(str).tolist()
     ownedm = pool["owned"].astype(bool).to_numpy()
-    price = pool["price"].astype(float).to_numpy()
-    ev = pool["exp_pts_mean"].astype(float).to_numpy()
-    var = pool["exp_pts_var"].astype(float).clip(lower=0.0).to_numpy()
-    capup = pool["captain_uplift"].astype(float).clip(lower=0.0).to_numpy()
+
+    price = pd.to_numeric(pool["price"], errors="coerce").fillna(0.0).astype(float).to_numpy()
+
+    # EV and variance
+    ev_series = pd.to_numeric(pool[ev_col], errors="coerce").fillna(0.0)
+    ev = ev_series.astype(float).to_numpy()
+
+    var_series = pd.to_numeric(pool["exp_pts_var"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    var = var_series.astype(float).to_numpy()
+
+    capup = pd.to_numeric(pool["captain_uplift"], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float).to_numpy()
+
+    # Opponent metadata
+    opp = pool["opponent"].astype(object).where(~pool["opponent"].isna(), None).tolist()
+
+    def _to_bool_or_none(v):
+        if _is_na_like(v):
+            return None
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if isinstance(v, (int, np.integer)):
+            return bool(int(v))
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in {"true", "t", "1", "h", "home"}:
+                return True
+            if s in {"false", "f", "0", "a", "away"}:
+                return False
+        return None
+
+    is_home_vals = [_to_bool_or_none(v) for v in pool["is_home"].tolist()]
+    venue = [("H" if b is True else ("A" if b is False else None)) for b in is_home_vals]
+
+    fdr_vals = None
+    if has_fdr and fdr_col:
+        fdr_vals = pd.to_numeric(pool[fdr_col], errors="coerce").where(~pool[fdr_col].isna(), None).tolist()
 
     names: List[Optional[str]] = [None] * len(pool)
     if "player" in pool.columns:
@@ -455,7 +427,7 @@ def solve_single_gw(
         if cap_cannot_equal_vice:
             m += cap[i] + vcap[i] <= 1
 
-    # Transfers & hits (chip-aware) — with deterministic controls
+    # Transfers & hits (chip-aware)
     transfers_cnt = pulp.lpSum(buy[i] for i in range(N))
     chip_norm = (chip or "").upper() or None
 
@@ -467,7 +439,7 @@ def solve_single_gw(
     Tmin = _int_or_none(min_total_transfers)
 
     if chip_norm in {"WC", "FH"}:
-        # zero hit cost semantics; still allow scenario caps/forces
+        # Unlimited by hits; if exact K is given, honor it; otherwise allow any K (unless caller sets min/max)
         m += hits == 0, "hits_zero_chip"
         if E is not None:
             if E < 0:
@@ -482,7 +454,6 @@ def solve_single_gw(
         if E is not None:
             if E < 0:
                 raise ValueError("--exact-transfers must be >= 0")
-            # exact total transfers
             m += transfers_cnt == E, "exact_transfers"
             if not allow_hits and E > free_transfers_before:
                 raise ValueError("exact_transfers > free_transfers but --allow-hits is not set")
@@ -492,7 +463,6 @@ def solve_single_gw(
                 m += hits == (E - free_transfers_before), "hits_exact_match"
                 m += hits <= max_extra_transfers, "hits_cap_exact"
         else:
-            # original semantics + hard-cap on total
             if not allow_hits:
                 m += transfers_cnt <= free_transfers_before, "no_hits_allowed"
                 m += hits == 0, "hits_zero"
@@ -526,7 +496,7 @@ def solve_single_gw(
     team_ev_term = pulp.lpSum(start[i] * ev[i] for i in range(N))
     cap_uplift = pulp.lpSum(cap[i] * capup[i] for i in range(N))
     if chip_norm == "TC":
-        factor = max(0.0, float(tc_multiplier) - 1.0)  # e.g., 3x => +2x uplift
+        factor = max(0.0, float(tc_multiplier) - 1.0)  # 3x => +2x uplift
         cap_uplift = pulp.lpSum(cap[i] * (factor * capup[i]) for i in range(N))
     if chip_norm == "BB":
         team_ev_term = pulp.lpSum(in_squad[i] * ev[i] for i in range(N))
@@ -542,9 +512,28 @@ def solve_single_gw(
     if pulp.LpStatus[res] != "Optimal":
         raise RuntimeError(f"MILP not optimal: status={pulp.LpStatus[res]}")
 
-    # Extract
+    # Extract helpers
     def picks(mask):
         return [pid[i] for i in range(N) if pulp.value(mask[i]) > 0.5]
+
+    def to_player_obj(xid: Optional[str]) -> Optional[dict]:
+        if xid is None:
+            return None
+        i = pid.index(xid)
+        base = {
+            "id": xid,
+            "name": (None if names[i] is None else names[i]),
+            "pos": pos[i],
+            "team": teams[i],
+            "xPts": _round1(ev[i]),
+            "opp": opp[i],
+            "is_home": is_home_vals[i],
+            "venue": venue[i],  # renamed
+        }
+        if has_fdr and fdr_col:
+            val = None if _is_na_like(fdr_vals[i]) else float(fdr_vals[i])
+            base["fdr"] = val
+        return base
 
     xi_ids = picks(start)
     cap_pid = picks(cap)[0]
@@ -572,14 +561,12 @@ def solve_single_gw(
     ev_map = {pid[i]: float(ev[i]) for i in range(N)}
     price_map = {pid[i]: float(price[i]) for i in range(N)}
     sell_map = {pid[i]: float(owned_sell_map.get(pid[i], 0.0)) for i in range(N)}
+    opp_map = {pid[i]: opp[i] for i in range(N)}
+    is_home_map = {pid[i]: is_home_vals[i] for i in range(N)}
+    venue_map = {pid[i]: venue[i] for i in range(N)}
+    fdr_map = {pid[i]: (None if (not has_fdr or fdr_vals is None) else fdr_vals[i]) for i in range(N)}
 
-    def _pobj(xid: Optional[str]) -> Optional[dict]:
-        if xid is None:
-            return None
-        return {"id": xid, "name": name_map.get(xid), "pos": pos_map.get(xid),
-                "team": team_map.get(xid), "xPts": _round1(ev_map.get(xid))}
-
-    # Transfers enriched (pairing sells to buys just for readability)
+    # Transfers enriched (pair sells to buys)
     transfers_out: List[dict] = []
     remaining_buys = list(buy_ids)
     for out_id in sell_ids:
@@ -587,26 +574,41 @@ def solve_single_gw(
         buy_price = float(price_map.get(in_id, 0.0)) if in_id else None
         sell_value = float(sell_map.get(out_id, 0.0))
         pair_net = (buy_price if buy_price is not None else 0.0) - sell_value
-        transfers_out.append({
+        payload = {
             "out": out_id, "out_name": name_map.get(out_id), "out_pos": pos_map.get(out_id),
             "out_team": team_map.get(out_id), "out_xPts": _round1(ev_map.get(out_id)),
+            "out_opp": opp_map.get(out_id), "out_is_home": is_home_map.get(out_id), "out_venue": venue_map.get(out_id),
             "in": in_id, "in_name": name_map.get(in_id) if in_id else None,
             "in_pos": pos_map.get(in_id) if in_id else None,
             "in_team": team_map.get(in_id) if in_id else None,
             "in_xPts": _round1(ev_map.get(in_id)) if in_id else None,
+            "in_opp": opp_map.get(in_id) if in_id else None,
+            "in_is_home": is_home_map.get(in_id) if in_id else None,
+            "in_venue": venue_map.get(in_id) if in_id else None,
             "sell_value": sell_value, "buy_price": buy_price,
             "pair_net": _round1(pair_net),
-            "price_delta": float(0.0 - sell_value) if in_id else float(0.0 - sell_value),
-        })
+            "price_delta": float(0.0 - sell_value),
+        }
+        if has_fdr:
+            payload["out_fdr"] = fdr_map.get(out_id)
+            payload["in_fdr"] = fdr_map.get(in_id) if in_id else None
+        transfers_out.append(payload)
+
     for in_id in remaining_buys:
         buy_price = float(price_map.get(in_id, 0.0))
-        transfers_out.append({
+        payload = {
             "out": None, "out_name": None, "out_pos": None, "out_team": None, "out_xPts": None,
+            "out_opp": None, "out_is_home": None, "out_venue": None,
             "in": in_id, "in_name": name_map.get(in_id), "in_pos": pos_map.get(in_id),
             "in_team": team_map.get(in_id), "in_xPts": _round1(ev_map.get(in_id)),
+            "in_opp": opp_map.get(in_id), "in_is_home": is_home_map.get(in_id), "in_venue": venue_map.get(in_id),
             "sell_value": None, "buy_price": buy_price,
             "pair_net": _round1(buy_price), "price_delta": float(buy_price),
-        })
+        }
+        if has_fdr:
+            payload["out_fdr"] = None
+            payload["in_fdr"] = fdr_map.get(in_id)
+        transfers_out.append(payload)
 
     # Objective parts (chip-aware EV term for reporting)
     if chip_norm == "BB":
@@ -649,7 +651,7 @@ def solve_single_gw(
             bindings.append("3-per-team")
             break
 
-    if E is not None:
+    if exact_transfers is not None:
         bindings.append("exact_transfers")
     if (max_total_transfers is not None):
         bindings.append("max_total_transfers")
@@ -658,15 +660,13 @@ def solve_single_gw(
     if chip_norm not in {"WC", "FH"} and allow_hits:
         bindings.append("transfer_cap_total")
 
-    # Free transfer accounting (this GW & next GW projection)
+    # Free transfer accounting
     transfers_used = len(buy_ids)
-
     if chip_norm in {"WC", "FH"}:
-        # Chip weeks do not consume saved FTs and still gain the +1 rollover (capped).
         free_used = 0
         free_after = free_transfers_before
         free_next = min(MAX_FREE_TRANSFERS_STACK, free_after + 1)
-        extra_used = 0  # semantics: hits=0 and we don't report "extra" vs free on chips
+        extra_used = 0
     else:
         free_used = min(free_transfers_before, transfers_used)
         free_after = max(0, free_transfers_before - free_used)
@@ -702,31 +702,28 @@ def solve_single_gw(
             "transfer_controls": {
                 "allow_hits": bool(allow_hits),
                 "max_extra_transfers": int(max_extra_transfers),
-                "exact_transfers": E,
-                "max_total_transfers": Tmax,
-                "min_total_transfers": Tmin,
-            },
-            "inputs": {
-                "team_state_path": team_state_path,
-                "optimizer_input_path": optimizer_input_path,
-                "teams_json": teams_json,
+                "exact_transfers": (None if exact_transfers is None else int(exact_transfers)),
+                "max_total_transfers": (None if max_total_transfers is None else int(max_total_transfers)),
+                "min_total_transfers": (None if min_total_transfers is None else int(min_total_transfers)),
             },
         },
         "chip": chip_norm or None,
         "transfers": transfers_out,
-        "xi": [_pobj(x) for x in xi_ids],
-        "bench": {"order": [_pobj(x) for x in bench_order_ids], "gk": _pobj(bench_gk_id)},
-        "captain": _pobj(cap_pid),
-        "vice": _pobj(vcap_pid),
+        "xi": [to_player_obj(x) for x in xi_ids],
+        "bench": {"order": [to_player_obj(x) for x in bench_order_ids], "gk": to_player_obj(bench_gk_id)},
+        "captain": to_player_obj(cap_pid),
+        "vice": to_player_obj(vcap_pid),
         "explanations": {
             "binding_constraints": sorted(set(bindings)),
             "notes": [
+                f"EV source column: {ev_col}",
                 "Captain adds captain_uplift on top of XI EV (TC scales uplift).",
-                "WC/FH: zero hit cost; totals may still be capped via exact/min/max flags for scenario control. Free transfers unaffected this GW and still gain +1 (capped at 5).",
+                "WC/FH: hits=0; K is enforced only if provided (sweep will run many exact K).",
                 "BB: counts EV of all 15 players.",
                 "Outfield bench ranks are 1..3; GK bench is implied.",
-                "Team column validated vs --teams-json mapping.",
+                "Team column validated from optimizer_input.",
                 "Next-GW free transfers projection assumes +1 carry, capped at 5.",
+                "Player objects expose opponent, is_home (bool), and venue ('H'/'A').",
             ],
         },
     }
@@ -739,39 +736,233 @@ def solve_single_gw(
     return plan
 
 
+# ---------------- sweep runner ----------------
+def run_sweep(
+    team_state_path: str,
+    optimizer_input_path: str,
+    out_base_dir: str,
+    gw: int,
+    allow_hits: bool,
+    max_extra_transfers: int,
+    sweep_free_transfers: bool,
+    sweep_include_hits: bool,
+    sweep_chips_csv: str,
+    risk_lambda: float,
+    topk: Dict[str, int],
+    pad_missing_owned: bool,
+    verbose: bool,
+) -> Dict[str, str]:
+    """
+    Produce multiple plans in one call. Returns dict alias -> path.
+
+    Folder layout:
+      <out_base_dir>/single/gw{gw}/
+        ├─ NONE plans (e.g., 1t.json, 2t.json, ...)
+        └─ chips/
+            ├─ TC/TC_1t.json, ...
+            ├─ BB/BB_1t.json, ...
+            ├─ WC/1t.json, 2t.json, ..., 15t.json (only feasible ones)
+            └─ FH/1t.json, 2t.json, ..., 15t.json (only feasible ones)
+    """
+    with open(team_state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    free_before = int(state.get("free_transfers", 1))
+
+    # Base K list for NONE/TC/BB
+    ks: List[int] = []
+    if sweep_free_transfers:
+        ks.extend(range(1, max(1, free_before) + 1))
+    else:
+        ks.append(min(1, max(1, free_before)))
+
+    if sweep_include_hits and allow_hits:
+        ks.extend(range(free_before + 1, free_before + max(1, max_extra_transfers) + 1))
+
+    chips_list = [c.strip().upper() for c in (sweep_chips_csv or "NONE").split(",") if c.strip()]
+    chips_list = [c for c in chips_list if c in {"NONE", "TC", "BB", "FH", "WC"}]
+
+    out_paths: Dict[str, str] = {}
+    base_single = os.path.join(out_base_dir, "single", f"gw{gw}")
+    base_chips = os.path.join(base_single, "chips")
+
+    for chip in chips_list:
+        if chip == "NONE":
+            # Save directly under gw folder
+            for K in ks:
+                alias = f"{K}t"
+                out_path = os.path.join(base_single, f"{alias}.json")
+                _ = solve_single_gw(
+                    team_state_path=team_state_path,
+                    optimizer_input_path=optimizer_input_path,
+                    out_path=out_path,
+                    gw=gw,
+                    risk_lambda=risk_lambda,
+                    topk=topk,
+                    allow_hits=allow_hits,
+                    max_extra_transfers=max_extra_transfers,
+                    cap_cannot_equal_vice=True,
+                    chip=None,
+                    tc_multiplier=3.0,
+                    verbose=verbose,
+                    exact_transfers=K,
+                    max_total_transfers=None,
+                    min_total_transfers=None,
+                    pad_missing_owned=pad_missing_owned,
+                    dry_run_validate=False,
+                )
+                out_paths[f"NONE_{alias}"] = out_path
+                if verbose:
+                    print(f"[sweep] wrote NONE {alias} -> {out_path}")
+            continue
+
+        # chips subfolder
+        chip_dir = os.path.join(base_chips, chip)
+        os.makedirs(chip_dir, exist_ok=True)
+
+        if chip in {"TC", "BB"}:
+            # Same K sweep as NONE, but placed under chips/<CHIP> and prefixed
+            for K in ks:
+                alias = f"{chip}_{K}t"
+                out_path = os.path.join(chip_dir, f"{alias}.json")
+                _ = solve_single_gw(
+                    team_state_path=team_state_path,
+                    optimizer_input_path=optimizer_input_path,
+                    out_path=out_path,
+                    gw=gw,
+                    risk_lambda=risk_lambda,
+                    topk=topk,
+                    allow_hits=allow_hits,
+                    max_extra_transfers=max_extra_transfers,
+                    cap_cannot_equal_vice=True,
+                    chip=chip,
+                    tc_multiplier=3.0,
+                    verbose=verbose,
+                    exact_transfers=K,
+                    max_total_transfers=None,
+                    min_total_transfers=None,
+                    pad_missing_owned=pad_missing_owned,
+                    dry_run_validate=False,
+                )
+                out_paths[alias] = out_path
+                if verbose:
+                    print(f"[sweep] wrote {alias} -> {out_path}")
+            continue
+
+        # WC / FH: try K=1..15, accept all feasible solves (hits=0)
+        for K in range(1, 16):
+            alias = f"{chip}_{K}t"
+            out_path = os.path.join(chip_dir, f"{K}t.json")
+            try:
+                _ = solve_single_gw(
+                    team_state_path=team_state_path,
+                    optimizer_input_path=optimizer_input_path,
+                    out_path=out_path,
+                    gw=gw,
+                    risk_lambda=risk_lambda,
+                    topk=topk,
+                    allow_hits=True,                   # irrelevant (hits=0 inside)
+                    max_extra_transfers=999,           # irrelevant (hits=0 inside)
+                    cap_cannot_equal_vice=True,
+                    chip=chip,
+                    tc_multiplier=3.0,
+                    verbose=verbose,
+                    exact_transfers=K,                 # enforce exact K on WC/FH
+                    max_total_transfers=None,
+                    min_total_transfers=None,
+                    pad_missing_owned=pad_missing_owned,
+                    dry_run_validate=False,
+                )
+                out_paths[alias] = out_path
+                if verbose:
+                    print(f"[sweep] wrote {alias} -> {out_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"[sweep] {alias} infeasible/skipped: {e}")
+
+    return out_paths
+
+
 # ---------------- CLI ----------------
 def main():
-    ap = argparse.ArgumentParser(description="Single-GW MILP selector (transfers + XI + C/VC)")
+    ap = argparse.ArgumentParser(description="Single-GW MILP selector (transfers + XI + C/VC) with sweep runner")
     ap.add_argument("--team-state", required=True)
     ap.add_argument("--optimizer-input", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out-base", default="data/plans", help="root output dir (default: data/plans)")
+    ap.add_argument("--out", help="single-plan path; ignored when sweep flags are used")
     ap.add_argument("--gw", type=int)
     ap.add_argument("--risk-lambda", type=float, default=0.0)
-    ap.add_argument("--topk", default="GK:10,DEF:25,MID:25,FWD:20")
+    ap.add_argument("--topk", default="GK:20,DEF:60,MID:60,FWD:40")
     ap.add_argument("--allow-hits", action="store_true")
     ap.add_argument("--max-extra-transfers", type=int, default=3)
     ap.add_argument("--no-cap-neq-vice", action="store_true",
                     help="allow same player as C and VC (not recommended)")
-    ap.add_argument("--chip", choices=["WC", "FH", "TC", "BB"], help="Apply chip logic")
+    ap.add_argument("--chip", choices=["WC", "FH", "TC", "BB"], help="Apply chip logic (single run)")
     ap.add_argument("--tc-multiplier", type=float, default=3.0, help="Triple Captain multiplier (default 3x)")
-    ap.add_argument("--teams-json", help="Path to _id_lookup_teams.json (code -> team_id) for strict validation")
     ap.add_argument("--verbose", action="store_true")
-    # Deterministic transfer controls
+
+    # Deterministic transfer controls (single run)
     ap.add_argument("--exact-transfers", type=int, help="Force exactly K transfers total")
     ap.add_argument("--max-total-transfers", type=int, help="Cap total transfers to ≤ K")
     ap.add_argument("--min-total-transfers", type=int, help="Lower bound on total transfers")
+
     # Preflight/diagnostics
     ap.add_argument("--pad-missing-owned", action="store_true",
                     help="Auto-inject zero-EV rows for missing owned players to keep feasibility")
     ap.add_argument("--dry-run-validate", action="store_true",
                     help="Run preflight checks and exit (no solve); prints min required transfers")
 
+    # Sweep controls
+    ap.add_argument("--sweep-free-transfers", action="store_true",
+                    help="Produce K=1..FT plans")
+    ap.add_argument("--sweep-include-hits", action="store_true",
+                    help="Additionally produce K=FT+1..FT+max_extra_transfers (requires --allow-hits)")
+    ap.add_argument("--sweep-chips", default="NONE", help='Comma list among NONE,TC,BB,FH,WC. Plans go to .../chips/<CHIP>/.')
     args = ap.parse_args()
 
+    # If sweep flags are present, run sweep
+    if args.sweep_free_transfers or args.sweep_include_hits or (args.sweep_chips and args.sweep_chips.upper() != "NONE"):
+        if args.dry_run_validate:
+            _ = solve_single_gw(
+                team_state_path=args.team_state,
+                optimizer_input_path=args.optimizer_input,
+                out_path=os.path.join(args.out_base, "tmp_preflight.json"),
+                gw=args.gw,
+                risk_lambda=args.risk_lambda,
+                topk=_parse_topk(args.topk),
+                allow_hits=bool(args.allow_hits),
+                max_extra_transfers=int(args.max_extra_transfers),
+                cap_cannot_equal_vice=not args.no_cap_neq_vice,
+                chip=None,
+                tc_multiplier=args.tc_multiplier,
+                verbose=bool(args.verbose),
+                exact_transfers=1,
+                pad_missing_owned=bool(args.pad_missing_owned),
+                dry_run_validate=True,
+            )
+        res = run_sweep(
+            team_state_path=args.team_state,
+            optimizer_input_path=args.optimizer_input,
+            out_base_dir=args.out_base,
+            gw=args.gw,
+            allow_hits=bool(args.allow_hits),
+            max_extra_transfers=int(args.max_extra_transfers),
+            sweep_free_transfers=bool(args.sweep_free_transfers),
+            sweep_include_hits=bool(args.sweep_include_hits),
+            sweep_chips_csv=str(args.sweep_chips or "NONE"),
+            risk_lambda=args.risk_lambda,
+            topk=_parse_topk(args.topk),
+            pad_missing_owned=bool(args.pad_missing_owned),
+            verbose=bool(args.verbose),
+        )
+        print(json.dumps(res, indent=2))
+        return
+
+    # Otherwise single plan
+    out_path = args.out or os.path.join(args.out_base, "single", f"gw{args.gw}", "plan.json")
     plan = solve_single_gw(
         team_state_path=args.team_state,
         optimizer_input_path=args.optimizer_input,
-        out_path=args.out,
+        out_path=out_path,
         gw=args.gw,
         risk_lambda=args.risk_lambda,
         topk=_parse_topk(args.topk),
@@ -780,7 +971,6 @@ def main():
         cap_cannot_equal_vice=not args.no_cap_neq_vice,
         chip=args.chip,
         tc_multiplier=args.tc_multiplier,
-        teams_json=args.teams_json,
         verbose=bool(args.verbose),
         exact_transfers=args.exact_transfers,
         max_total_transfers=args.max_total_transfers,
