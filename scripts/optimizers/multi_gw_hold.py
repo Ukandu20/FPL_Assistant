@@ -2,15 +2,28 @@
 """
 Multi-GW HOLD optimizer (MILP) — transfers only at first GW, squad held across the horizon.
 
-New:
-• XI items now include: opp, is_home, venue ('H'/'A'), fdr.
-• Objective adds a tiny -epsilon * (bench EV) so high-EV players prefer starting when feasible.
-• FH/WC runs are not bounded by --max-extra-transfers (WC hits=0; FH hits upper bound lifted).
+Highlights
+----------
+• Exact FPL legality: squad 15 (2/5/5/3), XI=11 with valid formations.
+• Optional --formation (e.g., 3-5-2) to force XI shape across all GWs.
+• Chips:
+  - WC: unlimited transfers at start GW, no hits that week.
+  - FH: temporary 15+XI on that GW; persistent squad unchanged.
+  - TC: triple-captain uplift on that GW only.
+  - BB: EV term uses all 15 players on that GW.
+• Sweep controls:
+  - --sweep-free-transfers (K=1..FT), --sweep-include-hits (K=FT+1..FT+H).
+• Output:
+  - plan.json (per variant), transfers.json (for GW_start).
+  - XI items include: id, name, pos, team, xPts, opp, is_home, venue, fdr.
+• Chips not bounded by --max-extra-transfers:
+  - WC has hits0==0; FH lifts hits upper bound to stack limit.
+• Tie-break: tiny penalty on bench EV so, all else equal, higher-EV players start.
 
-CLI additions (unchanged from last version I sent):
-• --skip-chips
-• --only-chip {WC,FH,TC,BB}
-• --only-chip-gw 6,7
+New in this version
+-------------------
+• Error out if --only-chip-gw includes any GW outside the horizon.
+• GK captaincy is **forbidden** (both normal and TC).
 """
 
 from __future__ import annotations
@@ -30,8 +43,7 @@ except Exception:
 TEAM_COL_CANDIDATES = ("team", "team_quota_key")
 MAX_FREE_TRANSFERS_STACK = 5
 HIT_COST = 4.0
-BIGM_EV = 1000.0
-EPS_BENCH = 1e-3  # tiny penalty on bench EV to break ties in favor of stronger XI
+EPS_BENCH = 1e-3  # tiny penalty on bench EV to break ties toward stronger XI
 
 # Valid formations per FPL
 VALID_FORMATIONS = {
@@ -66,7 +78,7 @@ def _get_team_col_name(df: pd.DataFrame) -> str:
 
 def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # EV mean candidates
+    # EV mean
     if "exp_pts_mean" not in df.columns:
         if "xPts" in df.columns:
             df["exp_pts_mean"] = pd.to_numeric(df["xPts"], errors="coerce").fillna(0.0)
@@ -93,11 +105,9 @@ def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
     else:
         df["is_dgw"] = 0
-    # Optional fields we’ll expose in XI JSON (keep if present)
-    # opp/team codes, is_home, venue, fdr
+    # optional XI-context fields
     for c in ["opponent", "opponent_id", "is_home", "venue", "fdr"]:
         if c not in df.columns:
-            # create empty/defaults; filled per-GW if available
             df[c] = np.nan
     # normalize is_home to {0,1}
     df["is_home"] = df["is_home"].map(lambda v: 1 if str(v).strip().lower() in {"1","true","t","yes","y","h"} else 0).astype(int, errors="ignore")
@@ -232,7 +242,7 @@ def solve_hold_horizon(
     name_arr = rep.set_index(rep["player_id"].astype(str)).get("player", rep["player_id"]).reindex(pid).astype(object).to_numpy()
     team_code = rep.set_index(rep["player_id"].astype(str))[team_col].reindex(pid).astype(str).str.upper().to_numpy()
 
-    # Build per-GW matrices (also opp/is_home/venue/fdr)
+    # Per-GW matrices (+ XI context)
     G = len(gw_list)
     gw_index = {gw_list[t]: t for t in range(G)}
     price = np.zeros((G,P), float)
@@ -240,11 +250,10 @@ def solve_hold_horizon(
     var   = np.zeros((G,P), float)
     capup = np.zeros((G,P), float)
     opp   = np.empty((G,P), dtype=object)
-    ishm  = np.zeros((G,P), int)    # 1=home, 0=away
-    venue = np.empty((G,P), dtype=object)  # 'H'/'A'
+    ishm  = np.zeros((G,P), int)
+    venue = np.empty((G,P), dtype=object)
     fdr   = np.zeros((G,P), float)
 
-    # default fills
     opp[:] = None
     venue[:] = None
     fdr[:] = np.nan
@@ -388,7 +397,7 @@ def solve_hold_horizon(
         m += pulp.lpSum(start[(t,i)] for i in range(P) if pos_arr[i] == "FWD") >= FWD_min
         m += pulp.lpSum(start[(t,i)] for i in range(P) if pos_arr[i] == "FWD") <= FWD_max
 
-        # Bench: exactly 1 per rank among non-GK outfielders, distinct, not starters
+        # Bench: exactly 1 per rank among non-GK outfielders; distinct; not starters
         for r in [1,2,3]:
             m += pulp.lpSum(bench[r][(t,i)] for i in range(P) if pos_arr[i] != "GK") == 1
             for i in range(P):
@@ -400,11 +409,14 @@ def solve_hold_horizon(
                 m += pulp.lpSum(bench[r][(t,i)] for r in [1,2,3]) <= 1
                 m += start[(t,i)] + pulp.lpSum(bench[r][(t,i)] for r in [1,2,3]) <= 1
 
-        # Captains: exactly 1 overall
+        # Captains: exactly 1 overall; **no GK captaincy**
         m += pulp.lpSum(cap_tc[(t,i)] for i in range(P)) + pulp.lpSum(cap_n[(t,i)] for i in range(P)) == 1
         for i in range(P):
             m += cap_tc[(t,i)] <= start[(t,i)]
             m += cap_n[(t,i)]  <= start[(t,i)]
+            if pos_arr[i] == "GK":
+                m += cap_tc[(t,i)] == 0
+                m += cap_n[(t,i)]  == 0
 
         # FH week support (temporary squad/XI)
         is_fh = (chip == "FH" and gw_list[t] == int(chip_gw or -1))
@@ -428,10 +440,14 @@ def solve_hold_horizon(
             for i in range(P):
                 m += tmp_sta[(t,i)] <= tmp_in[(t,i)]
 
-            m += pulp.lpSum(tmp_capn[(t,i)] for i in range(P)) + pulp.lpSum(tmp_capt[(t,i)] for i in range(P)) == 1
+            # FH captains: also forbid GK captaincy
+            m += pulp.lpSum(tmp_capt[(t,i)] for i in range(P)) + pulp.lpSum(tmp_capn[(t,i)] for i in range(P)) == 1
             for i in range(P):
                 m += tmp_capn[(t,i)] <= tmp_sta[(t,i)]
                 m += tmp_capt[(t,i)] <= tmp_sta[(t,i)]
+                if pos_arr[i] == "GK":
+                    m += tmp_capt[(t,i)] == 0
+                    m += tmp_capn[(t,i)] == 0
 
     # ----- Locks & bans -----
     for pid_locked in lock_ids:
@@ -453,9 +469,7 @@ def solve_hold_horizon(
         xi_var  = pulp.lpSum(start[(t,i)]    * var[t,i] for i in range(P))
         upl_n   = pulp.lpSum(cap_n[(t,i)]    * capup[t,i] for i in range(P))
         upl_tc  = pulp.lpSum(cap_tc[(t,i)]   * (2.0 * capup[t,i]) for i in range(P))
-
-        # tiny penalty on bench EV to prefer weaker bench if there's a tie
-        bench_ev = pulp.lpSum(bench[r][(t,i)] * ev[t,i] for r in [1,2,3] for i in range(P) if True)
+        bench_ev = pulp.lpSum(bench[r][(t,i)] * ev[t,i] for r in [1,2,3] for i in range(P))
 
         is_fh = (chip == "FH" and gw_list[t] == int(chip_gw or -1))
         is_bb = (chip == "BB" and gw_list[t] == int(chip_gw or -1))
@@ -496,7 +510,12 @@ def solve_hold_horizon(
 
     # ----- Extract solution & post-validate XI -----
     def _build_valid_xi_indices(t: int, use_fh: bool) -> List[int]:
-        raw = [i for i in range(P) if (pulp.value((tmp_sta if use_fh else start)[(t,i)]) or 0) > 0.5]
+        # raw mask
+        raw = []
+        if use_fh:
+            raw = [i for i in range(P) if (pulp.value(tmp_sta[(t,i)]) or 0) > 0.5]
+        else:
+            raw = [i for i in range(P) if (pulp.value(start[(t,i)]) or 0) > 0.5]
 
         def _counts(lst):
             d = sum(1 for i in lst if pos_arr[i]=="DEF")
@@ -512,13 +531,15 @@ def solve_hold_horizon(
         else:
             Dmin,Dmax=3,5; Mmin,Mmax=3,5; Fmin,Fmax=1,3
 
-        g,d,m_,f = _counts(raw)
-        if len(raw)==11 and g==1 and Dmin<=d<=Dmax and Mmin<=m_<=Mmax and Fmin<=f<=Fmax:
+        gk_cnt,d_cnt,m_cnt,f_cnt = _counts(raw)
+        if len(raw)==11 and gk_cnt==1 and Dmin<=d_cnt<=Dmax and Mmin<=m_cnt<=Mmax and Fmin<=f_cnt<=Fmax:
             return raw
 
-        avail = [i for i in range(P) if (pulp.value((tmp_in if use_fh else in_squad)[(t,i if use_fh else i)]) or 0) > 0.5] if use_fh \
-                else [i for i in range(P) if (pulp.value(in_squad[i]) or 0) > 0.5]
-        # choose best GK
+        # repair: greedy EV by formation from available pool
+        if use_fh:
+            avail = [i for i in range(P) if (pulp.value(tmp_in[(t,i)]) or 0) > 0.5]
+        else:
+            avail = [i for i in range(P) if (pulp.value(in_squad[i]) or 0) > 0.5]
         gks = sorted([i for i in avail if pos_arr[i]=="GK"], key=lambda i: -ev[t,i])
         if not gks: return raw[:11] if len(raw)>=11 else raw
         base = [gks[0]]
@@ -554,7 +575,6 @@ def solve_hold_horizon(
         f = sum(1 for p in xi_pids if pos_arr[pid_index[p]]=="FWD")
         formation = f"{d}-{m_}-{f}"
 
-        # captain
         if use_fh:
             c_tc = [i for i in range(P) if (pulp.value(tmp_capt[(t,i)]) or 0)>0.5]
             c_n  = [i for i in range(P) if (pulp.value(tmp_capn[(t,i)]) or 0)>0.5]
@@ -564,7 +584,7 @@ def solve_hold_horizon(
         cap_idx = (c_tc or c_n)[0] if (c_tc or c_n) else None
         captain_ids.append(pid[cap_idx] if cap_idx is not None else None)
 
-        # XI items w/ opp/is_home/venue/fdr
+        # XI items with extras
         xi_items = []
         for p in xi_pids:
             i = pid_index[p]
@@ -582,7 +602,6 @@ def solve_hold_horizon(
 
         # Bench 1..3 + GK 4
         squad_gk = [i for i in range(P) if (pulp.value(in_squad[i]) or 0)>0.5 and pos_arr[i]=="GK"]
-        xi_gk = [i for i in xi_idx if pos_arr[i]=="GK"]
         bench_gk_idx = None
         if squad_gk:
             cand = [i for i in squad_gk if i not in xi_idx]
@@ -728,6 +747,7 @@ def solve_hold_horizon(
             "Transfers only at first GW; squad held across horizon.",
             "XI is exactly 11 and obeys FPL formation bounds.",
             "Bench: outfield ranks 1..3 + bench GK.",
+            "GK captaincy is forbidden by constraint.",
         ],
     }
     return out
@@ -760,6 +780,16 @@ def run_sweep_hold(
     with open(team_state, "r", encoding="utf-8") as f:
         state = json.load(f)
     ft0 = int(state.get("free_transfers", 1))
+
+    # Validate --only-chip-gw against horizon BEFORE running
+    horizon = list(range(gw_start, gw_start + next_k))
+    if only_chip_gws:
+        bad = sorted({int(x) for x in only_chip_gws if int(x) not in horizon})
+        if bad:
+            lo, hi = horizon[0], horizon[-1]
+            raise ValueError(f"--only-chip-gw contains out-of-horizon GW(s): {bad}. "
+                             f"Horizon is [{lo}..{hi}] (gw={gw_start}, next_k={next_k}).")
+
     ks: List[int] = []
     if sweep_free_transfers:
         ks.extend(range(1, max(1, ft0) + 1))
@@ -830,12 +860,7 @@ def run_sweep_hold(
                         json.dump(plan["transfers"], f, indent=2, ensure_ascii=False)
                     written[f"WC_K{K}"] = os.path.join(chip_dir, "plan.json")
             else:
-                gw_range = list(range(gw_start, gw_start + next_k))
-                if only_chip_gws:
-                    sel = {int(x) for x in only_chip_gws}
-                    gw_range = [g for g in gw_range if g in sel]
-                    if not gw_range:
-                        continue
+                gw_range = horizon if not only_chip_gws else [g for g in horizon if g in set(only_chip_gws)]
                 for g in gw_range:
                     for K in ks:
                         plan = solve_hold_horizon(
@@ -897,12 +922,9 @@ def main():
     ap.add_argument("--sweep-include-hits", action="store_true", help="Also produce K=FT+1..FT+max_extra_transfers (requires --allow-hits)")
 
     # Chip control
-    ap.add_argument("--skip-chips", action="store_true",
-                    help="Do not run any chip variants (BASE only).")
-    ap.add_argument("--only-chip", choices=["WC","FH","TC","BB"],
-                    help="Run only this chip variant instead of sweeping all.")
-    ap.add_argument("--only-chip-gw",
-                    help="Comma-separated GW(s) to use for FH/TC/BB (default: all GWs in horizon).")
+    ap.add_argument("--skip-chips", action="store_true", help="BASE only")
+    ap.add_argument("--only-chip", choices=["WC","FH","TC","BB"], help="Run only this chip variant")
+    ap.add_argument("--only-chip-gw", help="Comma-separated GW(s) for FH/TC/BB (must be inside horizon)")
 
     # Runtime
     ap.add_argument("--time-limit", type=int, default=None)
@@ -913,7 +935,6 @@ def main():
     args = ap.parse_args()
 
     formation = _formation_from_cli(args.formation) if args.formation else None
-
     only_chip_gws = None
     if args.only_chip_gw:
         only_chip_gws = [int(x.strip()) for x in args.only_chip_gw.split(",") if x.strip()]

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 from __future__ import annotations
 
 import argparse
@@ -33,13 +33,14 @@ ACCEPTED_IN_COLS = {
     "season", "gw", "gw_orig",
     "player_id", "team_id", "team_code", "player", "pos",
     "p1","p60", "pred_minutes", "xMins_mean",
-    "xPts", "xPts", "exp_pts_var",
+    "xPts", "exp_pts_var",
     "__p_cs__", "team_prob_cs", "cs_prob",
     "team_ga_lambda90", "__lambda90__", "team_exp_gc",
     "is_dgw", "fixture_count",
     # legacy/meta
     "date_sched", "date_played", "kickoff_time",
     "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id",
+    "fdr",
     # prices
     "price", "now_price", "current_price", "now_cost", "cost",
     # other
@@ -49,10 +50,11 @@ ACCEPTED_IN_COLS = {
 # Legacy metadata we group to the left (after season)
 LEGACY_META_COLS = [
     "date_sched", "date_played", "kickoff_time",
-    "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id",
+    "team", "opponent", "opponent_id", "is_home", "fbref_id", "game_id", "fdr",
 ]
 
 KEY_FOR_STACK = ["season", "gw", "player_id"]  # consolidated unique key
+BANNED_COLS_IN_STACK = {"exp_pts_mean"}  # kill legacy/stray columns on stack
 
 # ===============================
 # IO Helpers
@@ -178,15 +180,20 @@ def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
 def _update_consolidated(new_df: pd.DataFrame, out_dir: Path) -> List[str]:
     cons_csv = out_dir / "optimizer_input.csv"
     cons_parq = out_dir / "optimizer_input.parquet"
+
     if cons_csv.exists():
         old = pd.read_csv(cons_csv, low_memory=False)
     else:
         old = pd.DataFrame(columns=new_df.columns)
 
-    # Align columns (union)
-    all_cols = list(dict.fromkeys([*old.columns, *new_df.columns]))
-    old = old.reindex(columns=all_cols)
-    new = new_df.reindex(columns=all_cols)
+    # Drop banned columns from both sides (prevents resurrection)
+    old = old.drop(columns=[c for c in BANNED_COLS_IN_STACK if c in old.columns], errors="ignore")
+    new_df = new_df.drop(columns=[c for c in BANNED_COLS_IN_STACK if c in new_df.columns], errors="ignore")
+
+    # Align columns (union), but prefer *new_df* column order
+    union_cols = list(dict.fromkeys([*new_df.columns, *old.columns]))
+    old = old.reindex(columns=union_cols)
+    new = new_df.reindex(columns=union_cols)
 
     # Overwrite-by-key semantics
     key_df = new[KEY_FOR_STACK].drop_duplicates()
@@ -197,6 +204,10 @@ def _update_consolidated(new_df: pd.DataFrame, out_dir: Path) -> List[str]:
     # Sort for readability
     sort_cols = [c for c in ["season", "gw", "team_id", "player_id"] if c in merged.columns]
     merged = merged.sort_values(sort_cols)
+
+    # Reorder columns to match new_df first (legacy extras trail)
+    trailing = [c for c in merged.columns if c not in new_df.columns]
+    merged = merged[[*new_df.columns, *trailing]]
 
     # CSV (atomic)
     _atomic_write_csv(merged, cons_csv)
@@ -242,8 +253,9 @@ def _coerce_output_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     df["is_dgw"] = df["is_dgw"].astype("bool")
 
     # floats
-    for c in ["price", "sell_price", "p60", "xPts", "exp_pts_var", "cs_prob", "captain_uplift"]:
-        df[c] = pd.to_numeric(df[c], errors="raise", downcast="float")
+    for c in ["price", "sell_price", "p60", "xPts", "exp_pts_var", "cs_prob", "captain_uplift", "fdr"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="raise", downcast="float")
     return df
 
 def _validate_contract(df: pd.DataFrame) -> None:
@@ -380,8 +392,11 @@ def _aggregate_player_gw(df: pd.DataFrame) -> pd.DataFrame:
             "cs_prob": _combine_prod_compl_one_minus(g["cs_prob"]),
             "is_dgw": (len(g) > 1),
         }
+        # fdr: mean across legs if present
+        if "fdr" in g.columns:
+            out["fdr"] = pd.to_numeric(g["fdr"], errors="coerce").mean()
         for c in ["team_code","player",*LEGACY_META_COLS]:
-            if c in g.columns:
+            if c in g.columns and c != "fdr":  # avoid overwriting aggregated fdr
                 out[c] = g[c].iloc[0]
         return pd.Series(out)
     agg = df.groupby(keys, as_index=False).apply(agg_fn)
@@ -426,11 +441,11 @@ def _load_team_code_map(path: Optional[str]) -> Dict[str, str]:
         for item in obj:
             if not isinstance(item, dict):
                 continue
-            tid = item.get("team_id") or item.get("id")
-            code = item.get("code") or item.get("fpl_code") or item.get("short_name") or item.get("name")
-            code = _maybe_code_from_name(code)
-            if tid and code:
-                by_id[str(tid)] = code
+        tid = item.get("team_id") or item.get("id")
+        code = item.get("code") or item.get("fpl_code") or item.get("short_name") or item.get("name")
+        code = _maybe_code_from_name(code)
+        if tid and code:
+            by_id[str(tid)] = code
     return {k: v.upper() for k, v in by_id.items()}
 
 def _resolve_team(
@@ -597,7 +612,7 @@ def build_optimizer_input(
         raise ValueError(f"Expected points mean column not found (looked for '{mean_col}'). Use --exp-mean-col.")
     df["xPts"] = pd.to_numeric(df[mean_col], errors="coerce")
     df["exp_pts_var"] = pd.to_numeric(
-    df["exp_pts_var"] if "exp_pts_var" in df.columns else pd.Series(0.0, index=df.index),
+        df["exp_pts_var"] if "exp_pts_var" in df.columns else pd.Series(0.0, index=df.index),
         errors="coerce"
     ).fillna(0.0)
 
@@ -676,24 +691,23 @@ def build_optimizer_input(
 
     # sell_price
     if strict_owned_sell:
-        df["sell_price"] = df.apply(lambda r: own_sell.get(str(r["player_id"]), r["price"]), axis=1)
+        df["sell_price"] = df.apply(lambda r: _owned_sell_map(ts).get(str(r["player_id"]), r["price"]), axis=1)
     else:
         df["sell_price"] = df["price"]
 
-    # Final column order — metadata block grouped on the left
+    # Final column order — legacy metadata block grouped on the left
     out_cols = [
         # identity + left metadata (like points_forecast)
         "season", "date_sched", "date_played", "kickoff_time",
         "gw",
         "player_id", "player",
         "team_id", "team",
-        "opponent", "opponent_id", "is_home", "fbref_id", "game_id",
+        "opponent", "opponent_id", "is_home", "fbref_id", "game_id", "fdr",
         # core required for solver
         "pos", "price", "sell_price", "p60",
         "xPts", "exp_pts_var", "cs_prob", "is_dgw",
         "captain_uplift",
     ]
-    # keep only present
     out_cols = [c for c in out_cols if c in df.columns]
     output_df = df[out_cols].copy()
 
@@ -724,17 +738,14 @@ def build_optimizer_input(
         print(f"OK (params): {params_out} -> {params}")
 
     # ----- Write GW-windowed + consolidated -----
-    # infer GW window from data
     gw_series = pd.to_numeric(output_df["gw"], errors="coerce").dropna().astype(int)
     gw_from_eff = int(gw_series.min()) if len(gw_series) else 0
     gw_to_eff   = int(gw_series.max()) if len(gw_series) else 0
     season_for_paths = future_season or str(output_df["season"].iloc[0])
 
-    # 1) per-window (csv + parquet)
     window_paths = _out_paths(out_dir, season_for_paths, gw_from_eff, gw_to_eff, zero_pad_filenames)
     written = _write_dual(output_df, window_paths)
 
-    # 2) consolidated stack (csv + parquet)
     stacked_written = _update_consolidated(output_df, out_dir)
 
     print(f"rows={len(output_df)} uniques={output_df[KEY_FOR_STACK].drop_duplicates().shape[0]}")
