@@ -44,6 +44,8 @@ from scripts.models.minutes_model_builder import (
     predict_with_model, taper_start_minutes
 )
 
+from scripts.utils.validate import validate_df
+
 # ----------------------------- utils ------------------------------------------
 
 def load_booster(path: Path) -> lgb.Booster:
@@ -1153,6 +1155,34 @@ def main():
     sort_keys = [k for k in ["gw_played","gw_orig","gw","team_id","player_id"] if k in out.columns]
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
+
+    # --- schema validation before write ---
+    MIN_SCHEMA = {
+    "required": ["season","game_id","team_id","team","opponent_id","opponent",
+                "gw_played","gw_orig","fdr","player_id","player","pos","date_sched",
+                "p_start","p60","p_cameo","p_play",
+                "pred_start_head","pred_bench_cameo_head","pred_bench_head",
+                "pred_minutes","exp_minutes_points"],
+    "dtypes": {
+        "season":"string","game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
+        "gw_played":"Int64","gw_orig":"Int64","fdr":"Int64","player_id":"string","player":"object","pos":"string",
+        "date_sched":"datetime64[ns]","p_start":"float","p60":"float","p_cameo":"float","p_play":"float",
+        "pred_start_head":"float","pred_bench_cameo_head":"float","pred_bench_head":"float",
+        "pred_minutes":"float","exp_minutes_points":"float",
+    },
+    "na": {"gw_orig": False, "fdr": False},
+    "ranges": {
+        "p_start":{"min":0.0,"max":1.0}, "p60":{"min":0.0,"max":1.0},
+        "p_cameo":{"min":0.0,"max":1.0}, "p_play":{"min":0.0,"max":1.0},
+        "pred_minutes":{"min":0.0,"max":120.0},
+        "exp_minutes_points":{"min":0.0,"max":2.0}
+    },
+    "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
+    "date_rules": {"normalize":["date_sched"]},
+    "unique": ["season","gw_orig","team_id","player_id"]
+    }
+    validate_df(out, MIN_SCHEMA, name="minutes_forecast")
+
 
     # ---------- auto-name output + dual writer ----------
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))

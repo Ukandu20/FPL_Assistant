@@ -19,6 +19,7 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 
+from scripts.utils.validate import validate_df
 
 # ----------------------------- tiny utils ------------------------------------
 
@@ -775,6 +776,34 @@ def main():
     if sort_keys:
         out = out.sort_values(sort_keys).reset_index(drop=True)
 
+    # --- schema validation before write ---
+    SAV_SCHEMA = {
+    "required": ["season","gw_played","gw_orig","date_sched","game_id","team_id","team",
+                "opponent_id","opponent","is_home","player_id","player","pos","fdr",
+                "pred_minutes","team_def_z_venue","opp_att_z_venue",
+                "pred_saves_p90_mean","pred_saves_mean",
+                "pred_saves_p90_poisson","pred_saves_poisson"],
+    "dtypes": {
+        "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
+        "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
+        "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64",
+        "pred_minutes":"float","team_def_z_venue":"float","opp_att_z_venue":"float",
+        "pred_saves_p90_mean":"float","pred_saves_mean":"float",
+        "pred_saves_p90_poisson":"float","pred_saves_poisson":"float",
+    },
+    "na": {"gw_orig": False, "fdr": False, "is_home": False},
+    "ranges": {
+        "pred_minutes":{"min":0.0,"max":120.0},
+        "pred_saves_p90_mean":{"min":0.0}, "pred_saves_mean":{"min":0.0}
+    },
+    "choices": {"pos":{"in":["GK"]}},
+    "logic": [("is_home in {0,1}", ["is_home"])],
+    "date_rules": {"normalize":["date_sched"]},
+    "unique": ["season","gw_orig","team_id","player_id"]
+    }
+    validate_df(out, SAV_SCHEMA, name="saves_forecast")
+
+    
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _saves_out_paths(
         base_dir=args.out_dir,

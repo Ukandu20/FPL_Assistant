@@ -35,6 +35,8 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from scripts.utils.validate import validate_df
+
 
 # ───────────────────────────── Helpers ─────────────────────────────
 
@@ -1228,6 +1230,48 @@ def main():
 
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+
+    # --- schema validation before write ---
+    GA_SCHEMA = {
+    "required": ["season","gw_played","gw_orig","date_sched","game_id","team_id","team",
+                "opponent_id","opponent","is_home","player_id","player","pos","fdr",
+                "p_start","p60","p_cameo","p_play","pred_start_head","pred_bench_cameo_head",
+                "pred_bench_head","pred_minutes","exp_minutes_points",
+                "team_att_z_venue","opp_def_z_venue",
+                "pred_goals_p90_mean","pred_assists_p90_mean",
+                "pred_goals_mean","pred_assists_mean",
+                "pred_goals_p90_poisson","pred_assists_p90_poisson",
+                "pred_goals_poisson","pred_assists_poisson",
+                "p_goal","p_assist","p_return_any"],
+    "dtypes": {
+        "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
+        "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
+        "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64",
+        "p_start":"float","p60":"float","p_cameo":"float","p_play":"float",
+        "pred_start_head":"float","pred_bench_cameo_head":"float","pred_bench_head":"float",
+        "pred_minutes":"float","exp_minutes_points":"float",
+        "team_att_z_venue":"float","opp_def_z_venue":"float",
+        "pred_goals_p90_mean":"float","pred_assists_p90_mean":"float",
+        "pred_goals_mean":"float","pred_assists_mean":"float",
+        "pred_goals_p90_poisson":"float","pred_assists_p90_poisson":"float",
+        "pred_goals_poisson":"float","pred_assists_poisson":"float",
+        "p_goal":"float","p_assist":"float","p_return_any":"float",
+    },
+    "na": {"gw_orig": False, "fdr": False, "is_home": False},
+    "ranges": {
+        "p_start":{"min":0.0,"max":1.0}, "p60":{"min":0.0,"max":1.0},
+        "p_cameo":{"min":0.0,"max":1.0}, "p_play":{"min":0.0,"max":1.0},
+        "exp_minutes_points":{"min":0.0,"max":2.0},
+        "p_goal":{"min":0.0,"max":1.0}, "p_assist":{"min":0.0,"max":1.0}, "p_return_any":{"min":0.0,"max":1.0},
+        "pred_minutes":{"min":0.0}
+    },
+    "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
+    "logic": [("is_home in {0,1}", ["is_home"])],
+    "date_rules": {"normalize":["date_sched"]},
+    "unique": ["season","gw_orig","team_id","player_id"]
+    }
+    validate_df(out, GA_SCHEMA, name="goals_assists_forecast")
+
 
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _ga_out_paths(

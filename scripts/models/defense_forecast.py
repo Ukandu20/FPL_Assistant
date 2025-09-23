@@ -18,6 +18,7 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 
+from scripts.utils.validate import validate_df
 # ----------------------------- helpers ----------------------------------------
 
 def _load_json(p: Path) -> list | dict:
@@ -982,6 +983,32 @@ def main():
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in out.columns]
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+
+    # … just before computing out_paths / writing:
+    DEF_SCHEMA = {
+    "required": ["season","gw_played","gw_orig","date_sched","game_id","team_id","team",
+                "opponent_id","opponent","is_home","player_id","player","pos","fdr",
+                "venue_bin","p_teamCS","prob_cs","lambda90","expected_dc","prob_dcp","exp_gc"],
+    "dtypes": {
+        "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
+        "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
+        "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64","venue_bin":"Int64",
+        "p_teamCS":"float","prob_cs":"float","lambda90":"float","expected_dc":"float","prob_dcp":"float","exp_gc":"float",
+    },
+    "na": {"gw_orig": False, "fdr": False, "is_home": False, "venue_bin": False},
+    "ranges": {
+        "p_teamCS":{"min":0.0,"max":1.0},
+        "prob_cs":{"min":0.0,"max":1.0},
+        "prob_dcp":{"min":0.0,"max":1.0},
+        "lambda90":{"min":0.0}, "expected_dc":{"min":0.0}, "exp_gc":{"min":0.0},
+    },
+    "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
+    "logic": [("venue_bin in {0,1}", ["venue_bin"]), ("is_home in {0,1}", ["is_home"])],
+    "date_rules": {"normalize":["date_sched"]},
+    "unique": ["season","gw_orig","team_id","player_id"]
+    }
+
+    validate_df(out, DEF_SCHEMA, name="defense_forecast")
 
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _def_out_paths(

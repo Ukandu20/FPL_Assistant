@@ -35,6 +35,7 @@ from typing import List, Dict, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+from scripts.utils.validate import validate_df
 SCHEMA_VERSION = "future.v1.8"
 
 # ───────────────────────── IO & normalization ─────────────────────────
