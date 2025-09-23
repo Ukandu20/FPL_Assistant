@@ -131,9 +131,9 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
             tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
     if "is_home" not in tf.columns:
         if "was_home" in tf.columns:
-            tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1", "true", "yes"]).astype(int)
+            tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1", "true", "yes"]).astype("Int8")
         elif "venue" in tf.columns:
-            tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype(int)
+            tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype("Int8")
         else:
             tf["is_home"] = 0
     for c in ("gw_played", "gw_orig", "gw"):
@@ -505,6 +505,83 @@ def _write_ga(df: pd.DataFrame, paths: List[Path]) -> List[str]:
             raise ValueError(f"Unsupported output extension: {p.suffix}")
     return written
 
+# ===================== CONSOLIDATED WRITER (season-level) =====================
+def _read_any(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    if path.suffix.lower() == ".csv":
+        hdr = pd.read_csv(path, nrows=0)
+        parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
+        return pd.read_csv(path, parse_dates=parse_cols)
+    if path.suffix.lower() in (".parquet", ".pq"):
+        df = pd.read_parquet(path)
+        if "date_sched" in df.columns:
+            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
+        return df
+    raise ValueError(f"Unsupported file to read: {path}")
+
+def _update_consolidated_ga(
+    out_df: pd.DataFrame,
+    season_dir: Path,
+    out_format: str,
+    desired_order: List[str],
+) -> List[str]:
+    """
+    Maintain season-level consolidated files:
+      <season_dir>/goals_assists.csv and/or goals_assists.parquet (per --out-format).
+    DGW-safe: de-duplicate on a robust identity.
+    """
+    cons_stem = season_dir / "expected_goals_assists"
+    targets: List[Path] = []
+    if out_format in ("csv", "both"): targets.append(Path(str(cons_stem) + ".csv"))
+    if out_format in ("parquet", "both"): targets.append(Path(str(cons_stem) + ".parquet"))
+
+    # load existing (union csv/parquet if both exist)
+    old = pd.DataFrame()
+    for p in [Path(str(cons_stem) + ".csv"), Path(str(cons_stem) + ".parquet")]:
+        if p.exists():
+            dfp = _read_any(p)
+            old = dfp if old.empty else pd.concat([old, dfp], ignore_index=True)
+
+    # normalize key dtypes
+    for c in ("season","team_id","player_id","opponent_id","game_id"):
+        if c in out_df.columns: out_df[c] = out_df[c].astype(str)
+        if c in old.columns:    old[c]    = old[c].astype(str)
+
+    all_cols = list(dict.fromkeys([*desired_order, *old.columns.tolist(), *out_df.columns.tolist()]))
+    new = out_df.reindex(columns=all_cols)
+    old = old.reindex(columns=all_cols)
+    merged = pd.concat([old, new], ignore_index=True)
+
+    # ensure datetime for sorting/formatting
+    if "date_sched" in merged.columns:
+        merged["date_sched"] = pd.to_datetime(merged["date_sched"], errors="coerce")
+
+    # robust DGW-safe key
+    key = [c for c in ["season","player_id","team_id","game_id","gw_orig","date_sched","opponent_id"] if c in merged.columns]
+    if not key:
+        key = [c for c in ["season","player_id","team_id","gw_orig"] if c in merged.columns]
+    merged = merged.drop_duplicates(subset=key, keep="last")
+
+    keep_cols = [c for c in desired_order if c in merged.columns]
+    merged = merged[keep_cols].copy()
+    sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in merged.columns]
+    if sort_keys:
+        merged = merged.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+
+    written: List[str] = []
+    for tgt in targets:
+        if tgt.suffix.lower() == ".csv":
+            tmp = merged.copy()
+            if "date_sched" in tmp.columns:
+                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            tmp.to_csv(tgt, index=False)
+            written.append(str(tgt))
+        else:
+            merged.to_parquet(tgt, index=False)
+            written.append(str(tgt))
+    return written
+
 
 # ───────────────────────────── Legacy metadata attach (NEW) ─────────────────────────────
 
@@ -554,7 +631,7 @@ def _attach_legacy_meta(df_pred: pd.DataFrame, team_fix: pd.DataFrame) -> pd.Dat
 
     if "opponent" not in merged.columns or merged["opponent"].isna().all():
         if {"home", "away", "is_home"}.issubset(merged.columns):
-            ih = pd.to_numeric(merged["is_home"], errors="coerce").fillna(0).astype(int)
+            ih = pd.to_numeric(merged["is_home"], errors="coerce").fillna(0).astype("Int8")
             merged["opponent"] = np.where(ih == 1, merged.get("away"), merged.get("home"))
 
     for col in ["fbref_id", "team", "opponent_id", "opponent"]:
@@ -582,14 +659,14 @@ def _find_fdr_cols(cols: set[str]) -> tuple[str, str]:
 def _ensure_is_home(df: pd.DataFrame) -> pd.DataFrame:
     if "is_home" in df.columns:
         out = df.copy()
-        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").fillna(0).astype(int)
+        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").fillna(0).astype("Int8")
         return out
     out = df.copy()
     if "was_home" in out.columns:
-        out["is_home"] = pd.to_numeric(out["was_home"], errors="coerce").fillna(0).astype(int)
+        out["is_home"] = pd.to_numeric(out["was_home"], errors="coerce").fillna(0).astype("Int8")
         return out
     if "venue" in out.columns:
-        out["is_home"] = out["venue"].astype(str).str.lower().eq("home").astype(int)
+        out["is_home"] = out["venue"].astype(str).str.lower().eq("home").astype("Int8")
         return out
     raise RuntimeError("No venue columns found to compute is_home.")
 
@@ -660,7 +737,7 @@ def attach_fdr_consistent(df: pd.DataFrame,
                       len(miss), miss.head(20).to_string(index=False))
         raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs. Check keys/coverage.")
 
-    merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="raise").astype(int)
+    merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="raise").astype("Int8")
     merged.drop(columns=["fdr_side"], inplace=True, errors="ignore")
     return merged
 
@@ -784,7 +861,7 @@ def main():
         minutes["season"] = args.future_season
 
     gw_sel = _gw_for_selection(minutes)
-    avail_gws = sorted(pd.unique(gw_sel.dropna().astype(int)))
+    avail_gws = sorted(pd.unique(gw_sel.dropna().astype("Int8")))
     avail_gws = [int(x) for x in avail_gws]
     target_gws = [int(g) for g in avail_gws if g >= int(gw_from_req)][:int(args.n_future)]
     if not target_gws:
@@ -824,25 +901,25 @@ def main():
 
     if "is_home" not in minutes.columns:
         if "venue" in minutes.columns:
-            minutes["is_home"] = minutes["venue"].astype(str).str.lower().eq("home").astype(int)
+            minutes["is_home"] = minutes["venue"].astype(str).str.lower().eq("home").astype("Int8")
         else:
             minutes["is_home"] = np.nan
 
     venue_fallback = (
-        minutes["venue"].astype(str).str.lower().eq("home").astype(int)
+        minutes["venue"].astype(str).str.lower().eq("home").astype("Int8")
         if "venue" in minutes.columns else 0
     )
     minutes["venue_bin"] = (
         pd.to_numeric(minutes["is_home"], errors="coerce")
           .fillna(venue_fallback)
           .fillna(0)
-          .astype(int)
+          .astype("Int8")
     )
 
     # Build future scoring frame
     fut = minutes.copy()
 
-    # -------- NEW: Venue-consistent, DGW-safe FDR attach (INT) --------
+    # -------- NEW: Venue-consistent, DGW-safe FDR attach ("Int8") --------
     fut = attach_fdr_consistent(
         df=fut,
         seasons_all=seasons_all,
@@ -851,7 +928,7 @@ def main():
         team_form=tf
     )
     # Ensure int dtype (attach_fdr_consistent guarantees no NaNs)
-    fut["fdr"] = pd.to_numeric(fut["fdr"], errors="raise").astype(int)
+    fut["fdr"] = pd.to_numeric(fut["fdr"], errors="raise").astype("Int8")
 
     # Roster gate
     allowed_pairs = _load_roster_pairs(
@@ -1055,7 +1132,7 @@ def main():
     gw_orig_vals   = pd.to_numeric(fut.get("gw_orig",   fut.get("gw", np.nan)), errors="coerce").values
 
     # fdr now guaranteed non-null int
-    fdr_vals       = pd.to_numeric(fut.get("fdr", np.nan), errors="raise").astype(int).values
+    fdr_vals       = pd.to_numeric(fut.get("fdr", np.nan), errors="raise").astype("Int8").values
 
     p_start_vals = pd.to_numeric(fut.get("p_start", np.nan), errors="coerce").clip(0, 1).values
     p60_vals     = pd.to_numeric(fut.get("p60", np.nan), errors="coerce").clip(0, 1).values
@@ -1079,7 +1156,7 @@ def main():
         "team":              team_name_vals,
         "opponent_id":       opponent_id_vals,
         "opponent":          opponent_name_vals,
-        "is_home":           pd.to_numeric(fut.get("is_home", np.nan), errors="coerce").fillna(0).astype(int).values,
+        "is_home":           pd.to_numeric(fut.get("is_home", np.nan), errors="coerce").fillna(0).astype("Int8").values,
 
         # --- Player context ---
         "player_id":         fut["player_id"].astype(str).values,
@@ -1121,7 +1198,7 @@ def main():
     desired_order = [
         "season","gw_played","gw_orig","date_sched","game_id",
         "team_id","team","opponent_id","opponent","is_home",
-        "player_id","player","pos","fdr",
+        "player_id","player","pos","fdr","venue_bin",
         "p_start","p60","p_cameo","p_play",
         "pred_start_head","pred_bench_cameo_head","pred_bench_head",
         "pred_minutes","exp_minutes_points","_is_synth",
@@ -1135,7 +1212,20 @@ def main():
     keep_cols = [c for c in desired_order if c in out.columns]
     out = out[keep_cols].copy()
 
+        # enforce integer dtypes (nullable ints preserve NA)
+    if "gw_played" in out.columns:
+        out["gw_played"] = pd.to_numeric(out["gw_played"], errors="coerce").astype("Int16")
+    if "gw_orig" in out.columns:
+        out["gw_orig"] = pd.to_numeric(out["gw_orig"], errors="coerce").astype("Int16")
+    if "fdr" in out.columns:
+        out["fdr"] = pd.to_numeric(out["fdr"], errors="coerce").astype("Int8")
+    if "is_home" in out.columns:
+        out["is_home"] = pd.to_numeric(out["is_home"], errors="coerce").astype("Int8")
+    if "venue_bin" in out.columns:
+        out["venue_bin"] = pd.to_numeric(out["venue_bin"], errors="coerce").astype("Int8")
+
     sort_keys = [k for k in ["gw_orig", "team_id", "player_id"] if k in out.columns]
+
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
 
@@ -1149,6 +1239,16 @@ def main():
         out_format=args.out_format,
     )
     written_paths = _write_ga(out, out_paths)
+
+    
+    # >>> NEW: update consolidated season-level files
+    season_dir.mkdir(parents=True, exist_ok=True)
+    consolidated_paths = _update_consolidated_ga(
+        out_df=out,
+        season_dir=season_dir,
+        out_format=args.out_format,
+        desired_order=desired_order,
+    )
 
     try:
         def q995(x): return float(pd.Series(x).quantile(0.995))
@@ -1166,7 +1266,8 @@ def main():
         "scored_gws": [int(x) for x in target_gws],
         "as_of": str(as_of_ts),
         "minutes_in": str(minutes_path),
-        "out": written_paths
+        "out": written_paths,
+        "consolidated_out": consolidated_paths
     }
     print(json.dumps(diag, indent=2))
 
