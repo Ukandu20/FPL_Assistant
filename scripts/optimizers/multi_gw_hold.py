@@ -22,7 +22,8 @@ Highlights
 
 New in this version
 -------------------
-• Folder naming: hold/gw{start}-gw{end}/...
+• Seasonized folder layout:
+  <out_dir>/<season>/multi/hold/gw{start}-gw{end}/...
 • Output schema mirrors single_gw:
   - No is_home in outputs; use venue 'H'/'A'/null.
   - fdr emitted as int|null.
@@ -195,6 +196,20 @@ def _order_by_pos_then_ev(pids: List[str], t: int, pid_index: Dict[str,int],
         return (pos_order.get(str(pos_arr[i]), 9), -float(ev[t, i]))
     return sorted(pids, key=key_func)
 
+def _detect_season_from_df(df: pd.DataFrame, gw_list: List[int]) -> str:
+    """Return single season string from df restricted to gw_list; raise if multiple; '' if missing."""
+    if "season" not in df.columns:
+        return ""
+    dd = df[df["gw"].isin(gw_list)]
+    if dd.empty:
+        return ""
+    seasons = sorted({str(s) for s in dd["season"].dropna().astype(str).unique()})
+    if not seasons:
+        return ""
+    if len(seasons) > 1:
+        raise ValueError(f"optimizer_input contains multiple seasons in the requested horizon: {seasons}")
+    return seasons[0]
+
 # ---------- Core Solver (Hold Horizon) ----------
 def solve_hold_horizon(
     team_state_path: str,
@@ -222,7 +237,7 @@ def solve_hold_horizon(
         state = json.load(f)
     bank0 = float(state.get("bank", 0.0))
     ft0   = int(state.get("free_transfers", 1))
-    season = str(state.get("season"))
+    season_state = str(state.get("season"))
     snapshot_gw = int(state.get("gw"))
     owned0: List[dict] = list(state.get("squad", []))
     owned_ids0: Set[str] = {str(p["player_id"]) for p in owned0}
@@ -251,6 +266,9 @@ def solve_hold_horizon(
     df = df_all[df_all["gw"].isin(gw_list)].copy()
     if df.empty:
         raise ValueError("optimizer_input has no rows for requested horizon")
+
+    # ---- Season from optimizer input (strict) ----
+    season = _detect_season_from_df(df_all, gw_list) or season_state
 
     # ---- Candidate pool ----
     pool = _pool_union(df, owned_ids0, gw_list, topk)
@@ -926,8 +944,15 @@ def run_sweep_hold(
         ks.extend(range(ft0+1, ft0 + max(1, max_extra_transfers) + 1))
 
     gw_end = gw_start + next_k - 1
-    base_root = os.path.join(out_dir, "hold", f"gw{gw_start}-gw{gw_end}", "base")
-    chips_root = os.path.join(out_dir, "hold", f"gw{gw_start}-gw{gw_end}", "chips")
+
+    # --- Seasonized root (season from optimizer input; fallback to team_state) ---
+    df_all = _read_any(optimizer_input)
+    df_all = _normalize_input_columns(df_all)
+    season_detected = _detect_season_from_df(df_all, horizon) or str(state.get("season") or "")
+
+    # NOTE: path includes 'multi' segment per your convention
+    base_root = os.path.join(out_dir, str(season_detected), "multi", "hold", f"gw{gw_start}-gw{gw_end}", "base")
+    chips_root = os.path.join(out_dir, str(season_detected), "multi", "hold", f"gw{gw_start}-gw{gw_end}", "chips")
     os.makedirs(base_root, exist_ok=True)
     os.makedirs(chips_root, exist_ok=True)
 
@@ -1014,10 +1039,12 @@ def _parse_csv_ids(s: Optional[str]) -> Set[str]:
 
 def _parse_team_caps(s: Optional[str]) -> Dict[str,int]:
     out: Dict[str,int] = {}
-    if not s: return out
+    if not s:
+        return out
     for part in s.split(","):
-        if not part.strip(): continue
-        code, num = part.split(":",1)
+        if not part.strip():
+            continue
+        code, num = part.split(":", 1)
         out[code.strip().upper()] = int(num.strip())
     return out
 
