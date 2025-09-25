@@ -22,8 +22,9 @@ Highlights
 
 New in this version
 -------------------
-• Seasonized folder layout:
-  <out_dir>/<season>/multi/hold/gw{start}-gw{end}/...
+• Folder naming (seasonized):
+  - <out_dir>/<season>/multi/hold/gw{start}-gw{end}/base/K{K}/plan.json
+  - <out_dir>/<season>/multi/hold/gw{start}-gw{end}/chips/<CHIP>/gw{g}/K{K}/plan.json
 • Output schema mirrors single_gw:
   - No is_home in outputs; use venue 'H'/'A'/null.
   - fdr emitted as int|null.
@@ -33,6 +34,7 @@ New in this version
 • Error out if --only-chip-gw includes any GW outside the horizon.
 • GK captaincy is **forbidden** (both normal and TC).
 • Vice-captain per GW (like single_gw) and --report md output for each variant folder.
+• Robust C/VC: after XI repair, rebase captain & vice onto the final XI (no GK).
 """
 
 from __future__ import annotations
@@ -179,7 +181,7 @@ def _pool_union(df: pd.DataFrame, owned_ids: Set[str], gws: List[int], topk: Dic
 def _formation_from_cli(s: Optional[str]) -> Optional[Tuple[int,int,int]]:
     if not s:
         return None
-    m = re.fullmatch(r"\s*([3-5])\s*-\s*([3-5])\s*-\s*([1-3])\s*", s)
+    m = re.fullmatch(r"\s*([3-5])\s*-\s*([3-5])\s*-\s*([1-3])\s*\b", s)
     if not m:
         raise ValueError("--formation must look like '3-5-2', '4-4-2', etc.")
     d, m_, f = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -191,24 +193,10 @@ def _formation_from_cli(s: Optional[str]) -> Optional[Tuple[int,int,int]]:
 def _order_by_pos_then_ev(pids: List[str], t: int, pid_index: Dict[str,int],
                           pos_arr: np.ndarray, ev: np.ndarray) -> List[str]:
     pos_order = {"GK":0, "DEF":1, "MID":2, "FWD":3}
-    def key_func(pid: str):
-        i = pid_index[pid]
+    def key_func(pid_: str):
+        i = pid_index[pid_]
         return (pos_order.get(str(pos_arr[i]), 9), -float(ev[t, i]))
     return sorted(pids, key=key_func)
-
-def _detect_season_from_df(df: pd.DataFrame, gw_list: List[int]) -> str:
-    """Return single season string from df restricted to gw_list; raise if multiple; '' if missing."""
-    if "season" not in df.columns:
-        return ""
-    dd = df[df["gw"].isin(gw_list)]
-    if dd.empty:
-        return ""
-    seasons = sorted({str(s) for s in dd["season"].dropna().astype(str).unique()})
-    if not seasons:
-        return ""
-    if len(seasons) > 1:
-        raise ValueError(f"optimizer_input contains multiple seasons in the requested horizon: {seasons}")
-    return seasons[0]
 
 # ---------- Core Solver (Hold Horizon) ----------
 def solve_hold_horizon(
@@ -237,7 +225,7 @@ def solve_hold_horizon(
         state = json.load(f)
     bank0 = float(state.get("bank", 0.0))
     ft0   = int(state.get("free_transfers", 1))
-    season_state = str(state.get("season"))
+    season = str(state.get("season"))
     snapshot_gw = int(state.get("gw"))
     owned0: List[dict] = list(state.get("squad", []))
     owned_ids0: Set[str] = {str(p["player_id"]) for p in owned0}
@@ -266,9 +254,6 @@ def solve_hold_horizon(
     df = df_all[df_all["gw"].isin(gw_list)].copy()
     if df.empty:
         raise ValueError("optimizer_input has no rows for requested horizon")
-
-    # ---- Season from optimizer input (strict) ----
-    season = _detect_season_from_df(df_all, gw_list) or season_state
 
     # ---- Candidate pool ----
     pool = _pool_union(df, owned_ids0, gw_list, topk)
@@ -459,7 +444,6 @@ def solve_hold_horizon(
             m += cap_tc[(t,i)] <= start[(t,i)]
             m += cap_n[(t,i)]  <= start[(t,i)]
             m += vice[(t,i)]   <= start[(t,i)]
-            # not same player as captain
             m += cap_tc[(t,i)] + cap_n[(t,i)] + vice[(t,i)] <= 1
             if pos_arr[i] == "GK":
                 m += cap_tc[(t,i)] == 0
@@ -563,7 +547,6 @@ def solve_hold_horizon(
     # ----- Extract solution & post-validate XI -----
     def _build_valid_xi_indices(t: int, use_fh: bool) -> List[int]:
         # raw mask
-        raw = []
         if use_fh:
             raw = [i for i in range(P) if (pulp.value(tmp_sta[(t,i)]) or 0) > 0.5]
         else:
@@ -629,6 +612,7 @@ def solve_hold_horizon(
         f = sum(1 for p in xi_pids if pos_arr[pid_index[p]]=="FWD")
         formation = f"{d}-{m_}-{f}"
 
+        # -------- Captain / Vice (rebased onto final XI; no GK) --------
         if use_fh:
             c_tc = [i for i in range(P) if (pulp.value(tmp_capt[(t,i)]) or 0)>0.5]
             c_n  = [i for i in range(P) if (pulp.value(tmp_capn[(t,i)]) or 0)>0.5]
@@ -637,10 +621,39 @@ def solve_hold_horizon(
             c_tc = [i for i in range(P) if (pulp.value(cap_tc[(t,i)]) or 0)>0.5]
             c_n  = [i for i in range(P) if (pulp.value(cap_n[(t,i)]) or 0)>0.5]
             v_i  = [i for i in range(P) if (pulp.value(vice[(t,i)]) or 0)>0.5]
-        cap_idx = (c_tc or c_n)[0] if (c_tc or c_n) else None
-        vice_idx = v_i[0] if v_i else None
+
+        raw_cap_idx = (c_tc or c_n)
+        raw_cap_idx = raw_cap_idx[0] if raw_cap_idx else None
+        raw_vice_idx = v_i[0] if v_i else None
+
+        xi_set = set(xi_idx)
+        non_gk_starters = [i for i in xi_idx if pos_arr[i] != "GK"]
+        non_gk_sorted = sorted(non_gk_starters, key=lambda i: -float(ev[t, i]))
+
+        cap_idx = None
+        if raw_cap_idx is not None and raw_cap_idx in xi_set and pos_arr[raw_cap_idx] != "GK":
+            cap_idx = raw_cap_idx
+        else:
+            cap_idx = non_gk_sorted[0] if non_gk_sorted else (xi_idx[0] if xi_idx else None)
+
+        vice_idx = None
+        if (raw_vice_idx is not None and raw_vice_idx in xi_set and
+            pos_arr[raw_vice_idx] != "GK" and raw_vice_idx != cap_idx):
+            vice_idx = raw_vice_idx
+        else:
+            for i2 in non_gk_sorted:
+                if i2 != cap_idx:
+                    vice_idx = i2
+                    break
+            if vice_idx is None:
+                for i2 in xi_idx:
+                    if i2 != cap_idx:
+                        vice_idx = i2
+                        break
+
         captain_ids.append(pid[cap_idx] if cap_idx is not None else None)
         vice_ids.append(pid[vice_idx] if vice_idx is not None else None)
+        # ----------------------------------------------------------------
 
         # XI items (mirror single_gw: no is_home; fdr=int|null)
         xi_items = []
@@ -725,8 +738,8 @@ def solve_hold_horizon(
         elif chip=="FH" and g==int(chip_gw or -1):
             ev_team = float(sum(ev[t,i] * (pulp.value(tmp_sta[(t,i)]) or 0.0) for i in range(P)))
         else:
-            xi_set = {x["id"] for x in xi_items}
-            ev_team = float(sum(ev[t,i] for i in range(P) if pid[i] in xi_set))
+            xi_set_ids = {x["id"] for x in xi_items}
+            ev_team = float(sum(ev[t,i] for i in range(P) if pid[i] in xi_set_ids))
 
         per_gw.append({
             "gw": g,
@@ -925,6 +938,7 @@ def run_sweep_hold(
     with open(team_state, "r", encoding="utf-8") as f:
         state = json.load(f)
     ft0 = int(state.get("free_transfers", 1))
+    season = str(state.get("season") or "unknown")
 
     # Validate --only-chip-gw against horizon BEFORE running
     horizon = list(range(gw_start, gw_start + next_k))
@@ -944,15 +958,9 @@ def run_sweep_hold(
         ks.extend(range(ft0+1, ft0 + max(1, max_extra_transfers) + 1))
 
     gw_end = gw_start + next_k - 1
-
-    # --- Seasonized root (season from optimizer input; fallback to team_state) ---
-    df_all = _read_any(optimizer_input)
-    df_all = _normalize_input_columns(df_all)
-    season_detected = _detect_season_from_df(df_all, horizon) or str(state.get("season") or "")
-
-    # NOTE: path includes 'multi' segment per your convention
-    base_root = os.path.join(out_dir, str(season_detected), "multi", "hold", f"gw{gw_start}-gw{gw_end}", "base")
-    chips_root = os.path.join(out_dir, str(season_detected), "multi", "hold", f"gw{gw_start}-gw{gw_end}", "chips")
+    root = os.path.join(out_dir, season, "multi", "hold", f"gw{gw_start}-gw{gw_end}")
+    base_root = os.path.join(root, "base")
+    chips_root = os.path.join(root, "chips")
     os.makedirs(base_root, exist_ok=True)
     os.makedirs(chips_root, exist_ok=True)
 
@@ -1039,12 +1047,10 @@ def _parse_csv_ids(s: Optional[str]) -> Set[str]:
 
 def _parse_team_caps(s: Optional[str]) -> Dict[str,int]:
     out: Dict[str,int] = {}
-    if not s:
-        return out
+    if not s: return out
     for part in s.split(","):
-        if not part.strip():
-            continue
-        code, num = part.split(":", 1)
+        if not part.strip(): continue
+        code, num = part.split(":",1)
         out[code.strip().upper()] = int(num.strip())
     return out
 
