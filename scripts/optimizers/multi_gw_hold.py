@@ -15,15 +15,23 @@ Highlights
   - --sweep-free-transfers (K=1..FT), --sweep-include-hits (K=FT+1..FT+H).
 • Output:
   - plan.json (per variant), transfers.json (for GW_start).
-  - XI items include: id, name, pos, team, xPts, opp, is_home, venue, fdr.
+  - Player objects expose: id, name, pos, team, xPts, opp, venue, fdr (int|null).
 • Chips not bounded by --max-extra-transfers:
   - WC has hits0==0; FH lifts hits upper bound to stack limit.
 • Tie-break: tiny penalty on bench EV so, all else equal, higher-EV players start.
 
 New in this version
 -------------------
+• Folder naming: hold/gw{start}-gw{end}/...
+• Output schema mirrors single_gw:
+  - No is_home in outputs; use venue 'H'/'A'/null.
+  - fdr emitted as int|null.
+  - transfers: {out:[...], in:[...], pairs_min:[...]} and still written to transfers.json.
+  - bench per-GW mirrors single_gw: {"order":[p1,p2,p3], "gk": {...}}.
+  - xi_by_pos provided per GW; meta.team_summary added (squad + start-GW XI).
 • Error out if --only-chip-gw includes any GW outside the horizon.
 • GK captaincy is **forbidden** (both normal and TC).
+• Vice-captain per GW (like single_gw) and --report md output for each variant folder.
 """
 
 from __future__ import annotations
@@ -52,6 +60,25 @@ VALID_FORMATIONS = {
     (5,3,2), (5,4,1),
 }
 
+# ----- Small output helpers -----
+def _round1(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    val = float(x)
+    r = round(val + (1e-12 if val >= 0 else -1e-12), 1)
+    return 0.0 if r == 0.0 else r
+
+def _fdr_int_or_none(v) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        if np.isnan(fv):
+            return None
+        return int(fv)
+    except Exception:
+        return None
+
 # ---------- Helpers ----------
 def _read_any(path: str) -> pd.DataFrame:
     if path.endswith(".parquet"):
@@ -62,13 +89,6 @@ def _read_any(path: str) -> pd.DataFrame:
     if path.endswith(".csv"):
         return pd.read_csv(path)
     raise ValueError("optimizer_input must be .parquet or .csv")
-
-def _round1(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    val = float(x)
-    r = round(val + (1e-12 if val >= 0 else -1e-12), 1)
-    return 0.0 if r == 0.0 else r
 
 def _get_team_col_name(df: pd.DataFrame) -> str:
     for c in TEAM_COL_CANDIDATES:
@@ -110,7 +130,9 @@ def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
     # normalize is_home to {0,1}
-    df["is_home"] = df["is_home"].map(lambda v: 1 if str(v).strip().lower() in {"1","true","t","yes","y","h"} else 0).astype(int, errors="ignore")
+    df["is_home"] = df["is_home"].map(
+        lambda v: 1 if str(v).strip().lower() in {"1","true","t","yes","y","h"} else 0
+    ).astype(int, errors="ignore")
     return df
 
 def _validate_teams(df: pd.DataFrame) -> None:
@@ -274,7 +296,7 @@ def solve_hold_horizon(
             opp[t,i] = None if pd.isna(opp_val) else str(opp_val).upper()
             ishome = int(r.get("is_home", 0)) if pd.notna(r.get("is_home", np.nan)) else 0
             ishm[t,i] = 1 if ishome==1 else 0
-            venue[t,i] = "H" if ishm[t,i]==1 else "A"
+            venue[t,i] = ("H" if ishm[t,i]==1 else ("A" if ishm[t,i]==0 else None))
             fdr_val = r.get("fdr", np.nan)
             try:
                 fdr[t,i] = float(fdr_val) if pd.notna(fdr_val) else np.nan
@@ -294,8 +316,10 @@ def solve_hold_horizon(
     bench = {r: pulp.LpVariable.dicts(f"bench_r{r}", [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
              for r in [1,2,3]}
 
-    cap_n  = pulp.LpVariable.dicts("cap_n",  [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
-    cap_tc = pulp.LpVariable.dicts("cap_tc", [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    # Captains & Vice (normal / TC-boosted C; vice is single var)
+    cap_n   = pulp.LpVariable.dicts("cap_n",   [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    cap_tc  = pulp.LpVariable.dicts("cap_tc",  [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    vice    = pulp.LpVariable.dicts("vice",    [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
 
     buy0  = pulp.LpVariable.dicts("buy0", [i for i in range(P)], 0, 1, cat=pulp.LpBinary)
     sell0 = pulp.LpVariable.dicts("sell0",[i for i in range(P)], 0, 1, cat=pulp.LpBinary)
@@ -304,10 +328,11 @@ def solve_hold_horizon(
     ft_used0 = pulp.LpVariable("ft_used0", lowBound=0, upBound=MAX_FREE_TRANSFERS_STACK, cat=pulp.LpInteger)
 
     # FH temporary squad/XI
-    tmp_in  = pulp.LpVariable.dicts("fh_in",  [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
-    tmp_sta = pulp.LpVariable.dicts("fh_sta", [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
-    tmp_capn= pulp.LpVariable.dicts("fh_cap_n",[(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
-    tmp_capt= pulp.LpVariable.dicts("fh_cap_tc",[(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    tmp_in   = pulp.LpVariable.dicts("fh_in",     [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    tmp_sta  = pulp.LpVariable.dicts("fh_sta",    [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    tmp_capn = pulp.LpVariable.dicts("fh_cap_n",  [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    tmp_capt = pulp.LpVariable.dicts("fh_cap_tc", [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
+    tmp_vice = pulp.LpVariable.dicts("fh_vice",   [(t,i) for t in range(G) for i in range(P)], 0, 1, cat=pulp.LpBinary)
 
     # ----- Ownership transition only at GW0 -----
     owned_prev = np.array([1 if pid[i] in owned_ids0 else 0 for i in range(P)], dtype=int)
@@ -409,14 +434,19 @@ def solve_hold_horizon(
                 m += pulp.lpSum(bench[r][(t,i)] for r in [1,2,3]) <= 1
                 m += start[(t,i)] + pulp.lpSum(bench[r][(t,i)] for r in [1,2,3]) <= 1
 
-        # Captains: exactly 1 overall; **no GK captaincy**
+        # Captain & Vice: exactly 1 captain (TC or normal) AND exactly 1 vice; no GK; C != VC
         m += pulp.lpSum(cap_tc[(t,i)] for i in range(P)) + pulp.lpSum(cap_n[(t,i)] for i in range(P)) == 1
+        m += pulp.lpSum(vice[(t,i)] for i in range(P)) == 1
         for i in range(P):
             m += cap_tc[(t,i)] <= start[(t,i)]
             m += cap_n[(t,i)]  <= start[(t,i)]
+            m += vice[(t,i)]   <= start[(t,i)]
+            # not same player as captain
+            m += cap_tc[(t,i)] + cap_n[(t,i)] + vice[(t,i)] <= 1
             if pos_arr[i] == "GK":
                 m += cap_tc[(t,i)] == 0
                 m += cap_n[(t,i)]  == 0
+                m += vice[(t,i)]   == 0
 
         # FH week support (temporary squad/XI)
         is_fh = (chip == "FH" and gw_list[t] == int(chip_gw or -1))
@@ -440,14 +470,18 @@ def solve_hold_horizon(
             for i in range(P):
                 m += tmp_sta[(t,i)] <= tmp_in[(t,i)]
 
-            # FH captains: also forbid GK captaincy
+            # FH captains/vice: also forbid GK; exactly one captain and one vice; not equal
             m += pulp.lpSum(tmp_capt[(t,i)] for i in range(P)) + pulp.lpSum(tmp_capn[(t,i)] for i in range(P)) == 1
+            m += pulp.lpSum(tmp_vice[(t,i)] for i in range(P)) == 1
             for i in range(P):
                 m += tmp_capn[(t,i)] <= tmp_sta[(t,i)]
                 m += tmp_capt[(t,i)] <= tmp_sta[(t,i)]
+                m += tmp_vice[(t,i)] <= tmp_sta[(t,i)]
+                m += tmp_capn[(t,i)] + tmp_capt[(t,i)] + tmp_vice[(t,i)] <= 1
                 if pos_arr[i] == "GK":
                     m += tmp_capt[(t,i)] == 0
                     m += tmp_capn[(t,i)] == 0
+                    m += tmp_vice[(t,i)] == 0
 
     # ----- Locks & bans -----
     for pid_locked in lock_ids:
@@ -561,8 +595,10 @@ def solve_hold_horizon(
 
     per_gw = []
     xi_blocks = []
+    xi_by_pos_blocks = []
     bench_blocks = []
     captain_ids = []
+    vice_ids = []
 
     for t,g in enumerate(gw_list):
         use_fh = (chip=="FH" and g == int(chip_gw or -1))
@@ -578,13 +614,17 @@ def solve_hold_horizon(
         if use_fh:
             c_tc = [i for i in range(P) if (pulp.value(tmp_capt[(t,i)]) or 0)>0.5]
             c_n  = [i for i in range(P) if (pulp.value(tmp_capn[(t,i)]) or 0)>0.5]
+            v_i  = [i for i in range(P) if (pulp.value(tmp_vice[(t,i)]) or 0)>0.5]
         else:
             c_tc = [i for i in range(P) if (pulp.value(cap_tc[(t,i)]) or 0)>0.5]
             c_n  = [i for i in range(P) if (pulp.value(cap_n[(t,i)]) or 0)>0.5]
+            v_i  = [i for i in range(P) if (pulp.value(vice[(t,i)]) or 0)>0.5]
         cap_idx = (c_tc or c_n)[0] if (c_tc or c_n) else None
+        vice_idx = v_i[0] if v_i else None
         captain_ids.append(pid[cap_idx] if cap_idx is not None else None)
+        vice_ids.append(pid[vice_idx] if vice_idx is not None else None)
 
-        # XI items with extras
+        # XI items (mirror single_gw: no is_home; fdr=int|null)
         xi_items = []
         for p in xi_pids:
             i = pid_index[p]
@@ -595,56 +635,65 @@ def solve_hold_horizon(
                 "team": str(team_code[i]),
                 "xPts": _round1(ev[t,i]),
                 "opp": None if opp[t,i] is None else str(opp[t,i]),
-                "is_home": bool(ishm[t,i] == 1),
-                "venue": "H" if ishm[t,i] == 1 else "A",
-                "fdr": (None if pd.isna(fdr[t,i]) else _round1(float(fdr[t,i])))
+                "venue": venue[t,i],
+                "fdr": _fdr_int_or_none(fdr[t,i]),
             })
 
-        # Bench 1..3 + GK 4
-        squad_gk = [i for i in range(P) if (pulp.value(in_squad[i]) or 0)>0.5 and pos_arr[i]=="GK"]
-        bench_gk_idx = None
-        if squad_gk:
-            cand = [i for i in squad_gk if i not in xi_idx]
-            bench_gk_idx = cand[0] if cand else squad_gk[0]
+        # xi_by_pos (GK/DEF/MID/FWD)
+        xi_by_pos = {"GK": [], "DEF": [], "MID": [], "FWD": []}
+        for item in xi_items:
+            xi_by_pos[item["pos"]].append(item.copy())
 
-        bench_out = []
+        # Bench per GW (mirror single_gw)
+        outfield_nonstar = [i for i in range(P) if pos_arr[i]!="GK" and (pulp.value(in_squad[i]) or 0)>0.5 and i not in xi_idx]
+        picked_rank = []
         for r in [1,2,3]:
             picked = None
             for i in range(P):
                 if pos_arr[i] != "GK" and (pulp.value(bench[r][(t,i)]) or 0) > 0.5:
                     picked = i; break
-            if picked is None:
-                nonstar = [i for i in range(P) if pos_arr[i]!="GK" and (pulp.value(in_squad[i]) or 0)>0.5 and i not in xi_idx]
-                nonstar = sorted(nonstar, key=lambda i: -ev[t,i])
-                if nonstar:
-                    picked = nonstar[min(r-1, len(nonstar)-1)]
             if picked is not None:
-                bench_out.append((r, picked))
-
-        bench_items = []
-        for r,i in bench_out:
-            bench_items.append({
+                picked_rank.append(picked)
+        remaining = [i for i in outfield_nonstar if i not in picked_rank]
+        remaining_sorted = sorted(remaining, key=lambda i: -ev[t,i])
+        while len(picked_rank) < 3 and remaining_sorted:
+            picked_rank.append(remaining_sorted.pop(0))
+        bench_order_objs: List[dict] = []
+        for i in picked_rank[:3]:
+            bench_order_objs.append({
                 "id": pid[i],
                 "name": None if pd.isna(name_arr[i]) else str(name_arr[i]),
                 "pos": str(pos_arr[i]),
                 "team": str(team_code[i]),
-                "bench_order": r,
-                "is_bench_gk": False,
                 "xPts": _round1(ev[t,i]),
+                "opp": None if opp[t,i] is None else str(opp[t,i]),
+                "venue": venue[t,i],
+                "fdr": _fdr_int_or_none(fdr[t,i]),
             })
+
+        # bench GK
+        squad_gk = [i for i in range(P) if (pulp.value(in_squad[i]) or 0)>0.5 and pos_arr[i]=="GK"]
+        gk_start = [i for i in xi_idx if pos_arr[i]=="GK"]
+        bench_gk_idx = None
+        if squad_gk:
+            cand = [i for i in squad_gk if i not in gk_start]
+            bench_gk_idx = cand[0] if cand else squad_gk[0]
+        bench_gk_obj = None
         if bench_gk_idx is not None:
-            bench_items.append({
+            bench_gk_obj = {
                 "id": pid[bench_gk_idx],
                 "name": None if pd.isna(name_arr[bench_gk_idx]) else str(name_arr[bench_gk_idx]),
                 "pos": "GK",
                 "team": str(team_code[bench_gk_idx]),
-                "bench_order": 4,
-                "is_bench_gk": True,
                 "xPts": _round1(ev[t,bench_gk_idx]),
-            })
+                "opp": None if opp[t,bench_gk_idx] is None else str(opp[t,bench_gk_idx]),
+                "venue": venue[t,bench_gk_idx],
+                "fdr": _fdr_int_or_none(fdr[t,bench_gk_idx]),
+            }
 
         xi_blocks.append({"gw": g, "xi": xi_items})
-        bench_blocks.append({"gw": g, "bench": bench_items})
+        xi_by_pos_blocks.append({"gw": g, "xi_by_pos": xi_by_pos})
+        bench_blocks.append({"gw": g, "bench": {"order": bench_order_objs, "gk": bench_gk_obj}})
 
         chip_tag = None
         if chip in {"FH","TC","BB"} and g == int(chip_gw or -1):
@@ -658,70 +707,85 @@ def solve_hold_horizon(
         elif chip=="FH" and g==int(chip_gw or -1):
             ev_team = float(sum(ev[t,i] * (pulp.value(tmp_sta[(t,i)]) or 0.0) for i in range(P)))
         else:
-            ev_team = float(sum(ev[t,i] * (1.0 if pid[i] in [x["id"] for x in xi_items] else 0.0) for i in range(P)))
+            xi_set = {x["id"] for x in xi_items}
+            ev_team = float(sum(ev[t,i] for i in range(P) if pid[i] in xi_set))
 
         per_gw.append({
             "gw": g,
             "formation": formation,
             "xi_count": len(xi_items),
-            "captain_id": captain_ids[-1],
+            "captain": captain_ids[-1],
+            "vice": vice_ids[-1],
             "chip": chip_tag,
             "ev_team": _round1(ev_team),
         })
 
+    # Transfer sets
     buy_ids  = [pid[i] for i in range(P) if (pulp.value(buy0[i]) or 0)>0.5]
     sell_ids = [pid[i] for i in range(P) if (pulp.value(sell0[i]) or 0)>0.5]
-    transfers_out: List[dict] = []
+
+    # Transfers (mirror single_gw shape) contextualized at start GW (t=0)
+    transfers_out_list: List[dict] = []
+    for out_id in sell_ids:
+        i_out = pid_index[out_id]
+        transfers_out_list.append({
+            "id": out_id,
+            "name": None if pd.isna(name_arr[i_out]) else str(name_arr[i_out]),
+            "pos": str(pos_arr[i_out]),
+            "team": str(team_code[i_out]),
+            "xPts": _round1(ev[0, i_out]),
+            "opp": None if opp[0, i_out] is None else str(opp[0, i_out]),
+            "venue": venue[0, i_out],
+            "fdr": _fdr_int_or_none(fdr[0, i_out]),
+            "sell_value": _round1(float(sell_map0.get(out_id, 0.0))),
+        })
+    transfers_in_list: List[dict] = []
+    for in_id in buy_ids:
+        i_in = pid_index[in_id]
+        transfers_in_list.append({
+            "id": in_id,
+            "name": None if pd.isna(name_arr[i_in]) else str(name_arr[i_in]),
+            "pos": str(pos_arr[i_in]),
+            "team": str(team_code[i_in]),
+            "xPts": _round1(ev[0, i_in]),
+            "opp": None if opp[0, i_in] is None else str(opp[0, i_in]),
+            "venue": venue[0, i_in],
+            "fdr": _fdr_int_or_none(fdr[0, i_in]),
+            "buy_price": _round1(float(price[0, i_in])),
+        })
+    # Minimal pairing for auditing
+    pairs_min: List[dict] = []
     remaining = list(buy_ids)
     for out_id in sell_ids:
         in_id = remaining.pop(0) if remaining else None
-        i_out = pid_index[out_id]
-        buy_price = float(price[0, pid_index[in_id]]) if in_id else None
-        sell_value = float(sell_map0.get(out_id, 0.0))
-        pair_net = (buy_price if buy_price is not None else 0.0) - sell_value
-        transfers_out.append({
-            "gw": gw_start,
-            "out": out_id,
-            "out_name": None if pd.isna(name_arr[i_out]) else str(name_arr[i_out]),
-            "out_pos": str(pos_arr[i_out]),
-            "out_team": str(team_code[i_out]),
-            "out_xPts": _round1(ev[0, i_out]),
-            "in": in_id,
-            "in_name": None if (in_id is None or pd.isna(name_arr[pid_index[in_id]])) else str(name_arr[pid_index[in_id]]),
-            "in_pos": None if in_id is None else str(pos_arr[pid_index[in_id]]),
-            "in_team": None if in_id is None else str(team_code[pid_index[in_id]]),
-            "in_xPts": None if in_id is None else _round1(ev[0, pid_index[in_id]]),
-            "sell_value": _round1(sell_value),
-            "buy_price": _round1(buy_price),
-            "pair_net": _round1(pair_net),
-        })
+        pairs_min.append({"gw": gw_start, "out": out_id, "in": in_id})
     for in_id in remaining:
-        i_in = pid_index[in_id]
-        transfers_out.append({
-            "gw": gw_start,
-            "out": None,
-            "out_name": None,
-            "out_pos": None,
-            "out_team": None,
-            "out_xPts": None,
-            "in": in_id,
-            "in_name": None if pd.isna(name_arr[i_in]) else str(name_arr[i_in]),
-            "in_pos": str(pos_arr[i_in]),
-            "in_team": str(team_code[i_in]),
-            "in_xPts": _round1(ev[0, i_in]),
-            "sell_value": None,
-            "buy_price": _round1(price[0, i_in]),
-            "pair_net": _round1(price[0, i_in]),
-        })
+        pairs_min.append({"gw": gw_start, "out": None, "in": in_id})
 
     total_ev = float(sum(item["ev_team"] or 0.0 for item in per_gw))
     hits_used = 0 if chip == "WC" else int(pulp.value(hits0))
+
+    # Team summary at start GW (mirror single_gw)
+    squad_counts = {}
+    for i in range(P):
+        if (pulp.value(in_squad[i]) or 0) > 0.5:
+            squad_counts[team_code[i]] = squad_counts.get(team_code[i], 0) + 1
+    xi_start = next((blk["xi"] for blk in xi_blocks if blk["gw"] == gw_start), [])
+    xi_counts = {}
+    for it in xi_start:
+        xi_counts[it["team"]] = xi_counts.get(it["team"], 0) + 1
+    team_summary = {
+        "squad": [{"team": k, "count": int(v)} for k,v in sorted(squad_counts.items())],
+        "xi":    [{"team": k, "count": int(v)} for k,v in sorted(xi_counts.items())],
+    }
+
     out = {
         "meta": {
             "season": season,
             "gw_start": gw_start,
             "next_k": next_k,
             "snapshot_gw": snapshot_gw,
+            "team_summary": team_summary,
             "locks": {"owned": sorted(list(lock_ids)), "ban": sorted(list(ban_ids))},
             "transfer_controls": {
                 "free_transfers_before": ft0,
@@ -733,24 +797,86 @@ def solve_hold_horizon(
         },
         "objective": {
             "per_gw": per_gw,
-            "total_ev": _round1(total_ev),
+            "ev": _round1(total_ev),                           # mirror single_gw key
             "hit_cost": _round1(HIT_COST * hits_used),
-            "total_minus_hits": _round1(total_ev - HIT_COST * hits_used),
+            "risk_penalty": 0.0,
+            "soft_lock_penalty": 0.0,
+            "total": _round1(total_ev - HIT_COST * hits_used),
         },
         "xi": xi_blocks,
-        "bench": bench_blocks,
-        "transfers_used": int(sum(1 for _ in buy_ids)),
+        "xi_by_pos": xi_by_pos_blocks,
+        "bench": bench_blocks,  # per-GW: {"gw": g, "bench": {"order":[...], "gk": {...}}}
+        "transfers_used": int(len(buy_ids)),
         "hits_used": hits_used,
-        "transfers": transfers_out,
+        "transfers": {
+            "out": transfers_out_list,
+            "in": transfers_in_list,
+            "pairs_min": pairs_min
+        },
         "notes": [
             "EV column: exp_pts_mean (xPts accepted upstream).",
             "Transfers only at first GW; squad held across horizon.",
             "XI is exactly 11 and obeys FPL formation bounds.",
-            "Bench: outfield ranks 1..3 + bench GK.",
+            "Bench: outfield ranks are mirrored as an ordered list; GK bench is separate.",
             "GK captaincy is forbidden by constraint.",
+            "Player objects expose opponent and venue ('H'/'A'); no is_home field in output.",
         ],
     }
     return out
+
+# ---------- Report builder ----------
+def _render_md_report(plan: dict) -> str:
+    meta = plan.get("meta", {})
+    obj = plan.get("objective", {})
+    per = obj.get("per_gw", [])
+    lines = []
+    gw_start = meta.get("gw_start")
+    next_k = meta.get("next_k")
+    gw_end = gw_start + next_k - 1 if (gw_start is not None and next_k is not None) else None
+    header = f"# HOLD plan: GW{gw_start}-GW{gw_end} (K={next_k})"
+    lines.append(header)
+    lines.append("")
+    lines.append(f"- Season: **{meta.get('season','')}**  | Snapshot GW: **{meta.get('snapshot_gw','?')}**")
+    lines.append(f"- Bank before: **{meta.get('bank_before',0)}**")
+    lines.append("")
+    lines.append(f"## Objective")
+    lines.append(f"- Total EV (sum): **{obj.get('ev')}**")
+    lines.append(f"- Hit cost: **{obj.get('hit_cost')}** → Total after hits: **{obj.get('total')}**")
+    lines.append("")
+    lines.append("## Per-GW Summary")
+    for g in per:
+        lines.append(f"- GW {g['gw']}: EV **{g['ev_team']}**, formation **{g['formation']}**, "
+                     f"Captain **{g.get('captain')}**, Vice **{g.get('vice')}**"
+                     + (f", Chip **{g['chip']}**" if g.get("chip") else ""))
+    lines.append("")
+    # Transfers
+    tr = plan.get("transfers", {})
+    lines.append("## Transfers at start GW")
+    lines.append("### Out")
+    if tr.get("out"):
+        for p in tr["out"]:
+            lines.append(f"- {p.get('name') or p['id']} ({p['team']} {p['pos']}) — sell {p.get('sell_value')}")
+    else:
+        lines.append("- None")
+    lines.append("### In")
+    if tr.get("in"):
+        for p in tr["in"]:
+            lines.append(f"- {p.get('name') or p['id']} ({p['team']} {p['pos']}) — buy {p.get('buy_price')}")
+    else:
+        lines.append("- None")
+    # Team summary
+    ts = meta.get("team_summary", {})
+    lines.append("")
+    lines.append("## Team summary (start GW)")
+    lines.append("### Squad (15)")
+    for row in ts.get("squad", []):
+        lines.append(f"- {row['team']}: {row['count']}")
+    lines.append("### XI")
+    for row in ts.get("xi", []):
+        lines.append(f"- {row['team']}: {row['count']}")
+    lines.append("")
+    lines.append("> Generated by multi_gw_hold.")
+    return "\n".join(lines)
 
 # ---------- Sweep Runner & CLI ----------
 def run_sweep_hold(
@@ -775,7 +901,8 @@ def run_sweep_hold(
     verbose: bool,
     skip_chips: bool = False,
     only_chip: Optional[str] = None,             # "WC" | "FH" | "TC" | "BB"
-    only_chip_gws: Optional[List[int]] = None    # applies to FH/TC/BB within horizon
+    only_chip_gws: Optional[List[int]] = None,   # applies to FH/TC/BB within horizon
+    report_fmt: Optional[str] = None             # "md" | None
 ) -> Dict[str,str]:
     with open(team_state, "r", encoding="utf-8") as f:
         state = json.load(f)
@@ -798,12 +925,27 @@ def run_sweep_hold(
     if sweep_include_hits and allow_hits:
         ks.extend(range(ft0+1, ft0 + max(1, max_extra_transfers) + 1))
 
-    base_root = os.path.join(out_dir, "hold", f"gw{gw_start}_k{next_k}", "base")
-    chips_root = os.path.join(out_dir, "hold", f"gw{gw_start}_k{next_k}", "chips")
+    gw_end = gw_start + next_k - 1
+    base_root = os.path.join(out_dir, "hold", f"gw{gw_start}-gw{gw_end}", "base")
+    chips_root = os.path.join(out_dir, "hold", f"gw{gw_start}-gw{gw_end}", "chips")
     os.makedirs(base_root, exist_ok=True)
     os.makedirs(chips_root, exist_ok=True)
 
     written: Dict[str,str] = {}
+
+    # helper to write files (json + transfers + optional report)
+    def _write_variant(dirpath: str, plan: dict, key: str):
+        os.makedirs(dirpath, exist_ok=True)
+        plan_path = os.path.join(dirpath, "plan.json")
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(dirpath, "transfers.json"), "w", encoding="utf-8") as f:
+            json.dump(plan["transfers"], f, indent=2, ensure_ascii=False)
+        if report_fmt == "md":
+            md = _render_md_report(plan)
+            with open(os.path.join(dirpath, "report.md"), "w", encoding="utf-8") as f:
+                f.write(md)
+        written[key] = plan_path
 
     # BASE (no chip)
     for K in ks:
@@ -828,13 +970,7 @@ def run_sweep_hold(
             threads=threads,
             verbose=verbose,
         )
-        k_dir = os.path.join(base_root, f"K{K}")
-        os.makedirs(k_dir, exist_ok=True)
-        with open(os.path.join(k_dir, "plan.json"), "w", encoding="utf-8") as f:
-            json.dump(plan, f, indent=2, ensure_ascii=False)
-        with open(os.path.join(k_dir, "transfers.json"), "w", encoding="utf-8") as f:
-            json.dump(plan["transfers"], f, indent=2, ensure_ascii=False)
-        written[f"BASE_K{K}"] = os.path.join(k_dir, "plan.json")
+        _write_variant(os.path.join(base_root, f"K{K}"), plan, f"BASE_K{K}")
 
     # CHIPS
     if not skip_chips:
@@ -852,13 +988,7 @@ def run_sweep_hold(
                         chip="WC", chip_gw=gw_start,
                         time_limit=time_limit, mip_gap=mip_gap, threads=threads, verbose=verbose,
                     )
-                    chip_dir = os.path.join(chips_root, "WC", f"gw{gw_start}", f"K{K}")
-                    os.makedirs(chip_dir, exist_ok=True)
-                    with open(os.path.join(chip_dir, "plan.json"), "w", encoding="utf-8") as f:
-                        json.dump(plan, f, indent=2, ensure_ascii=False)
-                    with open(os.path.join(chip_dir, "transfers.json"), "w", encoding="utf-8") as f:
-                        json.dump(plan["transfers"], f, indent=2, ensure_ascii=False)
-                    written[f"WC_K{K}"] = os.path.join(chip_dir, "plan.json")
+                    _write_variant(os.path.join(chips_root, "WC", f"gw{gw_start}", f"K{K}"), plan, f"WC_K{K}")
             else:
                 gw_range = horizon if not only_chip_gws else [g for g in horizon if g in set(only_chip_gws)]
                 for g in gw_range:
@@ -873,13 +1003,8 @@ def run_sweep_hold(
                             chip=chip, chip_gw=g,
                             time_limit=time_limit, mip_gap=mip_gap, threads=threads, verbose=verbose,
                         )
-                        chip_dir = os.path.join(chips_root, chip, f"gw{g}", f"K{K}")
-                        os.makedirs(chip_dir, exist_ok=True)
-                        with open(os.path.join(chip_dir, "plan.json"), "w", encoding="utf-8") as f:
-                            json.dump(plan, f, indent=2, ensure_ascii=False)
-                        with open(os.path.join(chip_dir, "transfers.json"), "w", encoding="utf-8") as f:
-                            json.dump(plan["transfers"], f, indent=2, ensure_ascii=False)
-                        written[f"{chip}_GW{g}_K{K}"] = os.path.join(chip_dir, "plan.json")
+                        _write_variant(os.path.join(chips_root, chip, f"gw{g}", f"K{K}"),
+                                       plan, f"{chip}_GW{g}_K{K}")
 
     return written
 
@@ -926,6 +1051,9 @@ def main():
     ap.add_argument("--only-chip", choices=["WC","FH","TC","BB"], help="Run only this chip variant")
     ap.add_argument("--only-chip-gw", help="Comma-separated GW(s) for FH/TC/BB (must be inside horizon)")
 
+    # Report
+    ap.add_argument("--report", choices=["md"], help="Emit a shareable report file per variant (report.md)")
+
     # Runtime
     ap.add_argument("--time-limit", type=int, default=None)
     ap.add_argument("--mip-gap", type=float, default=None)
@@ -962,6 +1090,7 @@ def main():
         skip_chips=bool(args.skip_chips),
         only_chip=(args.only_chip or None),
         only_chip_gws=only_chip_gws,
+        report_fmt=(args.report or None),
     )
     print(json.dumps(written, indent=2))
 
