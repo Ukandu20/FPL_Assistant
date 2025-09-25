@@ -19,6 +19,18 @@ New in this version:
 • --preview N: show quick preview of pool, XI, and transfers in stdout.
 • --report md: write a shareable Markdown file next to the JSON plan (works in sweep).
 • Sweep skips infeasible K's automatically and **reports infeasible K's** (especially useful when --lock is set).
+
+Output layout (updated to mirror multi_gw_hold and seasonized):
+  <out_base>/<season>/single/gw{gw}/
+    ├─ base/
+    │   └─ K{K}/
+    │       ├─ plan.json
+    │       ├─ transfers.json
+    │       └─ report.md (optional)
+    └─ chips/<CHIP>/K{K}/
+        ├─ plan.json
+        ├─ transfers.json
+        └─ report.md (optional)
 """
 from __future__ import annotations
 
@@ -189,6 +201,24 @@ def _preflight_budget_lb(df: pd.DataFrame, state: dict, gw: int, exact_transfers
         )
 
 
+def _detect_season_from_optimizer_input(optimizer_input_path: str, gw: Optional[int]) -> str:
+    """
+    Derive season strictly from the optimizer input (as requested).
+    If multiple seasons appear after GW filtering, raise; if missing, fall back to team_state later.
+    """
+    df = _read_any(optimizer_input_path)
+    if "season" not in df.columns:
+        return ""  # handled by fallbacks
+    d = df
+    if gw is not None and "gw" in d.columns:
+        d = d[d["gw"] == gw]
+    seasons = sorted(list({str(s) for s in d["season"].dropna().astype(str).unique()}))
+    if not seasons:
+        return ""
+    if len(seasons) > 1:
+        raise ValueError(f"optimizer_input has multiple seasons in scope for gw={gw}: {seasons}. Narrow your input.")
+    return seasons[0]
+
 # --------------- core MILP ----------------
 def solve_single_gw(
     team_state_path: str,
@@ -200,7 +230,6 @@ def solve_single_gw(
     allow_hits: bool = True,
     max_extra_transfers: int = 3,
     cap_cannot_equal_vice: bool = True,
-    formation_bounds: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]] = ((3, 5), (2, 5), (1, 3)),  # unused; kept for API compat
     chip: Optional[str] = None,         # None|WC|FH|TC|BB
     tc_multiplier: float = 3.0,
     verbose: bool = False,
@@ -225,7 +254,7 @@ def solve_single_gw(
         state = json.load(f)
     bank = float(state.get("bank", 0.0))
     free_transfers_before = int(state.get("free_transfers", 1))
-    season = str(state.get("season"))
+    season_state = str(state.get("season"))
     snapshot_gw = int(state.get("gw"))
     squad_owned: Set[str] = {str(p["player_id"]) for p in state.get("squad", [])}
     owned_sell_map: Dict[str, float] = {
@@ -280,6 +309,15 @@ def solve_single_gw(
             raise ValueError("optimizer_input has multiple GWs; specify --gw")
         gw = int(gws[0])
 
+    # Use season from optimizer input (single-value after GW filter)
+    seasons_in_df = sorted(list(df["season"].astype(str).unique()))
+    if not seasons_in_df:
+        season = season_state  # fallback
+    elif len(seasons_in_df) > 1:
+        raise ValueError(f"optimizer_input has multiple seasons for gw={gw}: {seasons_in_df}")
+    else:
+        season = seasons_in_df[0]
+
     # Preflight feasibility
     missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw)
 
@@ -321,6 +359,7 @@ def solve_single_gw(
     if dry_run_validate:
         diag = {
             "gw": gw,
+            "season": season,
             "owned_missing_count": len(missing_ids),
             "owned_missing_ids": missing_ids,
             "teamcap_excess_lower_bound": teamcap_lb,
@@ -403,7 +442,7 @@ def solve_single_gw(
     id2idx = {pid[i]: i for i in range(len(pid))}
 
     # Check locks present in pool
-    missing_locks = [x for x in lock_ids if x not in id2idx]
+    missing_locks = [x for x in (lock_ids or []) if x not in id2idx]
     if missing_locks:
         raise ValueError(f"--lock contains ids not present in candidate pool (gw={gw}): {missing_locks}")
     # bans not in pool are fine
@@ -433,7 +472,7 @@ def solve_single_gw(
             m += sell[i] == 0, f"cant_sell_not_owned_{i}"
 
     # Hard bans: in_squad == 0
-    for bid in ban_ids:
+    for bid in (ban_ids or []):
         if bid in id2idx:
             i = id2idx[bid]
             m += in_squad[i] == 0, f"ban_in_squad_{bid}"
@@ -474,7 +513,7 @@ def solve_single_gw(
     m += FWD_cnt == pulp.lpSum(f[2] * y_form[f] for f in y_form), "fwd_count_match_formation"
 
     # Locks: force start==1 for specified ids
-    for lid in lock_ids:
+    for lid in (lock_ids or []):
         i = id2idx[lid]
         m += start[i] == 1, f"lock_start_{lid}"
 
@@ -484,8 +523,8 @@ def solve_single_gw(
     for i in range(N):
         m += cap[i] <= start[i]
         m += vcap[i] <= start[i]
-        if cap_cannot_equal_vice:
-            m += cap[i] + vcap[i] <= 1
+        # No GK C/VC
+        m += cap[i] + vcap[i] <= 1
 
     # Transfers & hits (chip-aware)
     transfers_cnt = pulp.lpSum(buy[i] for i in range(N))
@@ -562,7 +601,7 @@ def solve_single_gw(
         team_ev_term = pulp.lpSum(in_squad[i] * ev[i] for i in range(N))
 
     # soft-lock penalty applies to OWNERSHIP (in_squad), not just starting
-    soft_ids_set = set(soft_lock_ids)
+    soft_ids_set = set(soft_lock_ids or [])
     soft_pen_vec = []
     for i in range(N):
         if pid[i] in soft_ids_set:
@@ -841,8 +880,7 @@ def solve_single_gw(
                 "Team column validated from optimizer_input.",
                 "Next-GW free transfers projection assumes +1 carry, capped at 5.",
                 "Player objects expose opponent and venue ('H'/'A'); no is_home field in output.",
-                "Formation is restricted to the FPL-valid set: "
-                + ", ".join([f"{d}-{m}-{f}" for (d, m, f) in sorted(list(VALID_FORMATIONS))]),
+                "Formation is restricted to the FPL-valid set",
                 "Soft-lock applies a negative EV penalty if these players are OWNED (in squad).",
             ],
         },
@@ -990,19 +1028,32 @@ def run_sweep(
     report_kind: Optional[str],
 ) -> Dict[str, str]:
     """
-    Produce multiple plans in one call. Returns dict alias -> path, plus '_infeasible' list in the dict.
-    Layout:
-      <out_base_dir>/single/gw{gw}/
-        ├─ NONE plans (e.g., 1t.json, 2t.json, ...)
-        └─ chips/
-            ├─ TC/TC_1t.json, ...
-            ├─ BB/BB_1t.json, ...
-            ├─ WC/1t.json, 2t.json, ..., 15t.json (only feasible ones)
-            └─ FH/1t.json, 2t.json, ..., 15t.json (only feasible ones)
+    Produce multiple plans in one call. Returns dict alias -> plan.json path, plus '_infeasible' list.
+
+    Layout (seasonized; mirrors multi_gw_hold):
+      <out_base>/<season>/single/gw{gw}/
+        ├─ base/
+        │   └─ K{K}/
+        │       ├─ plan.json
+        │       ├─ transfers.json
+        │       └─ report.md (optional)
+        └─ chips/<CHIP>/K{K}/
+            ├─ plan.json
+            ├─ transfers.json
+            └─ report.md (optional)
     """
     with open(team_state_path, "r", encoding="utf-8") as f:
         state = json.load(f)
     free_before = int(state.get("free_transfers", 1))
+
+    # Determine season from OPTIMIZER INPUT (strict request); fallback on team_state if needed
+    try:
+        season = _detect_season_from_optimizer_input(optimizer_input_path, gw)
+        if not season:
+            season = str(state.get("season"))
+    except Exception as e:
+        # If optimizer input is inconsistent, fail early to prevent wrong foldering
+        raise
 
     # Base K list for NONE/TC/BB
     ks: List[int] = []
@@ -1020,8 +1071,8 @@ def run_sweep(
     out_paths: Dict[str, str] = {}
     infeasible_notes: List[dict] = []
 
-    base_single = os.path.join(out_base_dir, "single", f"gw{gw}")
-    base_none  = os.path.join(base_single, "base")   # NEW: non-chip sweeps live here
+    base_single = os.path.join(out_base_dir, str(season), "single", f"gw{gw}")
+    base_none  = os.path.join(base_single, "base")   # non-chip sweeps live here
     base_chips = os.path.join(base_single, "chips")
 
     os.makedirs(base_single, exist_ok=True)
@@ -1034,16 +1085,35 @@ def run_sweep(
         if verbose:
             print(f"[sweep] {chip_lbl} {alias} infeasible/skipped: {reason}")
 
+    # Helper to write files in a K folder
+    def _write_variant(run_dir: str, plan: dict, alias_for_report: Optional[str]):
+        os.makedirs(run_dir, exist_ok=True)
+        plan_path = os.path.join(run_dir, "plan.json")
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2, ensure_ascii=False)
+        # transfers.json
+        with open(os.path.join(run_dir, "transfers.json"), "w", encoding="utf-8") as f:
+            json.dump(plan.get("transfers", {}), f, indent=2, ensure_ascii=False)
+        # report.md
+        if report_kind and report_kind.lower() == "md":
+            md_path = os.path.join(run_dir, "report.md")
+            _write_markdown_report(plan, md_path,
+                                   infeasible_notes=None,
+                                   sweep_alias=alias_for_report,
+                                   base_single_dir=base_single,
+                                   add_infeasible_section=False)
+        return plan_path
+
     # NONE
     if "NONE" in chips_list:
         for K in ks:
             alias = f"{K}t"
-            out_path = os.path.join(base_none, f"{alias}.json")
+            run_dir = os.path.join(base_none, f"K{K}")
             try:
                 plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
-                    out_path=out_path,
+                    out_path=os.path.join(run_dir, "plan.json"),   # solve writes here too
                     gw=gw,
                     risk_lambda=risk_lambda,
                     topk=topk,
@@ -1063,15 +1133,12 @@ def run_sweep(
                     soft_lock_ids=soft_lock_ids,
                     soft_lock_penalty=soft_lock_penalty,
                     preview=preview,
-                    report_kind=report_kind,
+                    report_kind=None,   # defer MD to _write_variant for unified file name
                 )
-                out_paths[f"NONE_{alias}"] = out_path
+                plan_path = _write_variant(run_dir, plan, alias_for_report=f"NONE {alias}")
+                out_paths[f"NONE_K{K}"] = plan_path
                 if verbose:
-                    print(f"[sweep] wrote NONE {alias} -> {out_path}")
-                if report_kind and report_kind.lower() == "md":
-                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
-                                           infeasible_notes=None, sweep_alias=f"NONE {alias}",
-                                           base_single_dir=base_single, add_infeasible_section=False)
+                    print(f"[sweep] wrote NONE K{K} -> {plan_path}")
             except Exception as e:
                 _record_infeasible("NONE", alias, e)
 
@@ -1083,12 +1150,12 @@ def run_sweep(
         os.makedirs(chip_dir, exist_ok=True)
         for K in ks:
             alias = f"{chip}_{K}t"
-            out_path = os.path.join(chip_dir, f"{alias}.json")
+            run_dir = os.path.join(chip_dir, f"K{K}")
             try:
                 plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
-                    out_path=out_path,
+                    out_path=os.path.join(run_dir, "plan.json"),
                     gw=gw,
                     risk_lambda=risk_lambda,
                     topk=topk,
@@ -1108,15 +1175,12 @@ def run_sweep(
                     soft_lock_ids=soft_lock_ids,
                     soft_lock_penalty=soft_lock_penalty,
                     preview=preview,
-                    report_kind=report_kind,
+                    report_kind=None,
                 )
-                out_paths[alias] = out_path
+                plan_path = _write_variant(run_dir, plan, alias_for_report=alias)
+                out_paths[f"{chip}_K{K}"] = plan_path
                 if verbose:
-                    print(f"[sweep] wrote {alias} -> {out_path}")
-                if report_kind and report_kind.lower() == "md":
-                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
-                                           infeasible_notes=None, sweep_alias=alias,
-                                           base_single_dir=base_single, add_infeasible_section=False)
+                    print(f"[sweep] wrote {alias} -> {plan_path}")
             except Exception as e:
                 _record_infeasible(chip, alias, e)
 
@@ -1128,12 +1192,12 @@ def run_sweep(
         os.makedirs(chip_dir, exist_ok=True)
         for K in range(1, 16):
             alias = f"{chip}_{K}t"
-            out_path = os.path.join(chip_dir, f"{K}t.json")
+            run_dir = os.path.join(chip_dir, f"K{K}")
             try:
                 plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
-                    out_path=out_path,
+                    out_path=os.path.join(run_dir, "plan.json"),
                     gw=gw,
                     risk_lambda=risk_lambda,
                     topk=topk,
@@ -1153,15 +1217,12 @@ def run_sweep(
                     soft_lock_ids=soft_lock_ids,
                     soft_lock_penalty=soft_lock_penalty,
                     preview=preview,
-                    report_kind=report_kind,
+                    report_kind=None,
                 )
-                out_paths[alias] = out_path
+                plan_path = _write_variant(run_dir, plan, alias_for_report=alias)
+                out_paths[f"{chip}_K{K}"] = plan_path
                 if verbose:
-                    print(f"[sweep] wrote {alias} -> {out_path}")
-                if report_kind and report_kind.lower() == "md":
-                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
-                                           infeasible_notes=None, sweep_alias=alias,
-                                           base_single_dir=base_single, add_infeasible_section=False)
+                    print(f"[sweep] wrote {alias} -> {plan_path}")
             except Exception as e:
                 _record_infeasible(chip, alias, e)
 
@@ -1233,10 +1294,16 @@ def main():
     # If sweep flags are present, run sweep
     if args.sweep_free_transfers or args.sweep_include_hits or (args.sweep_chips and args.sweep_chips.upper() != "NONE"):
         if args.dry_run_validate:
+            # Use seasonized temp path
+            try:
+                season_tmp = _detect_season_from_optimizer_input(args.optimizer_input, args.gw)
+            except Exception:
+                season_tmp = ""
+            temp_base = os.path.join(args.out_base, season_tmp or "unknown")
             _ = solve_single_gw(
                 team_state_path=args.team_state,
                 optimizer_input_path=args.optimizer_input,
-                out_path=os.path.join(args.out_base, "tmp_preflight.json"),
+                out_path=os.path.join(temp_base, "single", f"gw{args.gw}", "preflight_tmp.json"),
                 gw=args.gw,
                 risk_lambda=args.risk_lambda,
                 topk=_parse_topk(args.topk),
@@ -1280,8 +1347,16 @@ def main():
         print(json.dumps(res, indent=2))
         return
 
-    # Otherwise single plan
-    out_path = args.out or os.path.join(args.out_base, "single", f"gw{args.gw}", "plan.json")
+    # Otherwise single plan: build default OUT path with season folder if not provided
+    if args.out:
+        out_path = args.out
+    else:
+        try:
+            season_default = _detect_season_from_optimizer_input(args.optimizer_input, args.gw)
+        except Exception:
+            season_default = ""
+        out_path = os.path.join(args.out_base, season_default or "unknown", "single", f"gw{args.gw}", "plan.json")
+
     plan = solve_single_gw(
         team_state_path=args.team_state,
         optimizer_input_path=args.optimizer_input,
