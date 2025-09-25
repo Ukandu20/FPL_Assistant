@@ -1021,9 +1021,11 @@ def run_sweep(
     infeasible_notes: List[dict] = []
 
     base_single = os.path.join(out_base_dir, "single", f"gw{gw}")
+    base_none  = os.path.join(base_single, "base")   # NEW: non-chip sweeps live here
     base_chips = os.path.join(base_single, "chips")
 
     os.makedirs(base_single, exist_ok=True)
+    os.makedirs(base_none, exist_ok=True)
 
     # Helper to record infeasible
     def _record_infeasible(chip_lbl: str, alias: str, exc: Exception):
@@ -1036,7 +1038,7 @@ def run_sweep(
     if "NONE" in chips_list:
         for K in ks:
             alias = f"{K}t"
-            out_path = os.path.join(base_single, f"{alias}.json")
+            out_path = os.path.join(base_none, f"{alias}.json")
             try:
                 plan = solve_single_gw(
                     team_state_path=team_state_path,
