@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Single-GW selector (MILP) — chip-aware, sweep runner, team validator, rich JSON output.
+Single-GW selector (MILP) — chip-aware, sweep runner, team validator, rich JSON + Markdown output.
 
-This build:
+Core features:
 • EV auto-detection: picks the first non-empty among ['exp_pts_mean','xPts','xpts','exp_points'].
-• 'ha' renamed to 'venue' across output objects.
-• Robust handling of pd.NA in is_home and dtype-safe padding.
-• Sweep runner:
-    - NONE: produce K=1..FT (+hits to FT+H if requested).
-    - TC/BB: same K sweep as NONE, but saved under chips/TC/ and chips/BB/.
-    - WC/FH: run many solves with exact_transfers K=1..15 (hits==0), save any feasible results under chips/WC/ and chips/FH/.
-• Opponent/venue/fdr included per player and per transfer.
+• 'ha' renamed to 'venue' across output objects. No 'is_home' in output.
+• Strict FPL formations only (3-4-3, 3-5-2, 4-3-3, 4-4-2, 4-5-1, 5-3-2, 5-4-1) via selector binaries.
+• Team cap ≤3, legal squad composition (2/5/5/3).
+• Chips: NONE, TC, BB, WC, FH.
+• Sweep runner: NONE/TC/BB by FT/FT+hits; WC/FH try K=1..15 exact transfers (hits=0).
+• Outputs: transfers split into "out" and "in", fdr as int (or null), bench order+gk, xi (sorted) and xi_by_pos, team_summary.
+
+New in this version:
+• --ban <csv>: hard exclude player_ids.
+• --lock <csv>: force player_ids to start in XI.
+• --soft-lock <csv>: discourage **ownership** (apply EV penalty if in squad; not just if starting).
+• --soft-lock-penalty <float>: penalty magnitude (default 5.0) applied per soft-locked player owned.
+• --preview N: show quick preview of pool, XI, and transfers in stdout.
+• --report md: write a shareable Markdown file next to the JSON plan (works in sweep).
+• Sweep skips infeasible K's automatically and **reports infeasible K's** (especially useful when --lock is set).
 """
 from __future__ import annotations
 
@@ -31,6 +39,12 @@ MAX_FREE_TRANSFERS_STACK = 5
 OPP_COLS = ("opponent", "opponent_id", "is_home")
 FDR_COLS = ("fdr",)
 
+# Valid formations per FPL
+VALID_FORMATIONS: Set[Tuple[int, int, int]] = {
+    (3, 4, 3), (3, 5, 2),
+    (4, 3, 3), (4, 4, 2), (4, 5, 1),
+    (5, 3, 2), (5, 4, 1),
+}
 
 # ---------------- helpers ----------------
 def _read_any(path: str) -> pd.DataFrame:
@@ -52,6 +66,12 @@ def _parse_topk(s: str) -> Dict[str, int]:
         k, v = part.strip().split(":")
         out[k.strip().upper()] = int(v)
     return out
+
+
+def _parse_csv_ids(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
 
 def _round1(x: Optional[float]) -> Optional[float]:
@@ -180,7 +200,7 @@ def solve_single_gw(
     allow_hits: bool = True,
     max_extra_transfers: int = 3,
     cap_cannot_equal_vice: bool = True,
-    formation_bounds: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]] = ((3, 5), (2, 5), (1, 3)),
+    formation_bounds: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]] = ((3, 5), (2, 5), (1, 3)),  # unused; kept for API compat
     chip: Optional[str] = None,         # None|WC|FH|TC|BB
     tc_multiplier: float = 3.0,
     verbose: bool = False,
@@ -191,6 +211,14 @@ def solve_single_gw(
     # Preflight/diagnostics
     pad_missing_owned: bool = False,
     dry_run_validate: bool = False,
+    # Locks/Bans
+    ban_ids: Optional[List[str]] = None,
+    lock_ids: Optional[List[str]] = None,
+    soft_lock_ids: Optional[List[str]] = None,
+    soft_lock_penalty: float = 5.0,
+    # Preview/Report
+    preview: int = 0,
+    report_kind: Optional[str] = None,
 ) -> dict:
     # State
     with open(team_state_path, "r", encoding="utf-8") as f:
@@ -204,6 +232,10 @@ def solve_single_gw(
         str(p["player_id"]): float(p.get("sell_price", p.get("price", 0.0)))
         for p in state.get("squad", [])
     }
+
+    ban_ids = ban_ids or []
+    lock_ids = lock_ids or []
+    soft_lock_ids = soft_lock_ids or []
 
     # Data
     df = _read_any(optimizer_input_path)
@@ -280,7 +312,8 @@ def solve_single_gw(
             pads.append(pad_row)
 
         if pads:
-            df = pd.concat([df, pd.DataFrame(pads)[all_cols]], ignore_index=True)
+            pad_df = pd.DataFrame(pads, columns=all_cols)
+            df = pd.concat([df, pad_df], ignore_index=True)
             # Recompute bounds after padding
             missing_ids, teamcap_lb, lb, owned_view = _preflight_required_transfers(df, state, gw)
 
@@ -326,7 +359,6 @@ def solve_single_gw(
     pos = pool["pos"].astype(str).tolist()
     teams = pool[team_col_name].astype(str).tolist()
     ownedm = pool["owned"].astype(bool).to_numpy()
-
     price = pd.to_numeric(pool["price"], errors="coerce").fillna(0.0).astype(float).to_numpy()
 
     # EV and variance
@@ -367,6 +399,15 @@ def solve_single_gw(
     if "player" in pool.columns:
         names = [None if pd.isna(v) else str(v) for v in pool["player"].astype(object)]
 
+    # index maps
+    id2idx = {pid[i]: i for i in range(len(pid))}
+
+    # Check locks present in pool
+    missing_locks = [x for x in lock_ids if x not in id2idx]
+    if missing_locks:
+        raise ValueError(f"--lock contains ids not present in candidate pool (gw={gw}): {missing_locks}")
+    # bans not in pool are fine
+
     N = len(pool)
     m = pulp.LpProblem("single_gw_selector", pulp.LpMaximize)
 
@@ -391,6 +432,12 @@ def solve_single_gw(
             m += in_squad[i] == buy[i], f"new_transition_{i}"
             m += sell[i] == 0, f"cant_sell_not_owned_{i}"
 
+    # Hard bans: in_squad == 0
+    for bid in ban_ids:
+        if bid in id2idx:
+            i = id2idx[bid]
+            m += in_squad[i] == 0, f"ban_in_squad_{bid}"
+
     # Squad size & composition
     def _sum_pos(pname: str, vec):
         return pulp.lpSum(vec[i] for i in range(N) if pos[i] == pname)
@@ -405,18 +452,31 @@ def solve_single_gw(
     for t in sorted(set(teams)):
         m += pulp.lpSum(in_squad[i] for i in range(N) if teams[i] == t) <= 3, f"teamcap_{t}"
 
-    # XI & formation
+    # XI & formation (strict)
     m += pulp.lpSum(start[i] for i in range(N)) == 11, "xi_size_11"
     for i in range(N):
         m += start[i] <= in_squad[i], f"start_in_squad_{i}"
-    (DEF_min, DEF_max), (MID_min, MID_max), (FWD_min, FWD_max) = formation_bounds
     m += _sum_pos("GK", start) == 1, "xi_gk_1"
-    m += _sum_pos("DEF", start) >= DEF_min
-    m += _sum_pos("DEF", start) <= DEF_max
-    m += _sum_pos("MID", start) >= MID_min
-    m += _sum_pos("MID", start) <= MID_max
-    m += _sum_pos("FWD", start) >= FWD_min
-    m += _sum_pos("FWD", start) <= FWD_max
+
+    # counts
+    DEF_cnt = _sum_pos("DEF", start)
+    MID_cnt = _sum_pos("MID", start)
+    FWD_cnt = _sum_pos("FWD", start)
+
+    # formation selector binaries, one per VALID_FORMATIONS
+    y_form = {f: pulp.LpVariable(f"form_{f[0]}_{f[1]}_{f[2]}", lowBound=0, upBound=1, cat=pulp.LpBinary)
+              for f in sorted(list(VALID_FORMATIONS))}
+    m += pulp.lpSum(y_form[f] for f in y_form) == 1, "one_valid_formation"
+
+    # tie position counts to exactly one chosen tuple
+    m += DEF_cnt == pulp.lpSum(f[0] * y_form[f] for f in y_form), "def_count_match_formation"
+    m += MID_cnt == pulp.lpSum(f[1] * y_form[f] for f in y_form), "mid_count_match_formation"
+    m += FWD_cnt == pulp.lpSum(f[2] * y_form[f] for f in y_form), "fwd_count_match_formation"
+
+    # Locks: force start==1 for specified ids
+    for lid in lock_ids:
+        i = id2idx[lid]
+        m += start[i] == 1, f"lock_start_{lid}"
 
     # C/VC
     m += pulp.lpSum(cap[i] for i in range(N)) == 1, "one_captain"
@@ -439,7 +499,6 @@ def solve_single_gw(
     Tmin = _int_or_none(min_total_transfers)
 
     if chip_norm in {"WC", "FH"}:
-        # Unlimited by hits; if exact K is given, honor it; otherwise allow any K (unless caller sets min/max)
         m += hits == 0, "hits_zero_chip"
         if E is not None:
             if E < 0:
@@ -481,6 +540,7 @@ def solve_single_gw(
     m += cost_expr <= bank + proceeds_expr, "budget"
 
     # Bench ordering (outfield only)
+    bench_ranks = [1, 2, 3]
     for r in bench_ranks:
         m += pulp.lpSum(bench[r][i] for i in range(N) if pos[i] != "GK") == 1
     for i in range(N):
@@ -492,7 +552,7 @@ def solve_single_gw(
             for r in bench_ranks:
                 m += bench[r][i] <= in_squad[i] - start[i]
 
-    # Objective (chip-aware)
+    # Objective (chip-aware) + soft-lock ownership penalty (discourages owning these ids)
     team_ev_term = pulp.lpSum(start[i] * ev[i] for i in range(N))
     cap_uplift = pulp.lpSum(cap[i] * capup[i] for i in range(N))
     if chip_norm == "TC":
@@ -501,7 +561,15 @@ def solve_single_gw(
     if chip_norm == "BB":
         team_ev_term = pulp.lpSum(in_squad[i] * ev[i] for i in range(N))
 
-    obj = team_ev_term + cap_uplift - float(risk_lambda) * pulp.lpSum(start[i] * var[i] for i in range(N))
+    # soft-lock penalty applies to OWNERSHIP (in_squad), not just starting
+    soft_ids_set = set(soft_lock_ids)
+    soft_pen_vec = []
+    for i in range(N):
+        if pid[i] in soft_ids_set:
+            soft_pen_vec.append(in_squad[i] * float(soft_lock_penalty))
+    soft_pen_term = pulp.lpSum(soft_pen_vec) if soft_pen_vec else 0.0
+
+    obj = team_ev_term + cap_uplift - float(risk_lambda) * pulp.lpSum(start[i] * var[i] for i in range(N)) - soft_pen_term
     if chip_norm not in {"WC", "FH"}:
         obj = obj - 4.0 * hits
     m += obj
@@ -510,16 +578,27 @@ def solve_single_gw(
     solver = pulp.PULP_CBC_CMD(msg=bool(verbose))
     res = m.solve(solver)
     if pulp.LpStatus[res] != "Optimal":
-        raise RuntimeError(f"MILP not optimal: status={pulp.LpStatus[res]}")
+        msg = f"MILP not optimal: status={pulp.LpStatus[res]}"
+        if lock_ids:
+            msg += " | Hint: a LOCK may conflict with budget, 3-per-team, formation, or exact K; try higher K or use --soft-lock."
+        raise RuntimeError(msg)
 
     # Extract helpers
     def picks(mask):
         return [pid[i] for i in range(N) if pulp.value(mask[i]) > 0.5]
 
+    def _int_or_none_fdr(v):
+        if v is None or _is_na_like(v):
+            return None
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
     def to_player_obj(xid: Optional[str]) -> Optional[dict]:
         if xid is None:
             return None
-        i = pid.index(xid)
+        i = id2idx[xid]
         base = {
             "id": xid,
             "name": (None if names[i] is None else names[i]),
@@ -527,12 +606,10 @@ def solve_single_gw(
             "team": teams[i],
             "xPts": _round1(ev[i]),
             "opp": opp[i],
-            "is_home": is_home_vals[i],
-            "venue": venue[i],  # renamed
+            "venue": venue[i],  # 'H'/'A' or None
         }
         if has_fdr and fdr_col:
-            val = None if _is_na_like(fdr_vals[i]) else float(fdr_vals[i])
-            base["fdr"] = val
+            base["fdr"] = _int_or_none_fdr(fdr_vals[i])
         return base
 
     xi_ids = picks(start)
@@ -562,53 +639,41 @@ def solve_single_gw(
     price_map = {pid[i]: float(price[i]) for i in range(N)}
     sell_map = {pid[i]: float(owned_sell_map.get(pid[i], 0.0)) for i in range(N)}
     opp_map = {pid[i]: opp[i] for i in range(N)}
-    is_home_map = {pid[i]: is_home_vals[i] for i in range(N)}
     venue_map = {pid[i]: venue[i] for i in range(N)}
     fdr_map = {pid[i]: (None if (not has_fdr or fdr_vals is None) else fdr_vals[i]) for i in range(N)}
 
-    # Transfers enriched (pair sells to buys)
-    transfers_out: List[dict] = []
-    remaining_buys = list(buy_ids)
+    # Transfers enriched (split OUT and IN; no is_home in output)
+    transfers_out_list: List[dict] = []
     for out_id in sell_ids:
-        in_id = remaining_buys.pop(0) if remaining_buys else None
-        buy_price = float(price_map.get(in_id, 0.0)) if in_id else None
         sell_value = float(sell_map.get(out_id, 0.0))
-        pair_net = (buy_price if buy_price is not None else 0.0) - sell_value
-        payload = {
-            "out": out_id, "out_name": name_map.get(out_id), "out_pos": pos_map.get(out_id),
-            "out_team": team_map.get(out_id), "out_xPts": _round1(ev_map.get(out_id)),
-            "out_opp": opp_map.get(out_id), "out_is_home": is_home_map.get(out_id), "out_venue": venue_map.get(out_id),
-            "in": in_id, "in_name": name_map.get(in_id) if in_id else None,
-            "in_pos": pos_map.get(in_id) if in_id else None,
-            "in_team": team_map.get(in_id) if in_id else None,
-            "in_xPts": _round1(ev_map.get(in_id)) if in_id else None,
-            "in_opp": opp_map.get(in_id) if in_id else None,
-            "in_is_home": is_home_map.get(in_id) if in_id else None,
-            "in_venue": venue_map.get(in_id) if in_id else None,
-            "sell_value": sell_value, "buy_price": buy_price,
-            "pair_net": _round1(pair_net),
-            "price_delta": float(0.0 - sell_value),
+        payload_out = {
+            "id": out_id,
+            "name": name_map.get(out_id),
+            "pos": pos_map.get(out_id),
+            "team": team_map.get(out_id),
+            "xPts": _round1(ev_map.get(out_id)),
+            "opp": opp_map.get(out_id),
+            "venue": venue_map.get(out_id),
+            "fdr": _int_or_none_fdr(fdr_map.get(out_id)),
+            "sell_value": sell_value,
         }
-        if has_fdr:
-            payload["out_fdr"] = fdr_map.get(out_id)
-            payload["in_fdr"] = fdr_map.get(in_id) if in_id else None
-        transfers_out.append(payload)
+        transfers_out_list.append(payload_out)
 
-    for in_id in remaining_buys:
+    transfers_in_list: List[dict] = []
+    for in_id in buy_ids:
         buy_price = float(price_map.get(in_id, 0.0))
-        payload = {
-            "out": None, "out_name": None, "out_pos": None, "out_team": None, "out_xPts": None,
-            "out_opp": None, "out_is_home": None, "out_venue": None,
-            "in": in_id, "in_name": name_map.get(in_id), "in_pos": pos_map.get(in_id),
-            "in_team": team_map.get(in_id), "in_xPts": _round1(ev_map.get(in_id)),
-            "in_opp": opp_map.get(in_id), "in_is_home": is_home_map.get(in_id), "in_venue": venue_map.get(in_id),
-            "sell_value": None, "buy_price": buy_price,
-            "pair_net": _round1(buy_price), "price_delta": float(buy_price),
+        payload_in = {
+            "id": in_id,
+            "name": name_map.get(in_id),
+            "pos": pos_map.get(in_id),
+            "team": team_map.get(in_id),
+            "xPts": _round1(ev_map.get(in_id)),
+            "opp": opp_map.get(in_id),
+            "venue": venue_map.get(in_id),
+            "fdr": _int_or_none_fdr(fdr_map.get(in_id)),
+            "buy_price": buy_price,
         }
-        if has_fdr:
-            payload["out_fdr"] = None
-            payload["in_fdr"] = fdr_map.get(in_id)
-        transfers_out.append(payload)
+        transfers_in_list.append(payload_in)
 
     # Objective parts (chip-aware EV term for reporting)
     if chip_norm == "BB":
@@ -621,19 +686,31 @@ def solve_single_gw(
     else:
         ev_cap = float(sum(capup[i] * pulp.value(cap[i]) for i in range(N)))
     var_pen = float(risk_lambda * sum(var[i] * pulp.value(start[i]) for i in range(N)))
+    # Ownership-based soft-lock penalty value (count of soft-ids owned * penalty)
+    soft_pen_val = float(sum((pid[i] in soft_ids_set) * pulp.value(in_squad[i]) for i in range(N))) * float(soft_lock_penalty)
     hits_val = 0.0 if chip_norm in {"WC", "FH"} else float(4.0 * pulp.value(hits))
-    total = ev_start + ev_cap - var_pen - hits_val
+    total = ev_start + ev_cap - var_pen - soft_pen_val - hits_val
 
     # Budget math
     buys_cost = sum(price_map[x] for x in buy_ids)
     sells_proceeds = sum(sell_map[x] for x in sell_ids)
     bank_after = bank + sells_proceeds - buys_cost
 
-    # Formation string
-    nDEF = int(sum(1 for i in range(N) if pos[i] == "DEF" and pulp.value(start[i]) > 0.5))
-    nMID = int(sum(1 for i in range(N) if pos[i] == "MID" and pulp.value(start[i]) > 0.5))
-    nFWD = int(sum(1 for i in range(N) if pos[i] == "FWD" and pulp.value(start[i]) > 0.5))
-    formation_str = f"{nDEF}-{nMID}-{nFWD}"
+    # Formation string from chosen y_form
+    def _val(v): return float(pulp.value(v))
+    chosen = None
+    for f, y in y_form.items():
+        if _val(y) > 0.5:
+            chosen = f
+            break
+    if chosen is None:
+        # fallback (should not happen)
+        nDEF = int(sum(1 for i in range(N) if pos[i] == "DEF" and pulp.value(start[i]) > 0.5))
+        nMID = int(sum(1 for i in range(N) if pos[i] == "MID" and pulp.value(start[i]) > 0.5))
+        nFWD = int(sum(1 for i in range(N) if pos[i] == "FWD" and pulp.value(start[i]) > 0.5))
+        formation_str = f"{nDEF}-{nMID}-{nFWD}"
+    else:
+        formation_str = f"{chosen[0]}-{chosen[1]}-{chosen[2]}"
 
     # Binding detection (heuristic)
     bindings: List[str] = []
@@ -673,43 +750,83 @@ def solve_single_gw(
         free_next = min(MAX_FREE_TRANSFERS_STACK, free_after + 1)
         extra_used = max(0, transfers_used - free_transfers_before)
 
+    # Team summaries
+    def _team_counts(mask_vec):
+        counts: Dict[str, int] = {}
+        for i in range(N):
+            if pulp.value(mask_vec[i]) > 0.5:
+                counts[teams[i]] = counts.get(teams[i], 0) + 1
+        return [{"team": t, "count": int(c)} for t, c in sorted(counts.items())]
+
+    squad_team_summary = _team_counts(in_squad)
+    xi_team_summary = _team_counts(start)
+
+    # Compute XI objects once; then group/sort
+    xi_objs = [to_player_obj(x) for x in xi_ids]
+    pos_order = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
+    xi_sorted = sorted(xi_objs, key=lambda r: pos_order.get(r["pos"], 9) if r else 9)
+    xi_by_pos = {
+        "GK": [p for p in xi_objs if p and p["pos"] == "GK"],
+        "DEF": [p for p in xi_objs if p and p["pos"] == "DEF"],
+        "MID": [p for p in xi_objs if p and p["pos"] == "MID"],
+        "FWD": [p for p in xi_objs if p and p["pos"] == "FWD"],
+    }
+
+    meta_locks = {
+        "ban": ban_ids,
+        "lock": lock_ids,
+        "soft_lock": soft_lock_ids,
+    }
+
     # Compose plan JSON
     plan = {
         "objective": {
-            "ev": _round1(ev_start), "hit_cost": _round1(hits_val),
-            "risk_penalty": _round1(var_pen), "total": _round1(total),
+            "ev": _round1(ev_start),             # base EV (XI or all-15 for BB)
+            "hit_cost": _round1(hits_val),       # 4 * hits (0 for WC/FH)
+            "risk_penalty": _round1(var_pen),    # lambda * variance term
+            "soft_lock_penalty": _round1(soft_pen_val),  # ownership penalty sum
+            "total": _round1(total),             # ev + cap_uplift - risk_penalty - soft_lock_penalty - hit_cost
         },
         "meta": {
             "season": season,
             "gw": gw,
             "snapshot_gw": snapshot_gw,
             "formation": formation_str,
-            "free_transfers_before": free_transfers_before,
-            "free_transfers_used": free_used,
-            "free_transfers_after": free_after,
-            "free_transfers_next": free_next,
-            "max_free_transfers_stack": MAX_FREE_TRANSFERS_STACK,
             "bank_before": _round1(bank),
             "bank_after": _round1(bank_after),
+            "team_summary": {
+                "squad": squad_team_summary,
+                "xi": xi_team_summary,
+            },
+            "locks": meta_locks,
             "budget": {
                 "buys_cost": _round1(buys_cost),
                 "sells_proceeds": _round1(sells_proceeds),
                 "net_spend": _round1(buys_cost - sells_proceeds),
             },
-            "transfers_used": transfers_used,
-            "extra_transfers": extra_used,
-            "hits_charged": int(pulp.value(hits)),
             "transfer_controls": {
                 "allow_hits": bool(allow_hits),
                 "max_extra_transfers": int(max_extra_transfers),
                 "exact_transfers": (None if exact_transfers is None else int(exact_transfers)),
                 "max_total_transfers": (None if max_total_transfers is None else int(max_total_transfers)),
                 "min_total_transfers": (None if min_total_transfers is None else int(min_total_transfers)),
+                "free_transfers_before": free_transfers_before,
+                "free_transfers_used": free_used,
+                "free_transfers_after": free_after,
+                "free_transfers_next": free_next,
+                "max_free_transfers_stack": MAX_FREE_TRANSFERS_STACK,
+                "transfers_used": transfers_used,
+                "extra_transfers": extra_used,
+                "hits_charged": int(pulp.value(hits)),
             },
         },
         "chip": chip_norm or None,
-        "transfers": transfers_out,
-        "xi": [to_player_obj(x) for x in xi_ids],
+        "transfers": {
+            "out": transfers_out_list,
+            "in": transfers_in_list
+        },
+        "xi": xi_sorted,
+        "xi_by_pos": xi_by_pos,
         "bench": {"order": [to_player_obj(x) for x in bench_order_ids], "gk": to_player_obj(bench_gk_id)},
         "captain": to_player_obj(cap_pid),
         "vice": to_player_obj(vcap_pid),
@@ -723,17 +840,130 @@ def solve_single_gw(
                 "Outfield bench ranks are 1..3; GK bench is implied.",
                 "Team column validated from optimizer_input.",
                 "Next-GW free transfers projection assumes +1 carry, capped at 5.",
-                "Player objects expose opponent, is_home (bool), and venue ('H'/'A').",
+                "Player objects expose opponent and venue ('H'/'A'); no is_home field in output.",
+                "Formation is restricted to the FPL-valid set: "
+                + ", ".join([f"{d}-{m}-{f}" for (d, m, f) in sorted(list(VALID_FORMATIONS))]),
+                "Soft-lock applies a negative EV penalty if these players are OWNED (in squad).",
             ],
         },
     }
 
+    # Ensure directory and write JSON
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=2, ensure_ascii=False)
+
+    # Preview (stdout)
+    if preview and preview > 0:
+        print("\n=== PREVIEW ===")
+        print(f"GW {gw} • Formation {plan['meta']['formation']} • Chip {plan['chip']}")
+        print(f"Objective: EV={plan['objective']['ev']} | Cap+={_round1(ev_cap)} | Risk-={plan['objective']['risk_penalty']} | SoftOwn-={plan['objective']['soft_lock_penalty']} | Hits-={plan['objective']['hit_cost']} | Total={plan['objective']['total']}")
+        print("\nXI (pos, team, name, xPts, opp, venue, fdr) — top N:")
+        for p in plan["xi"][:preview]:
+            print(f"  {p['pos']:<3} {p['team']:<3}  {p['name']:<20}  xPts={p['xPts']:<4}  vs {p['opp'] or '-':<3}  {p['venue'] or '-':<1}  fdr={p.get('fdr')}")
+        print("\nTransfers OUT:")
+        for t in plan["transfers"]["out"][:preview]:
+            print(f"  OUT {t['pos']:<3} {t['team']:<3}  {t['name']:<20} sell={_round1(t['sell_value'])}  xPts={t['xPts']}  vs {t['opp'] or '-':<3} {t['venue'] or '-'} fdr={t.get('fdr')}")
+        print("\nTransfers IN:")
+        for t in plan["transfers"]["in"][:preview]:
+            print(f"  IN  {t['pos']:<3} {t['team']:<3}  {t['name']:<20} buy={_round1(t['buy_price'])}  xPts={t['xPts']}  vs {t['opp'] or '-':<3} {t['venue'] or '-'} fdr={t.get('fdr')}")
+        print("=== /PREVIEW ===\n")
+
+    # Report
+    if report_kind and report_kind.lower() == "md":
+        md_path = os.path.splitext(out_path)[0] + ".md"
+        _write_markdown_report(plan, md_path, infeasible_notes=None, sweep_alias=None, base_single_dir=None, add_infeasible_section=False)
+        if verbose:
+            print(f"[report] wrote {md_path}")
+
     return plan
+
+
+def _write_markdown_report(plan: dict, out_md: str,
+                           infeasible_notes: Optional[List[dict]],
+                           sweep_alias: Optional[str],
+                           base_single_dir: Optional[str],
+                           add_infeasible_section: bool) -> None:
+    """Emit a concise Markdown report for easy sharing. Optionally append infeasible K summary."""
+    meta = plan["meta"]
+    obj = plan["objective"]
+    chip = plan.get("chip") or "NONE"
+    xi = plan["xi"]
+    bench = plan["bench"]
+    transfers = plan["transfers"]
+
+    def fmt_player(p):
+        fdr = p.get("fdr")
+        fdrs = "" if fdr is None else f" | FDR {fdr}"
+        return f"- **{p['name']}** ({p['pos']} {p['team']}) — xPts {p['xPts']} vs {p['opp'] or '-'} {p['venue'] or ''}{fdrs}"
+
+    def fmt_transfer_out(t):
+        fdr = t.get("fdr")
+        fdrs = "" if fdr is None else f" | FDR {fdr}"
+        return f"- OUT: **{t['name']}** ({t['pos']} {t['team']}) — sell {t['sell_value']} | xPts {t['xPts']} vs {t['opp'] or '-'} {t['venue'] or ''}{fdrs}"
+
+    def fmt_transfer_in(t):
+        fdr = t.get("fdr")
+        fdrs = "" if fdr is None else f" | FDR {fdr}"
+        return f"- IN: **{t['name']}** ({t['pos']} {t['team']}) — buy {t['buy_price']} | xPts {t['xPts']} vs {t['opp'] or '-'} {t['venue'] or ''}{fdrs}"
+
+    lines = []
+    title_alias = f"{sweep_alias} — " if sweep_alias else ""
+    lines.append(f"# {title_alias}GW{meta['gw']} Plan — {meta['formation']}  \n")
+    lines.append(f"**Chip:** {chip}  \n")
+    lines.append(f"**Objective:** EV {obj['ev']}  + Cap  − Risk {obj['risk_penalty']} − SoftOwn {obj.get('soft_lock_penalty', 0)} − Hits {obj['hit_cost']}  = **{obj['total']}**  \n")
+    lines.append("")
+    lines.append("## Team Summary")
+    for scope in ("xi", "squad"):
+        ts = meta["team_summary"].get(scope, [])
+        lines.append(f"- **{scope.upper()}**: " + ", ".join([f"{x['team']}×{x['count']}" for x in ts]))
+    lines.append("")
+    lines.append("## XI")
+    for p in xi:
+        lines.append(fmt_player(p))
+    lines.append("")
+    lines.append("**Captain:** " + (f"{plan['captain']['name']} ({plan['captain']['team']})" if plan.get("captain") else "-"))
+    lines.append("**Vice:** " + (f"{plan['vice']['name']} ({plan['vice']['team']})" if plan.get("vice") else "-"))
+    lines.append("")
+    lines.append("## Bench")
+    bo = bench["order"]
+    bg = bench["gk"]
+    for i, p in enumerate(bo, start=1):
+        if p:
+            lines.append(f"- **B{i}**: {p['name']} ({p['pos']} {p['team']}) — xPts {p['xPts']}")
+    if bg:
+        lines.append(f"- **GK**: {bg['name']} ({bg['team']}) — xPts {bg['xPts']}")
+    lines.append("")
+    lines.append("## Transfers")
+    if transfers["out"]:
+        lines.append("### Out")
+        for t in transfers["out"]:
+            lines.append(fmt_transfer_out(t))
+    if transfers["in"]:
+        lines.append("### In")
+        for t in transfers["in"]:
+            lines.append(fmt_transfer_in(t))
+    lines.append("")
+    lines.append("## Budget")
+    b = meta["budget"]
+    lines.append(f"- Buys cost: **{b['buys_cost']}** | Sells proceeds: **{b['sells_proceeds']}** | Net spend: **{b['net_spend']}**  ")
+    lines.append(f"- Bank: **{meta['bank_before']} → {meta['bank_after']}**")
+    lines.append("")
+    lines.append("## Controls & Notes")
+    tc = meta["transfer_controls"]
+    lines.append(f"- Transfers used: **{tc['transfers_used']}** (free used {tc['free_transfers_used']}, extra {tc['extra_transfers']}, hits {tc['hits_charged']})")
+    lines.append(f"- Free next: **{tc['free_transfers_next']}**")
+    lines.append("- " + " | ".join(plan["explanations"]["notes"]))
+    if add_infeasible_section and infeasible_notes:
+        lines.append("")
+        lines.append("## Infeasible K Runs (skipped)")
+        for item in infeasible_notes:
+            lines.append(f"- **{item['chip']} {item['alias']}** — {item['reason']}")
+    lines.append("")
+    with open(out_md, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # ---------------- sweep runner ----------------
@@ -751,11 +981,17 @@ def run_sweep(
     topk: Dict[str, int],
     pad_missing_owned: bool,
     verbose: bool,
+    # new:
+    ban_ids: List[str],
+    lock_ids: List[str],
+    soft_lock_ids: List[str],
+    soft_lock_penalty: float,
+    preview: int,
+    report_kind: Optional[str],
 ) -> Dict[str, str]:
     """
-    Produce multiple plans in one call. Returns dict alias -> path.
-
-    Folder layout:
+    Produce multiple plans in one call. Returns dict alias -> path, plus '_infeasible' list in the dict.
+    Layout:
       <out_base_dir>/single/gw{gw}/
         ├─ NONE plans (e.g., 1t.json, 2t.json, ...)
         └─ chips/
@@ -782,16 +1018,27 @@ def run_sweep(
     chips_list = [c for c in chips_list if c in {"NONE", "TC", "BB", "FH", "WC"}]
 
     out_paths: Dict[str, str] = {}
+    infeasible_notes: List[dict] = []
+
     base_single = os.path.join(out_base_dir, "single", f"gw{gw}")
     base_chips = os.path.join(base_single, "chips")
 
-    for chip in chips_list:
-        if chip == "NONE":
-            # Save directly under gw folder
-            for K in ks:
-                alias = f"{K}t"
-                out_path = os.path.join(base_single, f"{alias}.json")
-                _ = solve_single_gw(
+    os.makedirs(base_single, exist_ok=True)
+
+    # Helper to record infeasible
+    def _record_infeasible(chip_lbl: str, alias: str, exc: Exception):
+        reason = str(exc)
+        infeasible_notes.append({"chip": chip_lbl, "alias": alias, "reason": reason})
+        if verbose:
+            print(f"[sweep] {chip_lbl} {alias} infeasible/skipped: {reason}")
+
+    # NONE
+    if "NONE" in chips_list:
+        for K in ks:
+            alias = f"{K}t"
+            out_path = os.path.join(base_single, f"{alias}.json")
+            try:
+                plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
                     out_path=out_path,
@@ -809,22 +1056,34 @@ def run_sweep(
                     min_total_transfers=None,
                     pad_missing_owned=pad_missing_owned,
                     dry_run_validate=False,
+                    ban_ids=ban_ids,
+                    lock_ids=lock_ids,
+                    soft_lock_ids=soft_lock_ids,
+                    soft_lock_penalty=soft_lock_penalty,
+                    preview=preview,
+                    report_kind=report_kind,
                 )
                 out_paths[f"NONE_{alias}"] = out_path
                 if verbose:
                     print(f"[sweep] wrote NONE {alias} -> {out_path}")
-            continue
+                if report_kind and report_kind.lower() == "md":
+                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
+                                           infeasible_notes=None, sweep_alias=f"NONE {alias}",
+                                           base_single_dir=base_single, add_infeasible_section=False)
+            except Exception as e:
+                _record_infeasible("NONE", alias, e)
 
-        # chips subfolder
+    # TC / BB
+    for chip in ["TC", "BB"]:
+        if chip not in chips_list:
+            continue
         chip_dir = os.path.join(base_chips, chip)
         os.makedirs(chip_dir, exist_ok=True)
-
-        if chip in {"TC", "BB"}:
-            # Same K sweep as NONE, but placed under chips/<CHIP> and prefixed
-            for K in ks:
-                alias = f"{chip}_{K}t"
-                out_path = os.path.join(chip_dir, f"{alias}.json")
-                _ = solve_single_gw(
+        for K in ks:
+            alias = f"{chip}_{K}t"
+            out_path = os.path.join(chip_dir, f"{alias}.json")
+            try:
+                plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
                     out_path=out_path,
@@ -842,18 +1101,34 @@ def run_sweep(
                     min_total_transfers=None,
                     pad_missing_owned=pad_missing_owned,
                     dry_run_validate=False,
+                    ban_ids=ban_ids,
+                    lock_ids=lock_ids,
+                    soft_lock_ids=soft_lock_ids,
+                    soft_lock_penalty=soft_lock_penalty,
+                    preview=preview,
+                    report_kind=report_kind,
                 )
                 out_paths[alias] = out_path
                 if verbose:
                     print(f"[sweep] wrote {alias} -> {out_path}")
-            continue
+                if report_kind and report_kind.lower() == "md":
+                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
+                                           infeasible_notes=None, sweep_alias=alias,
+                                           base_single_dir=base_single, add_infeasible_section=False)
+            except Exception as e:
+                _record_infeasible(chip, alias, e)
 
-        # WC / FH: try K=1..15, accept all feasible solves (hits=0)
+    # WC / FH: try K=1..15
+    for chip in ["WC", "FH"]:
+        if chip not in chips_list:
+            continue
+        chip_dir = os.path.join(base_chips, chip)
+        os.makedirs(chip_dir, exist_ok=True)
         for K in range(1, 16):
             alias = f"{chip}_{K}t"
             out_path = os.path.join(chip_dir, f"{K}t.json")
             try:
-                _ = solve_single_gw(
+                plan = solve_single_gw(
                     team_state_path=team_state_path,
                     optimizer_input_path=optimizer_input_path,
                     out_path=out_path,
@@ -871,14 +1146,35 @@ def run_sweep(
                     min_total_transfers=None,
                     pad_missing_owned=pad_missing_owned,
                     dry_run_validate=False,
+                    ban_ids=ban_ids,
+                    lock_ids=lock_ids,
+                    soft_lock_ids=soft_lock_ids,
+                    soft_lock_penalty=soft_lock_penalty,
+                    preview=preview,
+                    report_kind=report_kind,
                 )
                 out_paths[alias] = out_path
                 if verbose:
                     print(f"[sweep] wrote {alias} -> {out_path}")
+                if report_kind and report_kind.lower() == "md":
+                    _write_markdown_report(plan, os.path.splitext(out_path)[0] + ".md",
+                                           infeasible_notes=None, sweep_alias=alias,
+                                           base_single_dir=base_single, add_infeasible_section=False)
             except Exception as e:
-                if verbose:
-                    print(f"[sweep] {alias} infeasible/skipped: {e}")
+                _record_infeasible(chip, alias, e)
 
+    # If requested, write one consolidated infeasible summary markdown
+    if report_kind and report_kind.lower() == "md" and infeasible_notes:
+        md_path = os.path.join(base_single, "infeasible_runs.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("# Infeasible K Runs (skipped)\n\n")
+            for item in infeasible_notes:
+                f.write(f"- **{item['chip']} {item['alias']}** — {item['reason']}\n")
+        if verbose:
+            print(f"[report] wrote infeasible summary: {md_path}")
+
+    # Include infeasible metadata in return
+    out_paths["_infeasible"] = infeasible_notes
     return out_paths
 
 
@@ -917,7 +1213,20 @@ def main():
     ap.add_argument("--sweep-include-hits", action="store_true",
                     help="Additionally produce K=FT+1..FT+max_extra_transfers (requires --allow-hits)")
     ap.add_argument("--sweep-chips", default="NONE", help='Comma list among NONE,TC,BB,FH,WC. Plans go to .../chips/<CHIP>/.')
+    # Locks/Bans
+    ap.add_argument("--ban", help="Comma-separated player_ids to hard BAN (exclude from squad)")
+    ap.add_argument("--lock", help="Comma-separated player_ids to LOCK into starting XI")
+    ap.add_argument("--soft-lock", dest="soft_lock", help="Comma-separated player_ids to discourage (apply EV penalty if OWNED)")
+    ap.add_argument("--soft-lock-penalty", type=float, default=5.0, help="Penalty subtracted from objective if a soft-locked player is OWNED (default 5.0)")
+    # Preview/Report
+    ap.add_argument("--preview", type=int, default=0, help="Preview N rows of XI and transfers in stdout")
+    ap.add_argument("--report", choices=["md"], help="Emit a shareable report alongside JSON (e.g., 'md')")
+
     args = ap.parse_args()
+
+    ban_ids = _parse_csv_ids(args.ban)
+    lock_ids = _parse_csv_ids(args.lock)
+    soft_lock_ids = _parse_csv_ids(args.soft_lock)
 
     # If sweep flags are present, run sweep
     if args.sweep_free_transfers or args.sweep_include_hits or (args.sweep_chips and args.sweep_chips.upper() != "NONE"):
@@ -938,6 +1247,12 @@ def main():
                 exact_transfers=1,
                 pad_missing_owned=bool(args.pad_missing_owned),
                 dry_run_validate=True,
+                ban_ids=ban_ids,
+                lock_ids=lock_ids,
+                soft_lock_ids=soft_lock_ids,
+                soft_lock_penalty=float(args.soft_lock_penalty),
+                preview=int(args.preview),
+                report_kind=args.report,
             )
         res = run_sweep(
             team_state_path=args.team_state,
@@ -953,6 +1268,12 @@ def main():
             topk=_parse_topk(args.topk),
             pad_missing_owned=bool(args.pad_missing_owned),
             verbose=bool(args.verbose),
+            ban_ids=ban_ids,
+            lock_ids=lock_ids,
+            soft_lock_ids=soft_lock_ids,
+            soft_lock_penalty=float(args.soft_lock_penalty),
+            preview=int(args.preview),
+            report_kind=args.report,
         )
         print(json.dumps(res, indent=2))
         return
@@ -977,6 +1298,12 @@ def main():
         min_total_transfers=args.min_total_transfers,
         pad_missing_owned=bool(args.pad_missing_owned),
         dry_run_validate=bool(args.dry_run_validate),
+        ban_ids=ban_ids,
+        lock_ids=lock_ids,
+        soft_lock_ids=soft_lock_ids,
+        soft_lock_penalty=float(args.soft_lock_penalty),
+        preview=int(args.preview),
+        report_kind=args.report,
     )
     print(json.dumps(plan, indent=2, ensure_ascii=False))
 
