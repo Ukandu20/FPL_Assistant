@@ -49,7 +49,8 @@ def build_maps(long2hex: Dict[str, str], long2code: Dict[str, str]):
     return name2hex, name2code, code2hex
 
 def normalise_date(series: pd.Series) -> pd.Series:
-    if series.dt.tz is not None:
+    series = pd.to_datetime(series, errors="coerce")
+    if hasattr(series.dt, "tz") and series.dt.tz is not None:
         series = series.dt.tz_convert(None)
     return series.dt.floor("D")
 
@@ -82,6 +83,59 @@ def read_fixture_calendar(out_dir: Path, season: str) -> pd.DataFrame:
     fp = out_dir / season / "fixture_calendar.csv"
     return pd.read_csv(fp, parse_dates=["date_sched", "date_played"])
 
+# ──────────────── NEW: sticky locking of schedule fields ─────────────────────
+
+def _lock_sched_fields(out_new: pd.DataFrame, out_dir: Path, season: str) -> pd.DataFrame:
+    """
+    If a prior fixture_calendar.csv exists, keep previously-written
+    date_sched and gw_orig for matching rows (keyed by fpl_id+team).
+    This makes date_sched/gw_orig **sticky** so reschedules are measurable.
+    """
+    prev_path = out_dir / season / "fixture_calendar.csv"
+    if not prev_path.exists():
+        return out_new
+
+    try:
+        prev = pd.read_csv(prev_path, parse_dates=["date_sched", "date_played"])
+    except Exception:
+        logging.warning("%s • failed to read prior fixture_calendar.csv; skipping sticky restore.", season)
+        return out_new
+
+    keep = prev[["fpl_id", "team", "date_sched", "gw_orig"]].copy()
+    keep["date_sched"] = normalise_date(keep["date_sched"])
+    # prefer Int8 for gw_orig if possible
+    try:
+        keep["gw_orig"] = pd.to_numeric(keep["gw_orig"], errors="coerce").astype("Int8")
+    except Exception:
+        pass
+
+    merged = out_new.merge(
+        keep.rename(columns={"date_sched": "_date_sched_prev", "gw_orig": "_gw_orig_prev"}),
+        on=["fpl_id", "team"],
+        how="left",
+        validate="many_to_one"
+    )
+
+    # restore when a previous value exists
+    have_prev_date = merged["_date_sched_prev"].notna()
+    have_prev_gw   = merged["_gw_orig_prev"].notna()
+
+    merged.loc[have_prev_date, "date_sched"] = merged.loc[have_prev_date, "_date_sched_prev"]
+    merged.loc[have_prev_gw,   "gw_orig"]    = merged.loc[have_prev_gw,   "_gw_orig_prev"]
+
+    merged.drop(columns=["_date_sched_prev","_gw_orig_prev"], inplace=True)
+
+    # normalize & dtype after restore
+    merged["date_sched"] = normalise_date(merged["date_sched"])
+    try:
+        merged["gw_orig"] = pd.to_numeric(merged["gw_orig"], errors="coerce").astype("Int8")
+    except Exception:
+        pass
+
+    n_locked = int(have_prev_date.sum())
+    if n_locked:
+        logging.info("%s • sticky lock applied: restored %d date_sched/gw_orig rows from previous calendar.", season, n_locked)
+    return merged
 
 # ─────────────── FDR view materializer (optional, behind a flag) ────────────
 
@@ -280,27 +334,22 @@ def build_fixture_calendar(
     else:
         cal["team_id"] = cal["team_id"].fillna(cal["team"].map(code2hex))
 
-
     # ── Derive home/away using IDs first, then venue, then legacy flags ──
-    # Expected hex from FPL short codes
     cal["home_hex_expected"] = cal["home"].astype(str).map(code2hex).astype("string")
     cal["away_hex_expected"] = cal["away"].astype(str).map(code2hex).astype("string")
-    # ID-based truth (most reliable): team row is home iff team_id == home_hex_expected
     id_cmp_valid = cal["team_id"].notna() & cal["home_hex_expected"].notna()
     is_home_by_ids = pd.Series(pd.NA, index=cal.index, dtype="Int8")
     is_home_by_ids[id_cmp_valid] = cal.loc[id_cmp_valid, "team_id"].eq(
         cal.loc[id_cmp_valid, "home_hex_expected"]
     ).astype("Int8")
-    # Venue-based fallback
     is_home_by_venue = _venue_to_is_home_int8(cal["venue"])
-    # Legacy flag fallback
     if "is_home" in cal.columns:
         is_home_flag = _to_bool_mask(cal["is_home"]).astype("Int8")
     elif "is_away" in cal.columns:
         is_home_flag = (~_to_bool_mask(cal["is_away"])).astype("Int8")
     else:
         is_home_flag = pd.Series(pd.NA, index=cal.index, dtype="Int8")
-    # Coalesce: IDs → venue → flag
+
     cal["is_home"] = is_home_by_ids
     need_fill = cal["is_home"].isna()
     if need_fill.any():
@@ -310,13 +359,11 @@ def build_fixture_calendar(
         cal.loc[need_fill, "is_home"] = is_home_flag.loc[need_fill]
     cal["is_home"] = cal["is_home"].astype("Int8")
     cal["is_away"] = (1 - cal["is_home"]).astype("Int8")
+
     # Build mask and assign ids
     hmask = (cal["is_home"] == 1)
-
     cal["home_id"] = np.where(hmask, cal["team_id"], cal["opponent_id"])
     cal["away_id"] = np.where(hmask, cal["opponent_id"], cal["team_id"])
-
-
 
     # enforce lowercase hex strings (keeps <NA> if missing)
     for c in ("home_id", "away_id"):
@@ -328,16 +375,10 @@ def build_fixture_calendar(
         cal.groupby("team")["date_played"].diff().dt.days.fillna(0).astype(int)
     )
 
-    # After you've built/merged `cal` and before selecting `out`:
+    # Default: gw_played := gw_orig if not set
     if "gw_played" not in cal.columns:
         cal["gw_played"] = np.nan
-
-    # Default: gw_played := gw_orig; keep any already-computed values
     cal["gw_played"] = cal["gw_played"].fillna(cal["gw_orig"])
-
-    # Use nullable ints so NaNs stay NaN (if any remain)
-    
-
 
     # final flags
     cal["gw_played"] = cal.get("gw_played", cal.get("gw_orig"))
@@ -354,15 +395,25 @@ def build_fixture_calendar(
         "is_promoted", "is_relegated",
     ]].rename(columns={"game_id": "fbref_id"}).copy()
 
+    # ── NEW: apply sticky schedule lock from previous calendar ──
+    out = _lock_sched_fields(out, out_dir, season)
+
     # guarantee integer 0/1 in CSV
     out["is_home"] = out["is_home"].astype("Int8")
     out["gw_played"] = out["gw_played"].astype("Int8")
-    out["sched_missing"] = out["sched_missing"].astype("Int8")
+
+    # Normalize dates (date-only) just before write
+    out["date_sched"]  = normalise_date(out["date_sched"])
+    out["date_played"] = normalise_date(out["date_played"])
 
     # ── write base calendar ──
     dst_dir.mkdir(parents=True, exist_ok=True)
     out_csv = dst_dir / "fixture_calendar.csv"
-    out.to_csv(out_csv, index=False)
+
+    csv_out = out.copy()
+    csv_out["date_sched"]  = csv_out["date_sched"].dt.strftime("%Y-%m-%d")
+    csv_out["date_played"] = csv_out["date_played"].dt.strftime("%Y-%m-%d")
+    csv_out.to_csv(out_csv, index=False)
     logging.info("%s • fixture_calendar.csv (%d rows)", season, len(out))
 
     # Diagnostics
@@ -389,9 +440,6 @@ def build_fixture_calendar(
         cal.loc[bad_align.index, cols].to_csv(dst_dir / "_home_alignment_audit.csv", index=False)
         logging.error("%s • %d rows fail home/away ID alignment (see _home_alignment_audit.csv)", season, len(bad_align))
 
-
-
-
     # ── reschedule audit (only where we *did* match) ──
     audit = out.loc[out["fbref_id"].notna() & out["date_sched"].notna() & out["date_played"].notna()].copy()
     audit = audit[audit["date_sched"] != audit["date_played"]]
@@ -403,7 +451,7 @@ def build_fixture_calendar(
             "home", "away", "team", "team_id", "opponent_id",
             "date_sched", "date_played", "delta_days", "abs_delta_days", "status"
         ]
-        (dst_dir / "_reschedule_audit.csv").write_text("")  # ensure file exists even if to_csv appends header
+        (dst_dir / "_reschedule_audit.csv").write_text("")
         audit[audit_cols].to_csv(dst_dir / "_reschedule_audit.csv", index=False)
         logging.info("%s • reschedule audit: %d rows moved (see _reschedule_audit.csv)", season, len(audit))
     else:

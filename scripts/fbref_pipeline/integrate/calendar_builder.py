@@ -1,5 +1,5 @@
-#!/usr/bin/env python3 
-#calender_builder.py
+#!/usr/bin/env python3
+# calender_builder.py
 from __future__ import annotations
 import argparse, logging, json
 from pathlib import Path
@@ -44,6 +44,15 @@ def write_empty_minutes_calendar(season_dir: Path, include_price: bool) -> None:
     pd.DataFrame(columns=cols).to_csv(out_fp, index=False)
     logging.info("%s • wrote EMPTY player_fixture_calendar.csv", season_dir.name)
 
+# ───────────────────────────── Date helpers ─────────────────────────────
+def _normalize_date(s: pd.Series) -> pd.Series:
+    s = pd.to_datetime(s, errors="coerce", utc=True)
+    try:
+        s = s.dt.tz_convert(None)
+    except Exception:
+        s = s.dt.tz_localize(None)
+    return s.dt.floor("D")
+
 # ───────────────────────────── Season key helpers ─────────────────────────────
 
 def season_long_to_short(season: str) -> str:
@@ -80,10 +89,13 @@ def _autodetect_price_json(season_key: str) -> Optional[Path]:
 def _read_calendar_base(season_dir: Path) -> pd.DataFrame:
     """Read the PURE fixtures calendar (expects gw_orig present)."""
     fp = season_dir / "fixture_calendar.csv"
-    df = pd.read_csv(fp, low_memory=False, parse_dates=["date_played"])
+    df = pd.read_csv(fp, low_memory=False, parse_dates=["date_played","date_sched"])
     for c in ["team_id","home_id","away_id","opponent_id","fbref_id","fpl_id"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.lower()
+    # normalize dates to date-only
+    df["date_played"] = _normalize_date(df["date_played"])
+    df["date_sched"]  = _normalize_date(df["date_sched"])
     return df
 
 def _try_read_team_form(features_root: Path, season: str, team_version: str) -> Optional[pd.DataFrame]:
@@ -94,6 +106,7 @@ def _try_read_team_form(features_root: Path, season: str, team_version: str) -> 
     if {"date_played","home_id","away_id","fdr_home","fdr_away"}.issubset(tf.columns):
         for c in ["home_id","away_id"]:
             tf[c] = tf[c].astype("string").str.lower()
+        tf["date_played"] = _normalize_date(tf["date_played"])
         return tf[["date_played","home_id","away_id","fdr_home","fdr_away"]].drop_duplicates(["date_played","home_id","away_id"])
     return tf
 
@@ -135,8 +148,6 @@ def load_fixture_calendar(season_dir: Path, *, features_root: Path, team_version
             opp = np.where(mask, df["away_id"], df["home_id"])
             df["opponent_id"] = df.get("opponent_id", pd.Series(index=df.index, dtype="string"))
             df["opponent_id"] = df["opponent_id"].fillna(pd.Series(opp, index=df.index)).astype("string")
-    if "date_played" in df.columns:
-        df["date_played"] = pd.to_datetime(df["date_played"]).dt.tz_localize(None).dt.floor("D")
     return df
 
 # ───────────────────────────── FBref loaders ─────────────────────────────
@@ -209,7 +220,7 @@ def _coerce_01(series: pd.Series) -> pd.Series:
 def _prep_fixture_keys(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if "kickoff_time" not in df.columns: return None
     df = df.copy()
-    df["date_played"] = pd.to_datetime(df["kickoff_time"], utc=True).dt.tz_convert(None).dt.floor("D")
+    df["date_played"] = _normalize_date(df["kickoff_time"])
     if "was_home" in df.columns:
         df["was_home"] = _coerce_bool_int8(df["was_home"])
     elif "venue" in df.columns:
@@ -361,7 +372,6 @@ def load_prices_gws_fallback_by_gw(fpl_root: Path, season: str) -> Optional[pd.D
         df = pd.read_csv(gws_fp, low_memory=False)
     except Exception:
         logging.exception("Failed reading %s", gws_fp); return None
-    # try to find event column
     gw_col = next((c for c in ["event","gw","GW"] if c in df.columns), None)
     if gw_col is None:
         return None
@@ -375,7 +385,6 @@ def load_prices_gws_fallback_by_gw(fpl_root: Path, season: str) -> Optional[pd.D
     out["player_id"] = out["player_id"].astype(str).str.lower()
     out["gw_orig"] = pd.to_numeric(out["gw_orig"], errors="coerce").astype("Int64")
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
-    # normalize now_cost/value to real price if needed
     if pcol in ["now_cost","value"]:
         out["price"] = out["price"] / 10.0
     out = out.dropna(subset=["player_id","gw_orig"])
@@ -383,6 +392,91 @@ def load_prices_gws_fallback_by_gw(fpl_root: Path, season: str) -> Optional[pd.D
     return (out.sort_values(["player_id","gw_orig"])
                .drop_duplicates(["player_id","gw_orig"], keep="last")
                .reset_index(drop=True))
+
+# ───────────────────────────── NEW: sticky lock for date_sched/gw_orig ──────────────────────────
+
+def _lock_player_sched_fields(df_new: pd.DataFrame, season_dir: Path) -> pd.DataFrame:
+    """
+    Preserve previously written `date_sched` and `gw_orig` per player-match row.
+    Priority of keys:
+      1) (player_id, fbref_id)
+      2) (player_id, fpl_id)
+      3) (player_id, date_played)
+    """
+    prev_fp = season_dir / "player_fixture_calendar.csv"
+    if not prev_fp.exists():
+        return df_new
+
+    try:
+        prev = pd.read_csv(prev_fp, parse_dates=["date_sched","date_played"])
+    except Exception:
+        logging.warning("%s • could not read previous player_fixture_calendar.csv; skipping sticky restore", season_dir.name)
+        return df_new
+
+    # normalize IDs + dates
+    for c in ["player_id","fbref_id","fpl_id"]:
+        if c in prev.columns:
+            prev[c] = prev[c].astype(str).str.lower()
+    prev["date_sched"]  = _normalize_date(prev["date_sched"])
+    prev["date_played"] = _normalize_date(prev["date_played"])
+    # coerce gw_orig to Int8
+    try:
+        prev["gw_orig"] = pd.to_numeric(prev["gw_orig"], errors="coerce").astype("Int8")
+    except Exception:
+        pass
+
+    out = df_new.copy()
+    for c in ["player_id","fbref_id","fpl_id"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str).str.lower()
+
+    # Helper to apply a merge+restore for a given key set
+    def restore_with_keys(keys: List[str], mask_missing: Optional[pd.Series]=None):
+        nonlocal out
+        keep_cols = keys + ["date_sched","gw_orig"]
+        if not set(keys).issubset(prev.columns):
+            return
+        prev_k = prev[keep_cols].dropna(subset=keys).drop_duplicates(keys, keep="last")
+        left = out if mask_missing is None else out.loc[mask_missing].copy()
+        if not set(keys).issubset(left.columns):
+            return
+        merged = left.merge(
+            prev_k.rename(columns={"date_sched":"_date_sched_prev","gw_orig":"_gw_orig_prev"}),
+            on=keys, how="left", validate="m:1"
+        )
+        has_prev = merged["_date_sched_prev"].notna() | merged["_gw_orig_prev"].notna()
+        if has_prev.any():
+            merged.loc[merged["_date_sched_prev"].notna(), "date_sched"] = merged.loc[merged["_date_sched_prev"].notna(), "_date_sched_prev"]
+            merged.loc[merged["_gw_orig_prev"].notna(),   "gw_orig"]    = merged.loc[merged["_gw_orig_prev"].notna(),   "_gw_orig_prev"]
+        merged.drop(columns=["_date_sched_prev","_gw_orig_prev"], inplace=True)
+        if mask_missing is None:
+            out = merged
+        else:
+            out.loc[mask_missing, :] = merged
+
+    # Pass 1: (player_id, fbref_id)
+    restore_with_keys(["player_id","fbref_id"])
+    # Pass 2: (player_id, fpl_id) — only rows still missing either field
+    missing_after_p1 = out["date_sched"].isna() | out["gw_orig"].isna()
+    restore_with_keys(["player_id","fpl_id"], mask_missing=missing_after_p1)
+    # Pass 3: (player_id, date_played)
+    missing_after_p2 = out["date_sched"].isna() | out["gw_orig"].isna()
+    if "date_played" in out.columns and "date_played" in prev.columns:
+        # ensure date_played normalized
+        out["date_played"] = _normalize_date(out["date_played"])
+        restore_with_keys(["player_id","date_played"], mask_missing=missing_after_p2)
+
+    # final normalization
+    out["date_sched"] = _normalize_date(out["date_sched"])
+    try:
+        out["gw_orig"] = pd.to_numeric(out["gw_orig"], errors="coerce").astype("Int8")
+    except Exception:
+        pass
+
+    n_locked = int(((df_new["date_sched"] != out["date_sched"]) | (df_new["gw_orig"] != out["gw_orig"])).sum())
+    if n_locked:
+        logging.info("%s • sticky lock restored %d player rows (date_sched/gw_orig).", season_dir.name, n_locked)
+    return out
 
 # ───────────────────────────── Main builder ─────────────────────────────
 
@@ -452,16 +546,15 @@ def build_minutes_calendar(
     )
 
     # Normalize IDs for joins
-    for c in ["player_id","fbref_id","team_id"]:
+    for c in ["player_id","fbref_id","team_id","fpl_id"]:
         if c in merged.columns:
             merged[c] = merged[c].astype(str).str.lower()
-    merged["date_played"] = pd.to_datetime(merged["date_played"]).dt.floor("D")
+    merged["date_played"] = _normalize_date(merged["date_played"])
     if "gw_orig" in merged.columns:
         merged["gw_orig"] = pd.to_numeric(merged["gw_orig"], errors="coerce").astype("Int64")
 
     # ── PRICE (optional) ────────────────────────────────────────────────────
     if include_price:
-        # >>> Auto-detect seasonal prices if not explicitly provided
         if price_seasonal is None:
             auto = _autodetect_price_json(season_key)
             if auto:
@@ -471,17 +564,14 @@ def build_minutes_calendar(
                 logging.info("[%s] No seasonal price JSON auto-detected; will try master and merged_gws.", season_key)
 
         pframes: List[pd.DataFrame] = []
-        # 1) seasonal JSON (highest priority)
         ps = load_prices_seasonal_by_gw(price_seasonal) if price_seasonal else None
         if ps is not None:
             ps["_prio"] = 3
             pframes.append(ps)
-        # 2) master JSON (mid)
         pm = load_prices_master_by_gw(price_master, season_key) if price_master else None
         if pm is not None:
             pm["_prio"] = 2
             pframes.append(pm)
-        # 3) merged_gws fallback (lowest)
         pg = load_prices_gws_fallback_by_gw(fpl_root, season_key)
         if pg is not None:
             pg["_prio"] = 1
@@ -560,6 +650,9 @@ def build_minutes_calendar(
         for c in ["total_points","bonus","bps","clean_sheets"]:
             merged[c] = np.nan
 
+    # ── Apply sticky lock for date_sched/gw_orig BEFORE final type casts ────
+    merged = _lock_player_sched_fields(merged, season_dir)
+
     # ── Drop rows missing price (if requested) ──────────────────────────────
     if include_price and drop_missing_price:
         if "price" not in merged.columns:
@@ -575,14 +668,24 @@ def build_minutes_calendar(
     # ── Output (enforce canonical order; keep only known cols) ──────────────
     out_cols = [c for c in OUT_COLS if include_price or c != "price"]
     cols = [c for c in out_cols if c in merged.columns]
-        # Sort by gw_orig for deterministic, human-friendly CSV order.
+    # Normalize, final dtypes
+    merged["date_sched"]  = _normalize_date(merged.get("date_sched"))
+    merged["date_played"] = _normalize_date(merged.get("date_played"))
+    try:
+        merged["gw_orig"] = pd.to_numeric(merged["gw_orig"], errors="coerce").astype("Int8")
+    except Exception:
+        pass
     if "gw_orig" in merged.columns:
-        # ensure numeric to prevent lexicographic order if strings slipped in
-        merged["gw_orig"] = pd.to_numeric(merged["gw_orig"], errors="coerce").astype("Int64")
-        # stable sort so any prior ordering (e.g., by player/date used for features) is preserved within GW
-        merged = merged.sort_values(["gw_orig"], kind="mergesort")
-    merged[cols].to_csv(out_fp, index=False)
-    logging.info("✅ %s written (%d rows)  | include_price=%s", out_fp.name, len(merged), include_price)
+        merged = merged.sort_values(["gw_orig","player_id","date_played"], kind="mergesort")
+
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    out = merged[cols].copy()
+    # write as date-only strings
+    for dcol in ("date_sched","date_played"):
+        if dcol in out.columns:
+            out[dcol] = pd.to_datetime(out[dcol], errors="coerce").dt.strftime("%Y-%m-%d")
+    out.to_csv(out_fp, index=False)
+    logging.info("✅ %s written (%d rows)  | include_price=%s", out_fp.name, len(out), include_price)
 
 # ───────────────────────────── Batch & CLI ─────────────────────────────
 
