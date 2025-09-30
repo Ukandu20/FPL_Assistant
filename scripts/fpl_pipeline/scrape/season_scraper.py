@@ -7,14 +7,21 @@ Changes vs your version
 • Weekly reruns overwrite: all .to_csv are atomic (temp write then os.replace).
 • Optional --fresh to remove known generated CSVs before run (safe cleanup).
 • Creates needed folders safely.
+• cleaned_players.csv and ALL fixture CSVs live under data/raw/fpl/<SEASON>/season/
 
-Outputs (under data/raw/fpl/<YYYY-YYYY+1>/):
-  fixture_metadata.csv
-  fixture_metadata_resolved.csv                (if teams.csv present)
-  fixture_metadata_per_team.csv
-  fixture_metadata_per_team_resolved.csv       (if teams.csv present)
-  players/   (player histories)
+Outputs
+-------
+Under data/raw/fpl/<YYYY-YYYY+1>/:
+  players/                       (player histories)
   gws/xP<gw>.csv, gws/* merged GW artifacts via your functions
+  season/:
+    cleaned_players.csv
+    fixtures.csv
+    teams.csv
+    fixture_metadata.csv
+    fixture_metadata_resolved.csv
+    fixture_metadata_per_team.csv
+    fixture_metadata_per_team_resolved.csv
 """
 
 from __future__ import annotations
@@ -24,19 +31,15 @@ import datetime as dt
 import os
 import re
 import csv
-import shutil
-from typing import Optional
+from typing import Optional, List
 
 import pandas as pd
 
-# ── your project imports (left intact) ───────────────────────────────────────
-from scripts.fpl_pipeline.utils.parse_helpers import *  # parse_players, parse_team_data, parse_player_history, parse_player_gw_history, parse_fixtures
+from scripts.fpl_pipeline.utils.parse_helpers import *  # noqa: F401,F403
 from scripts.fpl_pipeline.clean.cleaners import clean_players, id_players, get_player_ids
 from scripts.fpl_pipeline.scrape.api_client import get_data, get_individual_player_data, get_fixtures_data
 from scripts.fpl_pipeline.analysis.gw_data_collector import collect_gw, merge_gw
 
-
-# ───────────────────────── Utilities ────────────────────────────────────────
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -45,7 +48,6 @@ def _with_sep(path: str) -> str:
     return path if path.endswith(os.sep) else path + os.sep
 
 def _write_csv_atomic(df: pd.DataFrame, out_path: str) -> None:
-    """Write CSV atomically so reruns overwrite cleanly."""
     _ensure_dir(os.path.dirname(out_path))
     tmp = out_path + ".tmp"
     df.to_csv(tmp, index=False)
@@ -59,24 +61,17 @@ def _safe_overwrite_text(out_path: str, text: str) -> None:
     os.replace(tmp, out_path)
 
 def _normalize_season_fmt(season: Optional[str]) -> str:
-    """
-    Normalize season strings into 'YYYY-YYYY+1'.
-    Accepts: '2025-26', '2025/26', '2025-2026', '2025', '2025/2026'.
-    Falls back to current (Europe) season if season is None.
-    """
     if not season or season.strip().lower() in {"auto", "current"}:
         return _current_euro_season()
 
     s = season.strip()
-    # 2025-2026 or 2025/2026
     m = re.fullmatch(r"(\d{4})[-/](\d{4})", s)
     if m:
         y1, y2 = int(m.group(1)), int(m.group(2))
         if y2 != y1 + 1:
-            y2 = y1 + 1  # correct sloppy inputs
+            y2 = y1 + 1
         return f"{y1:04d}-{y2:04d}"
 
-    # 2025-26 or 2025/26
     m = re.fullmatch(r"(\d{4})[-/](\d{2})", s)
     if m:
         y1, y2_two = int(m.group(1)), int(m.group(2))
@@ -85,21 +80,17 @@ def _normalize_season_fmt(season: Optional[str]) -> str:
             y2 += 100
         return f"{y1:04d}-{y2:04d}"
 
-    # just '2025' -> assume next year is +1
     m = re.fullmatch(r"(\d{4})", s)
     if m:
         y1 = int(m.group(1))
         return f"{y1:04d}-{(y1+1):04d}"
 
-    # last resort: compute from calendar
     return _current_euro_season()
 
 def _current_euro_season(today: Optional[dt.date] = None) -> str:
-    """Compute current European season (Aug–May)."""
     if today is None:
         today = dt.date.today()
     y = today.year
-    # If Jul/Aug or later → season starts this year; else Jan–Jun → season started last year
     start = y if today.month >= 7 else y - 1
     return f"{start:04d}-{start+1:04d}"
 
@@ -113,31 +104,24 @@ def _season_root(season_norm: str) -> str:
     return os.path.join("data", "raw", "fpl", season_norm)
 
 def _fresh_cleanup(season_dir: str) -> None:
-    """
-    Minimal, safe cleanup so reruns don't accumulate stale side-cars.
-    We only remove files we know we fully own/create.
-    """
-    targets = [
-        os.path.join(season_dir, "fixture_metadata.csv"),
-        os.path.join(season_dir, "fixture_metadata_resolved.csv"),
-        os.path.join(season_dir, "fixture_metadata_per_team.csv"),
-        os.path.join(season_dir, "fixture_metadata_per_team_resolved.csv"),
-    ]
-    for t in targets:
-        _delete_if_exists(t)
-
-    # Also clear prior xP<gw>.csv files in gws/ (safe to regenerate weekly)
     gws_dir = os.path.join(season_dir, "gws")
     if os.path.isdir(gws_dir):
         for name in os.listdir(gws_dir):
             if name.lower().startswith("xp") and name.lower().endswith(".csv"):
                 _delete_if_exists(os.path.join(gws_dir, name))
-
-
-# ───────────────────────── Metadata builders ─────────────────────────
+    season_sub = os.path.join(season_dir, "season")
+    for fname in [
+        "cleaned_players.csv",
+        "fixture_metadata.csv",
+        "fixture_metadata_resolved.csv",
+        "fixture_metadata_per_team.csv",
+        "fixture_metadata_per_team_resolved.csv",
+        "fixtures.csv",
+        "teams.csv",
+    ]:
+        _delete_if_exists(os.path.join(season_sub, fname))
 
 def _detect_kickoff_col(df: pd.DataFrame) -> str:
-    """Return the kickoff timestamp column name ('kickoff_time' or 'kickofftime')."""
     if "kickoff_time" in df.columns:
         return "kickoff_time"
     if "kickofftime" in df.columns:
@@ -145,13 +129,11 @@ def _detect_kickoff_col(df: pd.DataFrame) -> str:
     raise KeyError("Neither 'kickoff_time' nor 'kickofftime' found in fixtures.csv")
 
 def _normalize_fixtures_columns(fx: pd.DataFrame) -> pd.DataFrame:
-    """Handle common variants/typos like 'heam_a'."""
     if "heam_a" in fx.columns and "team_a" not in fx.columns:
         fx = fx.rename(columns={"heam_a": "team_a"})
     return fx
 
 def _teams_map(teams_path: str) -> pd.DataFrame | None:
-    """Load minimal team id→name/short map if available."""
     if not os.path.exists(teams_path):
         return None
     teams = pd.read_csv(teams_path)
@@ -166,7 +148,6 @@ def _teams_map(teams_path: str) -> pd.DataFrame | None:
     return teams[cols].rename(columns={id_col: "team_id"})
 
 def _add_names(df: pd.DataFrame, tmap: Optional[pd.DataFrame], id_field: str, prefix: str) -> pd.DataFrame:
-    """Merge readable team fields onto df using tmap and id_field."""
     if tmap is None:
         return df
     out = df.merge(tmap, left_on=id_field, right_on="team_id", how="left")
@@ -176,14 +157,11 @@ def _add_names(df: pd.DataFrame, tmap: Optional[pd.DataFrame], id_field: str, pr
         out = out.rename(columns={"short_name": f"{prefix}_short"})
     return out.drop(columns=["team_id"])
 
-def create_fixture_metadata(base_dir: str) -> None:
-    """
-    Build fixture_metadata.csv from fixtures.csv; optionally write *_resolved.csv if teams.csv exists.
-    """
-    fixtures_path = os.path.join(base_dir, "fixtures.csv")
-    teams_path    = os.path.join(base_dir, "teams.csv")
-    out_basic     = os.path.join(base_dir, "fixture_metadata.csv")
-    out_resolved  = os.path.join(base_dir, "fixture_metadata_resolved.csv")
+def create_fixture_metadata(season_dir_season: str) -> None:
+    fixtures_path = os.path.join(season_dir_season, "fixtures.csv")
+    teams_path    = os.path.join(season_dir_season, "teams.csv")
+    out_basic     = os.path.join(season_dir_season, "fixture_metadata.csv")
+    out_resolved  = os.path.join(season_dir_season, "fixture_metadata_resolved.csv")
 
     if not os.path.exists(fixtures_path):
         print(f"WARNING: {fixtures_path} not found; skipping fixture_metadata.csv")
@@ -198,14 +176,13 @@ def create_fixture_metadata(base_dir: str) -> None:
     if missing:
         raise KeyError(f"fixtures.csv missing required columns: {missing}")
 
-    # dates as YYYY-MM-DD strings
     date_sched = pd.to_datetime(fx[kickoff_col], errors="coerce", utc=True).dt.strftime("%Y-%m-%d")
 
     meta = pd.DataFrame({
         "fpl_id":     fx["id"].astype("Int64"),
-        "team":       fx["team_a"].astype("Int64"),  # as requested
+        "team":       fx["team_a"].astype("Int64"),
         "home":       fx["team_h"].astype("Int64"),
-        "away":       fx["team_a"].astype("Int64"),  # after heam_a→team_a normalization
+        "away":       fx["team_a"].astype("Int64"),
         "date_sched": date_sched.astype("string"),
     })
 
@@ -222,16 +199,11 @@ def create_fixture_metadata(base_dir: str) -> None:
         _write_csv_atomic(resolved, out_resolved)
         print(f"✅ wrote {out_resolved} with {len(resolved):,} rows")
 
-def create_fixture_metadata_per_team(base_dir: str) -> None:
-    """
-    Build per-team expansion (two rows per fixture): fixture_metadata_per_team.csv
-      Columns: fpl_id, team, opp, venue, date_sched
-    Also writes *_resolved.csv if teams.csv exists.
-    """
-    fixtures_path = os.path.join(base_dir, "fixtures.csv")
-    teams_path    = os.path.join(base_dir, "teams.csv")
-    out_basic     = os.path.join(base_dir, "fixture_metadata_per_team.csv")
-    out_resolved  = os.path.join(base_dir, "fixture_metadata_per_team_resolved.csv")
+def create_fixture_metadata_per_team(season_dir_season: str) -> None:
+    fixtures_path = os.path.join(season_dir_season, "fixtures.csv")
+    teams_path    = os.path.join(season_dir_season, "teams.csv")
+    out_basic     = os.path.join(season_dir_season, "fixture_metadata_per_team.csv")
+    out_resolved  = os.path.join(season_dir_season, "fixture_metadata_per_team_resolved.csv")
 
     if not os.path.exists(fixtures_path):
         print(f"WARNING: {fixtures_path} not found; skipping fixture_metadata_per_team.csv")
@@ -279,64 +251,78 @@ def create_fixture_metadata_per_team(base_dir: str) -> None:
         _write_csv_atomic(resolved, out_resolved)
         print(f"✅ wrote {out_resolved} with {len(resolved):,} rows")
 
-
-# ───────────────────────── Pipeline wrapper ─────────────────────────────────
-
-def fixtures(base_dir: str) -> None:
+def fixtures(season_dir_season: str) -> None:
     data = get_fixtures_data()
-    parse_fixtures(data, _with_sep(base_dir))  # provided by your helpers
+    parse_fixtures(data, _with_sep(season_dir_season))
+
+def _promote_cleaned_players_to_season_subdir(season_dir: str, season_dir_season: str) -> None:
+    candidates: List[str] = [
+        os.path.join(season_dir, "players.csv"),
+        os.path.join(season_dir, "players_clean.csv"),
+        os.path.join(season_dir, "players_cleaned.csv"),
+        os.path.join(season_dir, "cleaned_players.csv"),
+    ]
+    src = next((p for p in candidates if os.path.exists(p)), None)
+    if not src:
+        print("WARN: Could not find a cleaned players CSV to promote into season/.")
+        return
+    try:
+        df = pd.read_csv(src)
+        _write_csv_atomic(df, os.path.join(season_dir_season, "cleaned_players.csv"))
+        print(f"✅ promoted {os.path.basename(src)} → season/cleaned_players.csv")
+    except Exception as e:
+        print(f"WARN: Failed to promote cleaned players CSV from {src}: {e}")
 
 def parse_data(season_input: Optional[str], fresh: bool) -> None:
-    # 1) Normalize season folder name
     season = _normalize_season_fmt(season_input)
-    base_dir = _season_root(season)
-    base_dir_sep = _with_sep(base_dir) 
-
-    season_dir = base_dir
+    season_dir = _season_root(season)
     players_dir = os.path.join(season_dir, "players")
-    players_dir_sep  = _with_sep(players_dir)
+    gws_dir     = os.path.join(season_dir, "gws")
+    season_dir_season = os.path.join(season_dir, "season")
 
-    
-    gws_dir = os.path.join(season_dir, "gws")
-    gws_dir_sep      = _with_sep(gws_dir)
+    season_dir_sep        = _with_sep(season_dir)
+    players_dir_sep       = _with_sep(players_dir)
+    gws_dir_sep           = _with_sep(gws_dir)
+    season_dir_season_sep = _with_sep(season_dir_season)
 
-    _ensure_dir(base_dir)
+    _ensure_dir(season_dir)
     _ensure_dir(players_dir)
     _ensure_dir(gws_dir)
+    _ensure_dir(season_dir_season)
 
     if fresh:
         print(f"INFO: --fresh cleanup for {season}")
-        _fresh_cleanup(base_dir)
+        _fresh_cleanup(season_dir)
 
     print(f"INFO: Season set to {season}")
     print("Getting bootstrap data …")
     data = get_data()
 
     print("Parsing summary data …")
-    parse_players(data["elements"], base_dir_sep)
+    parse_players(data["elements"], season_dir_sep)
 
-    # Current GW (if available)
     gw_num = 0
     for event in data.get("events", []):
         if event.get("is_current") is True:
             gw_num = int(event["id"])
 
     print("Cleaning summary data …")
-    clean_players(os.path.join(base_dir, "players_raw.csv"), base_dir_sep)
+    clean_players(os.path.join(season_dir, "players_raw.csv"), season_dir_sep)
+    _promote_cleaned_players_to_season_subdir(season_dir, season_dir_season)
 
     print("Getting fixtures data …")
-    fixtures(base_dir_sep)
+    fixtures(season_dir_season_sep)
 
     print("Getting teams data …")
-    parse_team_data(data["teams"], base_dir_sep)
+    parse_team_data(data["teams"], season_dir_season_sep)
 
     print("Writing fixture metadata (fixture-level & per-team) …")
-    create_fixture_metadata(base_dir)
-    create_fixture_metadata_per_team(base_dir)
+    create_fixture_metadata(season_dir_season)
+    create_fixture_metadata_per_team(season_dir_season)
 
     print("Extracting player ids …")
-    id_players(os.path.join(base_dir, "players_raw.csv"), base_dir_sep)
-    player_ids = get_player_ids(base_dir_sep)
+    id_players(os.path.join(season_dir, "players_raw.csv"), season_dir_sep)
+    player_ids = get_player_ids(season_dir_sep)
 
     print("Extracting player-specific data …")
     for pid, name in player_ids.items():
@@ -344,28 +330,25 @@ def parse_data(season_input: Optional[str], fresh: bool) -> None:
         parse_player_history(player_data.get("history_past", []), players_dir_sep, name, pid)
         parse_player_gw_history(player_data.get("history", []), players_dir_sep, name, pid)
 
-    # Expected points snapshot for current GW (if any)
     if gw_num > 0:
         print(f"Writing expected points for GW{gw_num} …")
         xp_rows = [{"id": e["id"], "xP": e.get("ep_this")} for e in data["elements"]]
         xp_path = os.path.join(gws_dir, f"xP{gw_num}.csv")
-        # Atomic write to overwrite if exists
-        _safe_overwrite_text(xp_path, "")  # ensure file exists before DictWriter replace
+        _safe_overwrite_text(xp_path, "")
         with open(xp_path, "w", newline="") as outf:
             w = csv.DictWriter(outf, ["id", "xP"])
             w.writeheader()
             w.writerows(xp_rows)
 
         print("Collecting GW scores …")
-        collect_gw(gw_num, players_dir_sep, gws_dir_sep, base_dir_sep)
+        # IMPORTANT: root_directory_name must now be the literal season/ subfolder
+        collect_gw(gw_num, players_dir_sep, gws_dir_sep, season_dir_season_sep)
 
         print("Merging GW scores …")
         merge_gw(gw_num, gws_dir_sep)
 
     print("✅ Done.")
 
-
-# ───────────────────────── CLI ──────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="FPL data pull + fixture metadata side-cars (idempotent).")
