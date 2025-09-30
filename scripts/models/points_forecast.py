@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-points_forecast.py — upcoming fixtures — v1.8 (output rev, with FDR harmonization)
+points_forecast.py — upcoming fixtures — v1.9 (output rev, with FDR harmonization)
 
 Output changes vs v1.7
 ----------------------
@@ -25,6 +25,14 @@ Additional updates in this patch
   - If `parquet` → writes expected_points.parquet
   - If `both` → writes both, kept in sync.
 • Louder warnings when DEF/SAV are omitted so users don’t accidentally run GA-only points.
+
+v1.9 quality-of-life
+--------------------
+• New windowing flags for parity with other forecasters:
+  - --as-of-gw and --n-future (with --strict-n-future)
+  - If --gw-from/--gw-to are omitted, GW window resolves to:
+       gw_from = as-of-gw
+       gw_to   = gw_from + n-future - 1
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.utils.validate import validate_df
-SCHEMA_VERSION = "future.v1.8"
+SCHEMA_VERSION = "future.v1.9"
 
 # ───────────────────────── IO & normalization ─────────────────────────
 
@@ -195,7 +203,7 @@ def _expected_gc_pairs_lambda_on(lam_on: np.ndarray) -> np.ndarray:
 
 def _expected_floor_div3_poisson(lam: np.ndarray, kmax: int | None = None) -> np.ndarray:
     lam = np.asarray(lam, dtype=float)
-    lam = np.where(np.isfinite(lam) & (lam >= 0.0), lam, 0.0)
+    lam = np.where(np.isfinite(lam) & (lam >= 0.0), 0.0 + lam, 0.0)
     if lam.size == 0:
         return np.array([], dtype=float)
     if kmax is None:
@@ -212,7 +220,7 @@ def _expected_floor_div3_poisson(lam: np.ndarray, kmax: int | None = None) -> np
 
 def _poisson_sf_vectorized(lam: np.ndarray, k_threshold: int) -> np.ndarray:
     lam = np.asarray(lam, dtype=float)
-    lam = np.where(np.isfinite(lam) & (lam >= 0.0), lam, 0.0)
+    lam = np.where(np.isfinite(lam) & (lam >= 0.0), 0.0 + lam, 0.0)
     pmf0 = np.exp(-lam)
     cdf = pmf0.copy()
     pmf = pmf0.copy()
@@ -339,7 +347,6 @@ def _align_union_columns(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[pd.DataFrame
     return a2[all_cols], b2[all_cols], all_cols
 
 def _read_existing_merged(stem: Path) -> pd.DataFrame:
-    """Try to read existing merged stack from <stem>.parquet then <stem>.csv; else empty."""
     pq = stem.with_suffix(".parquet")
     cs = stem.with_suffix(".csv")
     if pq.exists():
@@ -354,62 +361,73 @@ def _read_existing_merged(stem: Path) -> pd.DataFrame:
             logging.warning("[merged] failed to read csv; starting fresh.")
     return pd.DataFrame()
 
-def _update_merged(
-    new_df: pd.DataFrame,
-    merged_stem: Path,           # e.g., out_dir / "expected_points" (no extension)
-    key_cols: List[str],
-    sort_cols: List[str],
-    formats: List[str],          # subset of ["csv","parquet"]
-) -> List[str]:
+def _update_merged(new_df: pd.DataFrame, merged_stem: Path, key_cols: List[str],
+                   sort_cols: List[str], formats: List[str]) -> List[str]:
     """
-    Union-merge new_df into existing merged stack and write to every requested format.
-    Returns list of written file paths.
+    Idempotent merge: replace overlapping keys, enforce unique key, and keep IO formats in sync.
+    Fixes duplicate rows when old/new key dtypes disagree.
     """
+    def _coerce_key_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if "season" in df.columns:
+            df["season"] = df["season"].astype(str)
+        if "gw_orig" in df.columns:
+            df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
+        for c in ("player_id", "team_id"):
+            if c in df.columns:
+                df[c] = df[c].astype(str)
+        return df
+
     old = _read_existing_merged(merged_stem)
-    old, new, all_cols = _align_union_columns(old, new_df)
+    old, new = _coerce_key_dtypes(old), _coerce_key_dtypes(new_df)
+    old, new, all_cols = _align_union_columns(old, new)
 
+    # Drop exact dupes pre-merge
+    old = old.drop_duplicates()
+    new = new.drop_duplicates()
+
+    # Remove old rows that share the key with new rows
     key_df = new[key_cols].drop_duplicates()
-    old_mark = old.merge(key_df.assign(__hit__=1), on=key_cols, how="left")
+    old_mark = old.merge(key_df.assign(__hit__=1), on=key_cols, how="left", validate="many_to_one")
+    replaced = int((old_mark["__hit__"] == 1).sum())
     old_kept = old_mark[old_mark["__hit__"].isna()].drop(columns="__hit__")
-    merged = pd.concat([old_kept, new], ignore_index=True, sort=False)
 
-    # ensure sort_cols exist
+    # Combine and enforce uniqueness on key (favor new)
+    merged = pd.concat([old_kept, new], ignore_index=True, sort=False)
+    merged = merged.drop_duplicates(subset=key_cols, keep="last")
+
+    # Ensure sort keys exist and deterministic order
     for c in sort_cols:
         if c not in merged.columns:
             merged[c] = np.nan
-    merged = merged.sort_values(by=[c for c in sort_cols if c in merged.columns])
+    merged = merged.reindex(columns=all_cols).sort_values(by=[c for c in sort_cols if c in merged.columns])
     merged = _round_for_output(merged)
 
     written: List[str] = []
-    # CSV writer with date formatting
     if "csv" in formats:
         out_csv = merged_stem.with_suffix(".csv")
-        if "date_sched" in merged.columns and pd.api.types.is_datetime64_any_dtype(merged["date_sched"]):
-            merged_csv = merged.copy()
-            merged_csv["date_sched"] = pd.to_datetime(merged_csv["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
-            out_csv.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out_csv.with_suffix(".csv.tmp")
-            merged_csv.to_csv(tmp, index=False)
-            os.replace(tmp, out_csv)
-        else:
-            _atomic_write_csv(merged, out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_csv.with_suffix(".csv.tmp")
+        m_csv = merged.copy()
+        if "date_sched" in m_csv.columns:
+            m_csv["date_sched"] = pd.to_datetime(m_csv["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+        m_csv.to_csv(tmp, index=False)
+        os.replace(tmp, out_csv)
         written.append(str(out_csv))
-        logging.info("[merged] updated %s (rows=%d)", out_csv.resolve(), len(merged))
+        logging.info("[merged] updated %s (rows=%d, replaced_keys=%d)", out_csv.resolve(), len(merged), replaced)
 
-    # Parquet writer (preserves nullable integers, categoricals, etc.)
     if "parquet" in formats:
         out_pq = merged_stem.with_suffix(".parquet")
         out_pq.parent.mkdir(parents=True, exist_ok=True)
         merged.to_parquet(out_pq, index=False)
         written.append(str(out_pq))
-        logging.info("[merged] updated %s (rows=%d)", out_pq.resolve(), len(merged))
+        logging.info("[merged] updated %s (rows=%d, replaced_keys=%d)", out_pq.resolve(), len(merged), replaced)
 
     return written
 
 # ───────────────────────── FDR harmonization helpers ─────────────────────────
 
 def _to_int_series(s: pd.Series) -> pd.Series:
-    """Coerce to pandas nullable Int64, preserving NA."""
     x = pd.to_numeric(s, errors="coerce").round(0)
     try:
         return x.astype("Int64")
@@ -417,11 +435,6 @@ def _to_int_series(s: pd.Series) -> pd.Series:
         return x.astype("float").astype("Int64")
 
 def _resolve_fdr_rowwise(df: pd.DataFrame) -> pd.Series:
-    """
-    Choose fdr per row with priority: GA → MIN → DEF → SAV.
-    If multiple disagree, pick the mode; if still tied, pick max.
-    Returns Int64 series.
-    """
     cand_cols = [c for c in ["fdr_ga","fdr_min","fdr_def","fdr_sav"] if c in df.columns]
     if not cand_cols:
         return pd.Series([pd.NA]*len(df), index=df.index, dtype="Int64")
@@ -432,7 +445,6 @@ def _resolve_fdr_rowwise(df: pd.DataFrame) -> pd.Series:
         if mask.any():
             chosen[mask] = df.loc[mask, c]
 
-    # detect conflicts via rowwise min/max ignoring NAs
     arrs = [df[c].astype("Int64") for c in cand_cols]
     minv = arrs[0]
     maxv = arrs[0]
@@ -449,7 +461,7 @@ def _resolve_fdr_rowwise(df: pd.DataFrame) -> pd.Series:
                 counts: Dict[int,int] = {}
                 for v in vals:
                     counts[int(v)] = counts.get(int(v), 0) + 1
-                best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]  # freq then value
+                best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
                 chosen.at[idx] = best
     return _to_int_series(chosen)
 
@@ -503,6 +515,14 @@ def main():
     ap.add_argument("--defense-root", type=Path, help="Root dir for defense")
 
     ap.add_argument("--future-season", type=str, help="Season for auto-resolve (e.g., 2025-2026)")
+
+    # NEW: parity with other forecasters
+    ap.add_argument("--as-of-gw", type=int, help="First GW not yet played; used when --gw-from is omitted")
+    ap.add_argument("--n-future", type=int, default=3, help="Number of future GWs to score when using --as-of-gw")
+    ap.add_argument("--strict-n-future", action="store_true",
+                    help="Error if inputs for the full derived window cannot be found")
+
+    # Legacy explicit window (still supported; overrides the derived window if provided)
     ap.add_argument("--gw-from", type=int, help="GW window start (for auto-resolve)")
     ap.add_argument("--gw-to", type=int, help="GW window end (for auto-resolve)")
     ap.add_argument("--zero-pad-filenames", action="store_true", help="Use GW05_07 instead of GW5_7 when resolving & writing")
@@ -525,13 +545,22 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
                         format="%(levelname)s: %(message)s")
 
+    # ---- Derive effective GW window (parity with minutes/GA forecasters) ----
+    if args.gw_from is None and args.as_of_gw is None:
+        raise ValueError("Provide either --gw-from or --as-of-gw.")
+    gw_from_req = int(args.gw_from) if args.gw_from is not None else int(args.as_of_gw)
+    gw_to_req   = int(args.gw_to)   if args.gw_to   is not None else int(gw_from_req + max(1, args.n_future) - 1)
+    logging.info("[window] requested gw_from=%d, gw_to=%d (n_future=%d%s)",
+                 gw_from_req, gw_to_req, int(args.n_future),
+                 ", strict" if args.strict_n_future else "")
+
     # Season output root (defense style)
     season_dir = args.out_dir / f"{args.future_season}" if args.future_season else args.out_dir
     artifacts_dir = season_dir / "artifacts"
 
     # ---- Resolve input files (explicit > auto-resolve) ----
     def res(tag, explicit, root):
-        return _resolve_input_path(explicit, root, args.future_season, args.gw_from, args.gw_to,
+        return _resolve_input_path(explicit, root, args.future_season, gw_from_req, gw_to_req,
                                    args.zero_pad_filenames, tag)
 
     minutes_path = args.minutes if args.minutes else res("minutes", args.minutes, args.minutes_root)
@@ -577,16 +606,15 @@ def main():
                            "pred_saves_p90_mean","pred_saves_p90_poisson","pred_minutes","player","pos",
                            "date_sched","date_played","kickoff_time"], "SAV")
 
+    # Key & dedupe
     KEY = FORCED_KEY
     logging.info("[key] FORCED -> %s (date columns not used in key)", KEY)
-
-    # De-dupe
     min_df = _drop_exact_dupes(min_df, "MIN")
     ga_df  = _drop_exact_dupes(ga_df,  "GA")
     if def_df is not None: def_df = _drop_exact_dupes(def_df, "DEF")
     if sav_df is not None: sav_df = _drop_exact_dupes(sav_df, "SAV")
 
-    # Base
+    # Base from minutes
     if not set(KEY).issubset(min_df.columns):
         raise ValueError(f"MINUTES missing key columns: {KEY}")
     base = min_df.copy()
@@ -598,7 +626,7 @@ def main():
     if base.empty:
         raise RuntimeError("No rows remain after roster gating.")
 
-    # Identity & legacy meta from GA first, then MIN
+    # Identity/meta from GA then MIN fallback
     if ga_df is not None and len(ga_df):
         id_keep = ["player","pos","team","opponent","opponent_id","is_home","fbref_id","game_id","date_sched","date_played","kickoff_time","fdr"]
         right = ga_df[KEY + [c for c in id_keep if c in ga_df.columns]]
@@ -609,31 +637,25 @@ def main():
     for c in ("player","pos"):
         if c not in base.columns: base[c] = np.nan
 
-    # Collect FDR from each source into separate columns for consistency checks
-    # GA fdr (may have been merged in under name 'fdr')
+    # Collect FDRs from sources
     if "fdr" in base.columns:
-        # If this 'fdr' came from GA merge (most recent), park as fdr_ga; we will pull minutes/def/sav next
         base = base.rename(columns={"fdr": "fdr_ga"})
-    # Pull minutes fdr explicitly
     if "fdr" in min_df.columns:
         fmin = right2[KEY + ["fdr"]].rename(columns={"fdr": "fdr_min"})
         base = _merge_with_nearest_date(base, fmin, KEY, ["fdr_min"], tag="MIN:fdr")
-    # DEF fdr
     if def_df is not None and "fdr" in def_df.columns:
         fdef = def_df[KEY + ["fdr"]].copy().rename(columns={"fdr":"fdr_def"})
         base = _merge_with_nearest_date(base, fdef, KEY, ["fdr_def"], tag="DEF:fdr")
-    # SAV fdr
     if sav_df is not None and "fdr" in sav_df.columns:
         fsav = sav_df[KEY + ["fdr"]].copy().rename(columns={"fdr":"fdr_sav"})
         base = _merge_with_nearest_date(base, fsav, KEY, ["fdr_sav"], tag="SAV:fdr")
 
-    # Normalize candidate FDRs to Int64 and resolve to a single 'fdr'
     for cc in ["fdr_ga","fdr_min","fdr_def","fdr_sav"]:
         if cc in base.columns:
             base[cc] = _to_int_series(base[cc])
     base["fdr"] = _resolve_fdr_rowwise(base)
 
-    # GA probabilities & expectations
+    # GA probs & means
     if ga_df is not None and len(ga_df):
         tmp = ga_df.copy()
         tmp["p_goal"]   = _select_prob_series(tmp, ["p_goal","prob_goal","p_goal_cal","prob_goal_cal"])
@@ -652,7 +674,7 @@ def main():
     lam_asst = lam_asst.where(lam_asst.notna() & (lam_asst > 0), pd.to_numeric(base.get("xa_mean"), errors="coerce"))
     lam_goal = lam_goal.fillna(0.0).clip(lower=0.0); lam_asst = lam_asst.fillna(0.0).clip(lower=0.0)
 
-    # Defense signals (CS/GA + DCP)
+    # Defense signals
     if def_df is not None and len(def_df):
         tmp = def_df.copy()
         tmp["p_cs"]         = _select_prob_series(tmp, ["prob_cs","p_teamCS"])
@@ -668,7 +690,7 @@ def main():
         for c in ["p_cs","lambda90","exp_gc","p_dcp","lambda90_dcp","exp_dc"]:
             base[c] = np.nan
 
-    # Saves (GK) — prefer per-match λ; else per-90 scaled by minutes
+    # Saves (GK)
     if sav_df is not None and len(sav_df):
         tmp = sav_df.copy()
         lam_pm  = _choose_first_num(tmp, ["pred_saves_mean","pred_saves_poisson"], default=np.nan)
@@ -696,7 +718,7 @@ def main():
     base["xp_goals"]   = goal_pts_vec * lam_goal.to_numpy()
     base["xp_assists"] = 3.0 * lam_asst.to_numpy()
 
-    # Clean sheet EP (≥60)
+    # Clean sheet EP
     cs_pts_vec = _pos_points_vector(base["pos"], kind="cs")
     p_cs = pd.to_numeric(base.get("p_cs", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     base["xp_clean_sheets"] = base["p60"] * p_cs * cs_pts_vec
@@ -714,7 +736,7 @@ def main():
     is_def_like_mask = base["pos"].fillna("").astype(str).str.upper().str[:3].isin(["GKP","GK","DEF"]).to_numpy()
     base["xp_concede_penalty"] = np.where(is_def_like_mask, -e_pairs, 0.0)
 
-    # Saves EP (GK only) — gated by p1
+    # Saves EP (GK only)
     raw_lambda = pd.to_numeric(base.get("saves_lambda_raw"), errors="coerce")
     had_pm = bool(sav_df is not None and (
         ("pred_saves_mean" in (sav_df.columns if sav_df is not None else [])) or
@@ -737,7 +759,7 @@ def main():
     prior_per90 = pos_upper.map(lambda x: priors.get(x, priors.get(x[:3], -0.12))).astype(float).fillna(-0.12)
     base["xp_discipline_prior"] = prior_per90 * (m / 90.0)
 
-    # DCP exposure (outfield)
+    # DCP exposure
     is_outfield = _is_outfield(base["pos"])
     is_def = _is_def(base["pos"])
 
@@ -777,7 +799,7 @@ def main():
     base["team_ga_lambda90"] = pd.to_numeric(base.get("lambda90"), errors="coerce")
     base["team_exp_gc"]      = pd.to_numeric(base.get("exp_gc"), errors="coerce")
 
-    # Normalize date_sched to date-only in memory (writer keeps date)
+    # Normalize date_sched to date-only dtype datetime64[ns]
     if "date_sched" in base.columns:
         base["date_sched"] = pd.to_datetime(base["date_sched"], errors="coerce").dt.normalize()
 
@@ -803,7 +825,6 @@ def main():
             sort_cols.append(dc)
 
     out = base[out_cols].copy().sort_values(by=sort_cols)
-    # ensure 'fdr' stays Int64 in memory; writer will preserve it (CSV writes as int or blank)
     if "fdr" in out.columns:
         out["fdr"] = _to_int_series(out["fdr"])
     out_rounded = _round_for_output(out)
@@ -813,23 +834,31 @@ def main():
     if len(gw_series):
         gw_from_eff, gw_to_eff = int(gw_series.min()), int(gw_series.max())
     else:
-        gw_from_eff = int(args.gw_from) if args.gw_from is not None else 0
-        gw_to_eff   = int(args.gw_to)   if args.gw_to   is not None else 0
+        gw_from_eff = int(gw_from_req)
+        gw_to_eff   = int(gw_to_req)
 
-    # Write per-window file(s) (defense_forecast style)
+    # Write per-window file(s)
     out_paths = _out_paths(
-        base_dir=args.out_dir,             # ← just the base
-        season=args.future_season or "",   # ← let _out_paths add the season
+        base_dir=args.out_dir,
+        season=args.future_season or "",
         gw_from=gw_from_eff,
         gw_to=gw_to_eff,
         zero_pad=args.zero_pad_filenames,
         out_format=args.out_format,
     )
-
     written = _write_points(out_rounded, out_paths)
     logging.info("[write] upcoming expected points -> %s (rows=%d)", ", ".join(written), len(out_rounded))
 
-    # Update cumulative combined file(s) unless suppressed (format-aware)
+    # Harmonize key dtypes before merging (extra safety)
+    if "season" in out_rounded.columns:
+        out_rounded["season"] = out_rounded["season"].astype(str)
+    if "gw_orig" in out_rounded.columns:
+        out_rounded["gw_orig"] = pd.to_numeric(out_rounded["gw_orig"], errors="coerce").astype("Int64")
+    for c in ("player_id","team_id"):
+        if c in out_rounded.columns:
+            out_rounded[c] = out_rounded[c].astype(str)
+
+    # Update cumulative combined file(s)
     merged_written: Optional[List[str]] = None
     if not args.no_merged:
         fmt_map = {"csv": ["csv"], "parquet": ["parquet"], "both": ["csv", "parquet"]}
@@ -837,18 +866,12 @@ def main():
         merged_stem = args.out_dir / "expected_points"
         merged_written = _update_merged(out_rounded, merged_stem, FORCED_KEY, sort_cols, merged_formats)
 
-    # Logs
-    nonzero_ga = int((pd.to_numeric(base.get('xg_mean'), errors='coerce').fillna(0) > 0).sum() |
-                     (pd.to_numeric(base.get('p_goal'), errors='coerce').fillna(0) > 0).sum())
-    nonzero_as = int((pd.to_numeric(base.get('xa_mean'), errors='coerce').fillna(0) > 0).sum() |
-                     (pd.to_numeric(base.get('p_assist'), errors='coerce').fillna(0) > 0).sum())
-    logging.info("[GA] non-zero λ -> goals=%d, assists=%d", nonzero_ga, nonzero_as)
-
-    # Simple diagnostic print (defense_forecast style)
+    # Diagnostics
     diag = {
         "rows": int(len(out_rounded)),
         "season": str(args.future_season),
-        "gw_window": {"from": int(gw_from_eff), "to": int(gw_to_eff)},
+        "requested": {"gw_from": int(gw_from_req), "gw_to": int(gw_to_req), "n_future": int(args.n_future)},
+        "resolved": {"gw_from": int(gw_from_eff), "gw_to": int(gw_to_eff)},
         "inputs": {
             "minutes": str(minutes_path),
             "goals_assists": str(ga_path),
