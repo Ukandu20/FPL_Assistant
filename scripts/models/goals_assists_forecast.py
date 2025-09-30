@@ -13,10 +13,11 @@ Key fixes vs prior rev:
 • Use training medians (artifacts/features_median.json) for Poisson/Tweedie imputations; avoid leakage.
 • Optional safety clamp: --cap-per90 "GK:0.10,DEF:0.35,MID:1.00,FWD:1.40" (applies to LGBM per-90s only).
 • Apply isotonic calibration for probabilities when --apply-calibration is set.
-• Normalize league labels and write date-only for date_sched in CSV.
+• Normalize league labels and write date-only for dates in all persisted files (CSV+Parquet).
 • Output includes rich minutes metadata in a fixed order.
 • Auto-resolve minutes file from GW window (+ dual CSV/Parquet loader), with helpful failures.
 • NEW: Output format control (--out-format csv|parquet|both) + optional zero-padded filenames.
+• NEW: Guaranteed date-only persistence (YYYY-MM-DD strings) — never writes time.
 
 NEW (legacy meta like minutes_forecast):
 • Attach game_id (fbref_id), team, opponent_id, opponent from fixture_calendar.csv.
@@ -63,6 +64,21 @@ def _coerce_ts(s: pd.Series, tz: Optional[str]) -> pd.Series:
     return out
 
 
+def _to_naive_date(s: pd.Series, tz: Optional[str]) -> pd.Series:
+    """
+    Ensure date-only, tz-naive (datetime64[ns]) in local calendar.
+    If tz-aware, convert to `tz`, drop tz, then normalize.
+    """
+    out = pd.to_datetime(s, errors="coerce")
+    if hasattr(out.dt, "tz") and out.dt.tz is not None:
+        # align to target tz calendar day before dropping tz
+        if tz:
+            out = out.dt.tz_convert(tz)
+        out = out.dt.tz_localize(None)
+    return out.dt.normalize()
+
+
+
 def _load_players_form(features_root: Path, form_version: str, seasons: List[str]) -> pd.DataFrame:
     frames = []
     for s in seasons:
@@ -70,6 +86,7 @@ def _load_players_form(features_root: Path, form_version: str, seasons: List[str
         if not fp.exists():
             raise FileNotFoundError(f"Missing players_form: {fp}")
         t = pd.read_csv(fp, parse_dates=["date_played"])
+        t["date_played"] = pd.to_datetime(t["date_played"], errors="coerce")  # keep datetime for in-memory ops
         t["season"] = s
         frames.append(t)
     df = pd.concat(frames, ignore_index=True)
@@ -86,6 +103,7 @@ def _load_team_form(features_root: Path, form_version: str, seasons: List[str]) 
         fp = features_root / form_version / s / "team_form.csv"
         if fp.exists():
             t = pd.read_csv(fp, parse_dates=["date_played"])
+            t["date_played"] = pd.to_datetime(t["date_played"], errors="coerce")
             t["season"] = s
             frames.append(t)
     if not frames:
@@ -128,9 +146,10 @@ def _load_team_fixtures(fix_root: Path, season: str, filename: str) -> pd.DataFr
     if not path.exists():
         raise FileNotFoundError(f"Missing team fixtures: {path}")
     tf = pd.read_csv(path)
+    # Parse → normalize (keep dtype datetime64[ns], zero time component)
     for dc in ("date_sched", "date_played"):
         if dc in tf.columns:
-            tf[dc] = pd.to_datetime(tf[dc], errors="coerce")
+            tf[dc] = pd.to_datetime(tf[dc], errors="coerce").dt.normalize()
     if "is_home" not in tf.columns:
         if "was_home" in tf.columns:
             tf["is_home"] = tf["was_home"].astype(str).str.lower().isin(["1", "true", "yes"]).astype("Int8")
@@ -407,6 +426,13 @@ def _load_minutes_dual(path: Path) -> pd.DataFrame:
             df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
     else:
         raise ValueError(f"Unsupported minutes file extension: {suffix}. Use .csv or .parquet")
+
+    # enforce date-only (datetime64[ns] at midnight) for safety in-memory
+    if "date_sched" in df.columns:
+        df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce").dt.normalize()
+    if "date_played" in df.columns:
+        df["date_played"] = pd.to_datetime(df["date_played"], errors="coerce").dt.normalize()
+
     return df
 
 
@@ -423,7 +449,7 @@ def _load_roster_pairs(teams_json: Optional[Path],
         return None
     p = Path(teams_json)
     if not p.exists():
-        logging.warning("teams_json not found at %s — skipping roster gate.")
+        logging.warning("teams_json not found at %s — skipping roster gate.", p)
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -492,35 +518,45 @@ def _ga_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
 
 
 def _write_ga(df: pd.DataFrame, paths: List[Path]) -> List[str]:
+    """
+    Persist outputs guaranteeing date-only strings (YYYY-MM-DD) for all date columns,
+    for BOTH CSV and Parquet. In-memory df remains untouched (datetime64[ns] ok).
+    """
     written: List[str] = []
+    tmp = df.copy()
+
+    # Identify date-like cols to stringify; GA output uses date_sched, but handle any present.
+    date_cols = [c for c in ["date_sched", "date_played"] if c in tmp.columns]
+    for dc in date_cols:
+        tmp[dc] = pd.to_datetime(tmp[dc], errors="coerce").dt.strftime("%Y-%m-%d")
+
     for p in paths:
         if p.suffix.lower() == ".csv":
-            tmp = df.copy()
-            if "date_sched" in tmp.columns:
-                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
             tmp.to_csv(p, index=False)
             written.append(str(p))
         elif p.suffix.lower() == ".parquet":
-            df.to_parquet(p, index=False)
+            # Store as strings in Parquet to avoid implicit time components
+            tmp.to_parquet(p, index=False)
             written.append(str(p))
         else:
             raise ValueError(f"Unsupported output extension: {p.suffix}")
     return written
 
+
 # ===================== CONSOLIDATED WRITER (season-level) =====================
 def _read_any(path: Path) -> pd.DataFrame:
+    """
+    Read CSV/Parquet without forcing date parsing — keep strings as-is.
+    Older files may contain datetimes; downstream code will handle both.
+    """
     if not path.exists():
         return pd.DataFrame()
     if path.suffix.lower() == ".csv":
-        hdr = pd.read_csv(path, nrows=0)
-        parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
-        return pd.read_csv(path, parse_dates=parse_cols)
+        return pd.read_csv(path)
     if path.suffix.lower() in (".parquet", ".pq"):
-        df = pd.read_parquet(path)
-        if "date_sched" in df.columns:
-            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
-        return df
+        return pd.read_parquet(path)
     raise ValueError(f"Unsupported file to read: {path}")
+
 
 def _update_consolidated_ga(
     out_df: pd.DataFrame,
@@ -530,12 +566,13 @@ def _update_consolidated_ga(
 ) -> List[str]:
     """
     Maintain season-level consolidated files:
-      <season_dir>/goals_assists.csv and/or goals_assists.parquet (per --out-format).
+      <season_dir>/expected_goals_assists.csv and/or .parquet (per --out-format).
     DGW-safe: de-duplicate on a robust identity.
+    Persist dates as 'YYYY-MM-DD' strings (never time).
     """
     cons_stem = season_dir / "expected_goals_assists"
     targets: List[Path] = []
-    if out_format in ("csv", "both"): targets.append(Path(str(cons_stem) + ".csv"))
+    if out_format in ("csv", "both"):    targets.append(Path(str(cons_stem) + ".csv"))
     if out_format in ("parquet", "both"): targets.append(Path(str(cons_stem) + ".parquet"))
 
     # load existing (union csv/parquet if both exist)
@@ -555,9 +592,11 @@ def _update_consolidated_ga(
     old = old.reindex(columns=all_cols)
     merged = pd.concat([old, new], ignore_index=True)
 
-    # ensure datetime for sorting/formatting
+    # Build a temporary datetime for robust dedup/sort, but DO NOT persist it
     if "date_sched" in merged.columns:
-        merged["date_sched"] = pd.to_datetime(merged["date_sched"], errors="coerce")
+        merged["_date_sched_dt"] = pd.to_datetime(merged["date_sched"], errors="coerce")
+    else:
+        merged["_date_sched_dt"] = pd.NaT
 
     # robust DGW-safe key
     key = [c for c in ["season","player_id","team_id","game_id","gw_orig","date_sched","opponent_id"] if c in merged.columns]
@@ -565,23 +604,25 @@ def _update_consolidated_ga(
         key = [c for c in ["season","player_id","team_id","gw_orig"] if c in merged.columns]
     merged = merged.drop_duplicates(subset=key, keep="last")
 
-    keep_cols = [c for c in desired_order if c in merged.columns]
+    keep_cols = [c for c in desired_order if c in merged.columns] + ["_date_sched_dt"]
     merged = merged[keep_cols].copy()
+
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in merged.columns]
     if sort_keys:
-        merged = merged.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+        merged = merged.sort_values(sort_keys + ["_date_sched_dt"], kind="mergesort").reset_index(drop=True)
+
+    # Before writing, stringify dates (no time) and drop temp
+    if "date_sched" in merged.columns:
+        merged["date_sched"] = pd.to_datetime(merged["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+    merged = merged.drop(columns=["_date_sched_dt"], errors="ignore")
 
     written: List[str] = []
     for tgt in targets:
         if tgt.suffix.lower() == ".csv":
-            tmp = merged.copy()
-            if "date_sched" in tmp.columns:
-                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
-            tmp.to_csv(tgt, index=False)
-            written.append(str(tgt))
+            merged.to_csv(tgt, index=False)
         else:
             merged.to_parquet(tgt, index=False)
-            written.append(str(tgt))
+        written.append(str(tgt))
     return written
 
 
@@ -989,10 +1030,15 @@ def main():
     )
     last_play["date_played"] = _coerce_ts(last_play["date_played"], tz)
     fut["date_sched"] = _coerce_ts(fut["date_sched"], tz)
+
+    # use tz-aware for the subtraction, THEN strip tz for persisted field
     fut = fut.merge(last_play, how="left", on=["season", "player_id"], validate="many_to_one")
     fut["days_since_last"] = (fut["date_sched"] - fut["date_played"]).dt.days.clip(lower=0)
     fut.drop(columns=["date_played"], inplace=True)
-    fut["date_sched"] = fut["date_sched"].dt.normalize()
+
+    # >>> canonicalize to tz-naive, date-only (pre-validation!)
+    fut["date_sched"] = _to_naive_date(fut["date_sched"], tz)
+
 
     if "prev_minutes" not in fut.columns:
         last_prev = last[["season", "player_id", "minutes"]].rename(columns={"minutes": "prev_minutes"})
@@ -1152,7 +1198,7 @@ def main():
         "season":            fut["season"].values,
         "gw_played":         gw_played_vals,
         "gw_orig":           gw_orig_vals,
-        "date_sched":        fut["date_sched"].dt.normalize().values,  # date-only
+        "date_sched":        _to_naive_date(fut["date_sched"], tz).values,
         "game_id":           game_id_vals,       # fbref_id → game_id
         "team_id":           fut.get("team_id", pd.Series([np.nan]*len(fut))).astype(str).values,
         "team":              team_name_vals,
@@ -1165,6 +1211,7 @@ def main():
         "player":            fut.get("player", pd.Series([np.nan]*len(fut))).values,
         "pos":               fut["pos"].astype(str).values,
         "fdr":               fdr_vals,
+        "venue_bin":         pd.to_numeric(fut.get("venue_bin", 0), errors="coerce").astype("Int8").values,
 
         # --- Minutes heads & gates (for consumers) ---
         "p_start":           p_start_vals,
@@ -1214,7 +1261,7 @@ def main():
     keep_cols = [c for c in desired_order if c in out.columns]
     out = out[keep_cols].copy()
 
-        # enforce integer dtypes (nullable ints preserve NA)
+    # enforce integer dtypes (nullable ints preserve NA)
     if "gw_played" in out.columns:
         out["gw_played"] = pd.to_numeric(out["gw_played"], errors="coerce").astype("Int16")
     if "gw_orig" in out.columns:
@@ -1227,51 +1274,49 @@ def main():
         out["venue_bin"] = pd.to_numeric(out["venue_bin"], errors="coerce").astype("Int8")
 
     sort_keys = [k for k in ["gw_orig", "team_id", "player_id"] if k in out.columns]
-
     if sort_keys:
         out = out.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
 
     # --- schema validation before write ---
     GA_SCHEMA = {
-    "required": ["season","gw_played","gw_orig","date_sched","game_id","team_id","team",
-                "opponent_id","opponent","is_home","player_id","player","pos","fdr",
-                "p_start","p60","p_cameo","p_play","pred_start_head","pred_bench_cameo_head",
-                "pred_bench_head","pred_minutes","exp_minutes_points",
-                "team_att_z_venue","opp_def_z_venue",
-                "pred_goals_p90_mean","pred_assists_p90_mean",
-                "pred_goals_mean","pred_assists_mean",
-                "pred_goals_p90_poisson","pred_assists_p90_poisson",
-                "pred_goals_poisson","pred_assists_poisson",
-                "p_goal","p_assist","p_return_any"],
-    "dtypes": {
-        "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
-        "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
-        "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64",
-        "p_start":"float","p60":"float","p_cameo":"float","p_play":"float",
-        "pred_start_head":"float","pred_bench_cameo_head":"float","pred_bench_head":"float",
-        "pred_minutes":"float","exp_minutes_points":"float",
-        "team_att_z_venue":"float","opp_def_z_venue":"float",
-        "pred_goals_p90_mean":"float","pred_assists_p90_mean":"float",
-        "pred_goals_mean":"float","pred_assists_mean":"float",
-        "pred_goals_p90_poisson":"float","pred_assists_p90_poisson":"float",
-        "pred_goals_poisson":"float","pred_assists_poisson":"float",
-        "p_goal":"float","p_assist":"float","p_return_any":"float",
-    },
-    "na": {"gw_orig": False, "fdr": False, "is_home": False},
-    "ranges": {
-        "p_start":{"min":0.0,"max":1.0}, "p60":{"min":0.0,"max":1.0},
-        "p_cameo":{"min":0.0,"max":1.0}, "p_play":{"min":0.0,"max":1.0},
-        "exp_minutes_points":{"min":0.0,"max":2.0},
-        "p_goal":{"min":0.0,"max":1.0}, "p_assist":{"min":0.0,"max":1.0}, "p_return_any":{"min":0.0,"max":1.0},
-        "pred_minutes":{"min":0.0}
-    },
-    "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
-    "logic": [("is_home in {0,1}", ["is_home"])],
-    "date_rules": {"normalize":["date_sched"]},
-    "unique": ["season","gw_orig","team_id","player_id"]
+        "required": ["season","gw_played","gw_orig","date_sched","game_id","team_id","team",
+                     "opponent_id","opponent","is_home","player_id","player","pos","fdr",
+                     "p_start","p60","p_cameo","p_play","pred_start_head","pred_bench_cameo_head",
+                     "pred_bench_head","pred_minutes","exp_minutes_points",
+                     "team_att_z_venue","opp_def_z_venue",
+                     "pred_goals_p90_mean","pred_assists_p90_mean",
+                     "pred_goals_mean","pred_assists_mean",
+                     "pred_goals_p90_poisson","pred_assists_p90_poisson",
+                     "pred_goals_poisson","pred_assists_poisson",
+                     "p_goal","p_assist","p_return_any"],
+        "dtypes": {
+            "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
+            "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
+            "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64",
+            "p_start":"float","p60":"float","p_cameo":"float","p_play":"float",
+            "pred_start_head":"float","pred_bench_cameo_head":"float","pred_bench_head":"float",
+            "pred_minutes":"float","exp_minutes_points":"float",
+            "team_att_z_venue":"float","opp_def_z_venue":"float",
+            "pred_goals_p90_mean":"float","pred_assists_p90_mean":"float",
+            "pred_goals_mean":"float","pred_assists_mean":"float",
+            "pred_goals_p90_poisson":"float","pred_assists_p90_poisson":"float",
+            "pred_goals_poisson":"float","pred_assists_poisson":"float",
+            "p_goal":"float","p_assist":"float","p_return_any":"float",
+        },
+        "na": {"gw_orig": False, "fdr": False, "is_home": False},
+        "ranges": {
+            "p_start":{"min":0.0,"max":1.0}, "p60":{"min":0.0,"max":1.0},
+            "p_cameo":{"min":0.0,"max":1.0}, "p_play":{"min":0.0,"max":1.0},
+            "exp_minutes_points":{"min":0.0,"max":2.0},
+            "p_goal":{"min":0.0,"max":1.0}, "p_assist":{"min":0.0,"max":1.0}, "p_return_any":{"min":0.0,"max":1.0},
+            "pred_minutes":{"min":0.0}
+        },
+        "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
+        "logic": [("is_home in {0,1}", ["is_home"])],
+        "date_rules": {"normalize":["date_sched"]},
+        "unique": ["season","gw_orig","team_id","player_id"]
     }
     validate_df(out, GA_SCHEMA, name="goals_assists_forecast")
-
 
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _ga_out_paths(
@@ -1284,8 +1329,7 @@ def main():
     )
     written_paths = _write_ga(out, out_paths)
 
-    
-    # >>> NEW: update consolidated season-level files
+    # >>> NEW: update consolidated season-level files (also string dates)
     season_dir.mkdir(parents=True, exist_ok=True)
     consolidated_paths = _update_consolidated_ga(
         out_df=out,
