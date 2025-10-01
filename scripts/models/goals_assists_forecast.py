@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 # -*- coding: utf-8 -*-
 r"""
 goals_assists_forecast.py — leak-free scorer for future GWs using trained G/A heads,
@@ -563,6 +563,8 @@ def _update_consolidated_ga(
     season_dir: Path,
     out_format: str,
     desired_order: List[str],
+    run_gw_from: int,
+    run_gw_to: int,
 ) -> List[str]:
     """
     Maintain season-level consolidated files:
@@ -574,6 +576,11 @@ def _update_consolidated_ga(
     targets: List[Path] = []
     if out_format in ("csv", "both"):    targets.append(Path(str(cons_stem) + ".csv"))
     if out_format in ("parquet", "both"): targets.append(Path(str(cons_stem) + ".parquet"))
+
+    # annotate this batch with run window (persisted for precedence on future merges)
+    out_df = out_df.copy()
+    out_df["_run_gw_from"] = int(run_gw_from)
+    out_df["_run_gw_to"] = int(run_gw_to)
 
     # load existing (union csv/parquet if both exist)
     old = pd.DataFrame()
@@ -587,6 +594,12 @@ def _update_consolidated_ga(
         if c in out_df.columns: out_df[c] = out_df[c].astype(str)
         if c in old.columns:    old[c]    = old[c].astype(str)
 
+    # ensure batch meta columns exist on old (if file pre-dates this change)
+    if "_run_gw_from" not in old.columns:
+        old["_run_gw_from"] = -1
+    if "_run_gw_to" not in old.columns:
+        old["_run_gw_to"] = -1
+
     all_cols = list(dict.fromkeys([*desired_order, *old.columns.tolist(), *out_df.columns.tolist()]))
     new = out_df.reindex(columns=all_cols)
     old = old.reindex(columns=all_cols)
@@ -598,13 +611,24 @@ def _update_consolidated_ga(
     else:
         merged["_date_sched_dt"] = pd.NaT
 
-    # robust DGW-safe key
-    key = [c for c in ["season","player_id","team_id","game_id","gw_orig","date_sched","opponent_id"] if c in merged.columns]
-    if not key:
-        key = [c for c in ["season","player_id","team_id","gw_orig"] if c in merged.columns]
-    merged = merged.drop_duplicates(subset=key, keep="last")
+    # De-dup rule (points-forecast style):
+    # for the same (season, player_id, gw_orig), keep the row from the batch
+    # with the highest _run_gw_to (latest window). Tie-breaker: later date_sched.
+    dedup_key = [c for c in ["season", "player_id", "gw_orig"] if c in merged.columns]
+    if not dedup_key:
+        # fall back if columns are missing in unexpected data
+        dedup_key = [c for c in ["season", "player_id", "team_id", "gw_orig"] if c in merged.columns]
 
-    keep_cols = [c for c in desired_order if c in merged.columns] + ["_date_sched_dt"]
+    merged = merged.sort_values(
+        dedup_key
+        + ["_run_gw_to"] 
+        + (["_date_sched_dt"] if "_date_sched_dt" in merged.columns else []),
+        kind="mergesort"
+    ).drop_duplicates(subset=dedup_key, keep="last")
+
+    
+    # Keep desired output order, but also persist batch columns for future precedence
+    keep_cols = [c for c in desired_order if c in merged.columns] + ["_run_gw_from","_run_gw_to","_date_sched_dt"]
     merged = merged[keep_cols].copy()
 
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in merged.columns]
@@ -1263,9 +1287,9 @@ def main():
 
     # enforce integer dtypes (nullable ints preserve NA)
     if "gw_played" in out.columns:
-        out["gw_played"] = pd.to_numeric(out["gw_played"], errors="coerce").astype("Int16")
+        out["gw_played"] = pd.to_numeric(out["gw_played"], errors="coerce").astype("Int8")
     if "gw_orig" in out.columns:
-        out["gw_orig"] = pd.to_numeric(out["gw_orig"], errors="coerce").astype("Int16")
+        out["gw_orig"] = pd.to_numeric(out["gw_orig"], errors="coerce").astype("Int8")
     if "fdr" in out.columns:
         out["fdr"] = pd.to_numeric(out["fdr"], errors="coerce").astype("Int8")
     if "is_home" in out.columns:
@@ -1290,9 +1314,21 @@ def main():
                      "pred_goals_poisson","pred_assists_poisson",
                      "p_goal","p_assist","p_return_any"],
         "dtypes": {
-            "season":"string","gw_played":"Int64","gw_orig":"Int64","date_sched":"datetime64[ns]",
-            "game_id":"object","team_id":"string","team":"object","opponent_id":"object","opponent":"object",
-            "is_home":"Int64","player_id":"string","player":"object","pos":"string","fdr":"Int64",
+            "season":"string",
+            "gw_played":"Int8",          # align with cast above
+            "gw_orig":"Int8",            # align with cast above
+            "date_sched":"datetime64[ns]",
+            "game_id":"object",
+            "team_id":"string",
+            "team":"object",
+            "opponent_id":"object",
+            "opponent":"object",
+            "is_home":"Int8",             # align with cast above
+            "player_id":"string",
+            "player":"object",
+            "pos":"string",
+            "fdr":"Int8",                 # align with cast above
+            "venue_bin":"Int8",           # explicitly declare for consistency
             "p_start":"float","p60":"float","p_cameo":"float","p_play":"float",
             "pred_start_head":"float","pred_bench_cameo_head":"float","pred_bench_head":"float",
             "pred_minutes":"float","exp_minutes_points":"float",
@@ -1314,7 +1350,8 @@ def main():
         "choices": {"pos":{"in":["GK","DEF","MID","FWD"]}},
         "logic": [("is_home in {0,1}", ["is_home"])],
         "date_rules": {"normalize":["date_sched"]},
-        "unique": ["season","gw_orig","team_id","player_id"]
+        # DGW-safe uniqueness (two fixtures same GW → distinct game_id)
+        "unique": ["season","gw_orig","team_id","player_id","game_id"]
     }
     validate_df(out, GA_SCHEMA, name="goals_assists_forecast")
 
@@ -1336,8 +1373,9 @@ def main():
         season_dir=season_dir,
         out_format=args.out_format,
         desired_order=desired_order,
+        run_gw_from=gw_from_eff,
+        run_gw_to=gw_to_eff,
     )
-
     try:
         def q995(x): return float(pd.Series(x).quantile(0.995))
         for nm, arr in [("g90_LGBM", g_p90_mean), ("a90_LGBM", a_p90_mean),
