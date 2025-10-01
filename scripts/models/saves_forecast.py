@@ -38,6 +38,12 @@ def _coerce_ts(s: pd.Series, tz: Optional[str]) -> pd.Series:
             out = out.dt.tz_convert(tz)
     return out
 
+def _normalize_dates_inplace(df: pd.DataFrame, cols: Tuple[str, ...] = ("date_sched","date_played")) -> None:
+    """Force datetime64[ns] and strip time to 00:00:00 for all listed date cols."""
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.normalize()
+
 def _fmt_gw(n: int, zero_pad: bool) -> str:
     return f"{int(n):02d}" if zero_pad else f"{int(n)}"
 
@@ -230,10 +236,11 @@ def _load_minutes_dual(path: Path) -> pd.DataFrame:
         hdr = pd.read_csv(path, nrows=0)
         parse_cols = ["date_sched"] if "date_sched" in hdr.columns else None
         df = pd.read_csv(path, parse_dates=parse_cols)
+        _normalize_dates_inplace(df, ("date_sched",))
     elif suffix in (".parquet", ".pq"):
         df = pd.read_parquet(path)
         if "date_sched" in df.columns:
-            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce")
+            df["date_sched"] = pd.to_datetime(df["date_sched"], errors="coerce").dt.normalize()
     else:
         raise ValueError(f"Unsupported minutes file extension: {suffix}. Use .csv or .parquet")
     return df
@@ -394,6 +401,16 @@ def _saves_out_paths(base_dir: Path, season: str, gw_from: int, gw_to: int,
     return [Path(str(stem) + ".csv"), Path(str(stem) + ".parquet")]
 
 def _write_saves(df: pd.DataFrame, paths: List[Path]) -> List[str]:
+    # Ensure stable dtypes before any write
+    df = df.copy()
+    _normalize_dates_inplace(df, ("date_sched",))
+    for c in ("gw_played","gw_orig"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    for c in ("team_id","player_id","opponent_id","game_id","season"):
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+
     written: List[str] = []
     for p in paths:
         if p.suffix.lower() == ".csv":
@@ -457,7 +474,9 @@ def _update_consolidated(
             old = pd.DataFrame()
     if cons_csv.exists():
         try:
-            old_csv = pd.read_csv(cons_csv)
+            # PARSE the date column on read to avoid object dtype
+            old_csv = pd.read_csv(cons_csv, parse_dates=["date_sched"])
+            _normalize_dates_inplace(old_csv, ("date_sched",))
             old = old_csv if old.empty else pd.concat([old, old_csv], ignore_index=True)
         except Exception:
             pass
@@ -468,10 +487,16 @@ def _update_consolidated(
     if "_run_gw_to" not in old.columns:
         old["_run_gw_to"] = -1
 
-    # Normalize key dtypes
+    # Normalize key dtypes BEFORE concat
     for c in ("season","team_id","player_id","opponent_id","game_id"):
         if c in new_df.columns: new_df[c] = new_df[c].astype(str)
         if c in old.columns:    old[c]    = old[c].astype(str)
+    for c in ("gw_played","gw_orig","gw"):
+        if c in new_df.columns: new_df[c] = pd.to_numeric(new_df[c], errors="coerce").astype("Int64")
+        if c in old.columns:    old[c]    = pd.to_numeric(old[c], errors="coerce").astype("Int64")
+
+    _normalize_dates_inplace(new_df, ("date_sched",))
+    _normalize_dates_inplace(old, ("date_sched",))
 
     # Align schemas (outer union) then concat
     all_cols = list(dict.fromkeys([*old.columns.tolist(), *new_df.columns.tolist()]))
@@ -500,6 +525,15 @@ def _update_consolidated(
     if sort_keys:
         merged = merged.sort_values(sort_keys + ["_date_sched_dt"], kind="mergesort").reset_index(drop=True)
     merged = merged.drop(columns=["_date_sched_dt"], errors="ignore")
+
+    # Ensure final dtypes are stable before writing Parquet
+    _normalize_dates_inplace(merged, ("date_sched",))
+    for c in ("gw_played","gw_orig","gw"):
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").astype("Int64")
+    for c in ("season","team_id","player_id","opponent_id","game_id"):
+        if c in merged.columns:
+            merged[c] = merged[c].astype(str)
 
     # Write parquet + csv (csv with date-only date_sched)
     parq_path, csv_path = _consolidated_paths(base_dir, season)
@@ -635,7 +669,14 @@ def main():
         team_fix = pd.read_csv(args.fix_root / args.future_season / args.team_fixtures_filename)
         for dc in ("date_sched","date_played"):
             if dc in team_fix.columns:
-                team_fix[dc] = pd.to_datetime(team_fix[dc], errors="coerce")
+                team_fix[dc] = pd.to_datetime(dc in team_fix.columns and team_fix[dc], errors="coerce")
+                # ^ keep structure; fix below for clarity
+        # Correct normalization (the one-liner above keeps types but is unclear)
+        if "date_sched" in team_fix.columns:
+            team_fix["date_sched"] = pd.to_datetime(team_fix["date_sched"], errors="coerce").dt.normalize()
+        if "date_played" in team_fix.columns:
+            team_fix["date_played"] = pd.to_datetime(team_fix["date_played"], errors="coerce").dt.normalize()
+
         if "is_home" not in team_fix.columns:
             if "was_home" in team_fix.columns:
                 team_fix["is_home"] = team_fix["was_home"].astype(str).str.lower().isin(["1","true","yes"]).astype("Int8")
@@ -841,7 +882,6 @@ def main():
     }
     validate_df(out, SAV_SCHEMA, name="saves_forecast")
 
-    
     gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
     out_paths = _saves_out_paths(
         base_dir=args.out_dir,
