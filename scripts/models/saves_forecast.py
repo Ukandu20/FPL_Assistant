@@ -278,12 +278,25 @@ def attach_fdr_consistent(df: pd.DataFrame,
                           seasons_all: List[str],
                           features_root: Path,
                           version: str,
-                          team_form: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                          team_form: Optional[pd.DataFrame] = None,
+                          team_fix: Optional[pd.DataFrame] = None,
+                          audit_dir: Optional[Path] = None,
+                          audit_tag: Optional[str] = None,
+                          drop_on_missing: bool = True) -> pd.DataFrame:
     """
-    Attach integer FDR via (season, team_id, GW, is_home). DGW-safe: collapse dup keys by max.
+    Attach integer FDR via (season, team_id, GW, is_home).
+    Priority:
+      1) team_form with separate home/away FDR columns (historical and, if available, forward-filled)
+      2) team fixtures (fixture_calendar*) if they expose `fdr` (or `fdr_home`/`fdr_away`)
+    DGW-safe: collapse dup keys by max.
+
+    If rows remain without FDR after both sources:
+      - If drop_on_missing=True (default): write them to an audit CSV and drop them, proceed with the rest.
+      - Else: raise RuntimeError with diagnostics.
     """
     if df.empty:
         return df
+
     df = _ensure_is_home(df)
     df["team_id"] = df["team_id"].astype(str)
     for c in ("gw_played","gw_orig","gw"):
@@ -294,36 +307,154 @@ def attach_fdr_consistent(df: pd.DataFrame,
     if gw_df is None:
         raise RuntimeError("attach_fdr_consistent: no GW column among ['gw_played','gw_orig','gw'].")
 
+    # ---------- Source 1: team_form (home/away columns) ----------
     tf_all = team_form.copy() if team_form is not None else _load_team_form(features_root, version, seasons_all)
-    if tf_all is None or tf_all.empty:
-        raise FileNotFoundError("attach_fdr_consistent: team_form not available.")
-    tf_all["team_id"] = tf_all.get("team_id", pd.Series(index=tf_all.index, dtype=object)).astype(str)
-    for c in ("gw_played","gw_orig","gw"):
-        if c in tf_all.columns:
-            tf_all[c] = pd.to_numeric(tf_all[c], errors="coerce")
+    form_join_ok = False
+    merged = df.copy()
 
-    home_col, away_col = _find_fdr_cols(set(tf_all.columns))
-    gw_tf = _pick_gw_col(tf_all.columns.tolist())
-    if gw_tf is None:
-        raise RuntimeError("attach_fdr_consistent: no GW column in team_form.")
+    if tf_all is not None and not tf_all.empty:
+        tf_all["team_id"] = tf_all.get("team_id", pd.Series(index=tf_all.index, dtype=object)).astype(str)
+        for c in ("gw_played","gw_orig","gw"):
+            if c in tf_all.columns:
+                tf_all[c] = pd.to_numeric(tf_all[c], errors="coerce")
 
-    base = tf_all[["season","team_id",gw_tf,home_col,away_col]].dropna(subset=["team_id",gw_tf])
-    home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season","team_id",gw_tf,"is_home","fdr_side"]]
-    away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season","team_id",gw_tf,"is_home","fdr_side"]]
-    form_long = pd.concat([home_rows, away_rows], ignore_index=True)
-    if gw_tf != gw_df:
-        form_long = form_long.rename(columns={gw_tf: gw_df})
+        try:
+            home_col, away_col = _find_fdr_cols(set(tf_all.columns))
+            gw_tf = _pick_gw_col(tf_all.columns.tolist())
+            if gw_tf is None:
+                raise RuntimeError("attach_fdr_consistent: no GW column in team_form.")
 
-    form_long = (form_long.groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"].max())
-    merged = df.merge(form_long, how="left",
-                      on=["season","team_id",gw_df,"is_home"],
-                      validate="many_to_one", copy=False)
+            base = tf_all[["season","team_id",gw_tf,home_col,away_col]].dropna(subset=["team_id",gw_tf])
+            home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+            away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+            form_long = pd.concat([home_rows, away_rows], ignore_index=True)
+            if gw_tf != gw_df:
+                form_long = form_long.rename(columns={gw_tf: gw_df})
 
+            form_long = (form_long.groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"].max())
+            merged = merged.merge(form_long, how="left",
+                                  on=["season","team_id",gw_df,"is_home"],
+                                  validate="many_to_one", copy=False)
+            form_join_ok = merged["fdr_side"].notna().any()
+        except Exception:
+            form_join_ok = False  # allow fallback
+
+    # ---------- Source 2: team fixtures (fallback) ----------
+    need_fixtures = (not form_join_ok) or merged["fdr_side"].isna().any()
+    if need_fixtures and team_fix is not None and not team_fix.empty:
+        tf = team_fix.copy()
+        for c in ("team_id",):
+            if c in tf.columns:
+                tf[c] = tf[c].astype(str)
+        for c in ("gw_played","gw_orig","gw"):
+            if c in tf.columns:
+                tf[c] = pd.to_numeric(tf[c], errors="coerce")
+        if "season" not in tf.columns:
+            tf["season"] = df["season"].iloc[0]
+
+        gw_tf = _pick_gw_col(tf.columns.tolist()) or "gw_orig"
+
+        fdr_cols = set(tf.columns)
+        has_pair = ("fdr_home" in fdr_cols or "team_fdr_home" in fdr_cols) and ("fdr_away" in fdr_cols or "team_fdr_away" in fdr_cols)
+        has_single = "fdr" in fdr_cols
+
+        if has_pair:
+            home_col = "fdr_home" if "fdr_home" in fdr_cols else "team_fdr_home"
+            away_col = "fdr_away" if "fdr_away" in fdr_cols else "team_fdr_away"
+            base = tf[["season","team_id",gw_tf,home_col,away_col]].dropna(subset=["team_id",gw_tf]).copy()
+            home_rows = base.rename(columns={home_col: "fdr_side"}).assign(is_home=1)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+            away_rows = base.rename(columns={away_col: "fdr_side"}).assign(is_home=0)[["season","team_id",gw_tf,"is_home","fdr_side"]]
+            fx_long = pd.concat([home_rows, away_rows], ignore_index=True)
+        elif has_single:
+            if "is_home" not in tf.columns:
+                if "venue" in tf.columns:
+                    tf["is_home"] = tf["venue"].astype(str).str.lower().eq("home").astype("Int8")
+                else:
+                    tf["is_home"] = 1
+                    tf2 = tf.copy()
+                    tf2["is_home"] = 0
+                    tf = pd.concat([tf, tf2], ignore_index=True)
+            fx_long = (tf[["season","team_id",gw_tf,"is_home","fdr"]]
+                       .rename(columns={"fdr":"fdr_side"})
+                       .dropna(subset=["team_id",gw_tf]))
+        else:
+            fx_long = pd.DataFrame(columns=["season","team_id",gw_tf,"is_home","fdr_side"])
+
+        if not fx_long.empty:
+            if gw_tf != gw_df:
+                fx_long = fx_long.rename(columns={gw_tf: gw_df})
+            fx_long["fdr_side"] = pd.to_numeric(fx_long["fdr_side"], errors="coerce")
+
+            if "fdr_side" in merged.columns:
+                miss_mask = merged["fdr_side"].isna()
+                if miss_mask.any():
+                    fill = merged.loc[miss_mask].merge(
+                        fx_long.groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"].max(),
+                        how="left", on=["season","team_id",gw_df,"is_home"], validate="many_to_one"
+                    )
+                    merged.loc[miss_mask, "fdr_side"] = fill["fdr_side"].values
+            else:
+                merged = merged.merge(
+                    fx_long.groupby(["season","team_id",gw_df,"is_home"], as_index=False)["fdr_side"].max(),
+                    how="left", on=["season","team_id",gw_df,"is_home"], validate="many_to_one"
+                )
+
+    # ---------- Finalize: audit + optionally drop missing ----------
     if merged["fdr_side"].isna().any():
-        miss = merged.loc[merged["fdr_side"].isna(), ["season","team_id",gw_df,"is_home"]].drop_duplicates()
-        logging.error("attach_fdr_consistent: missing FDR for %d rows. Examples:\n%s",
-                      len(miss), miss.head(20).to_string(index=False))
-        raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs. Check keys/coverage.")
+        miss_keys = (merged.loc[merged["fdr_side"].isna(), ["season","team_id",gw_df,"is_home"]]
+                     .drop_duplicates()
+                     .sort_values(["season","team_id",gw_df,"is_home"]))
+        miss_count = int(len(miss_keys))
+
+        # Build richer audit payload (include a few helpful columns if present)
+        audit_cols = [c for c in [
+            "season", gw_df, "team_id", "team", "is_home", "opponent_id", "opponent",
+            "player_id", "player", "pos", "date_sched"
+        ] if c in merged.columns]
+        audit_df = (merged.loc[merged["fdr_side"].isna(), audit_cols]
+                    .drop_duplicates()
+                    .sort_values([c for c in [gw_df, "team_id", "player_id"] if c in audit_cols]))
+
+        if audit_dir is not None:
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            tag = (audit_tag or "unknown").replace(" ", "_")
+            audit_path = audit_dir / f"fdr_attach_missing__{tag}.csv"
+            # Normalize date for readability
+            if "date_sched" in audit_df.columns:
+                audit_df = audit_df.copy()
+                audit_df["date_sched"] = pd.to_datetime(audit_df["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            audit_df.to_csv(audit_path, index=False)
+            logging.warning("attach_fdr_consistent: wrote %d missing-FDR rows to audit file: %s",
+                            miss_count, audit_path)
+        else:
+            logging.warning("attach_fdr_consistent: %d missing-FDR rows (no audit_dir provided).", miss_count)
+
+        # Provide compact coverage context for logs
+        debug_bits = []
+        if tf_all is not None and not tf_all.empty:
+            gw_tf_all = _pick_gw_col(tf_all.columns.tolist()) or "gw_orig"
+            debug_bits.append({
+                "source": "team_form",
+                "rows": int(len(tf_all)),
+                "gw_col": gw_tf_all,
+                "seasons": sorted(map(str, pd.unique(tf_all["season"]))),
+            })
+        if team_fix is not None and not team_fix.empty:
+            gw_fx = _pick_gw_col(team_fix.columns.tolist()) or "gw_orig"
+            has_cols = [c for c in ["fdr","fdr_home","fdr_away","team_fdr_home","team_fdr_away"] if c in team_fix.columns]
+            debug_bits.append({
+                "source": "team_fix",
+                "rows": int(len(team_fix)),
+                "gw_col": gw_fx,
+                "has_cols": has_cols,
+            })
+        logging.info("FDR coverage summary: %s", json.dumps(debug_bits))
+
+        if not drop_on_missing:
+            raise RuntimeError("attach_fdr_consistent: FDR merge produced NaNs after fallback and drop_on_missing=False.")
+
+        # Drop missing and proceed
+        merged = merged[merged["fdr_side"].notna()].copy()
 
     merged["fdr"] = pd.to_numeric(merged["fdr_side"], errors="raise").astype("Int8")
     merged.drop(columns=["fdr_side"], inplace=True, errors="ignore")
@@ -667,11 +798,7 @@ def main():
     # --- team fixtures load (for venue + legacy meta) ---
     try:
         team_fix = pd.read_csv(args.fix_root / args.future_season / args.team_fixtures_filename)
-        for dc in ("date_sched","date_played"):
-            if dc in team_fix.columns:
-                team_fix[dc] = pd.to_datetime(dc in team_fix.columns and team_fix[dc], errors="coerce")
-                # ^ keep structure; fix below for clarity
-        # Correct normalization (the one-liner above keeps types but is unclear)
+        # normalize any dates
         if "date_sched" in team_fix.columns:
             team_fix["date_sched"] = pd.to_datetime(team_fix["date_sched"], errors="coerce").dt.normalize()
         if "date_played" in team_fix.columns:
@@ -702,13 +829,72 @@ def main():
     fut["venue_bin"] = venue_bin.astype("Int8")
     fut["is_home"] = fut["venue_bin"].astype("Int8")  # canonicalize
 
+    # Prepare audit directory + tag for any FDR attach misses
+    audit_dir = (args.out_dir / str(args.future_season) / "artifacts")
+    audit_tag = f"GW{int(gw_from_req)}_{int(gw_to_req)}"
+
     # --- FDR attach (INT, venue-consistent, DGW-safe) ---
     fut = attach_fdr_consistent(
-        df=fut, seasons_all=seasons_all,
-        features_root=args.features_root, version=args.form_version,
-        team_form=tf
+        df=fut,
+        seasons_all=seasons_all,
+        features_root=args.features_root,
+        version=args.form_version,
+        team_form=tf,
+        team_fix=team_fix,
+        audit_dir=audit_dir,
+        audit_tag=audit_tag,
+        drop_on_missing=True,   # write audit + drop + continue
     )
     fut["fdr"] = pd.to_numeric(fut["fdr"], errors="raise").astype("Int8")
+
+    # >>> Guard: if everything was dropped, write empty outputs and exit cleanly
+    if fut.empty:
+        logging.warning("No rows remain after FDR attach (all dropped or no coverage). Writing empty outputs and exiting.")
+        gw_from_eff, gw_to_eff = int(min(target_gws)), int(max(target_gws))
+        empty_cols = [
+            "season","gw_played","gw_orig","date_sched","game_id",
+            "team_id","team","opponent_id","opponent","is_home","venue_bin",
+            "player_id","player","pos","fdr",
+            "pred_minutes","team_def_z_venue","opp_att_z_venue",
+            "pred_saves_p90_mean","pred_saves_mean",
+            "pred_saves_p90_poisson","pred_saves_poisson"
+        ]
+        out = pd.DataFrame(columns=empty_cols)
+        out_paths = _saves_out_paths(
+            base_dir=args.out_dir,
+            season=args.future_season,
+            gw_from=gw_from_eff,
+            gw_to=gw_to_eff,
+            zero_pad=args.zero_pad_filenames,
+            out_format=args.out_format,
+        )
+        _ = _write_saves(out, out_paths)
+        _ = _update_consolidated(
+            new_df=out,
+            base_dir=args.out_dir,
+            season=args.future_season,
+            run_gw_from=gw_from_eff,
+            run_gw_to=gw_to_eff,
+        )
+        diag = {
+            "rows": 0,
+            "season": str(args.future_season),
+            "requested": {"gw_from": int(gw_from_req), "gw_to": int(gw_to_req), "n_future": int(args.n_future)},
+            "available_team_gws": [int(x) for x in avail_gws],
+            "scored_gws": [int(x) for x in target_gws],
+            "as_of": str(as_of_ts),
+            "minutes_in": str(minutes_path),
+            "out": [str(p) for p in out_paths],
+            "consolidated_out": [],
+            "roster_gate": {
+                "enabled": bool(args.teams_json),
+                "league_filter": (args.league_filter if args.league_filter != "" else None)
+            },
+            "note": "All fixtures for this window lacked FDR coverage; empty outputs written. See audit CSV."
+        }
+        print(json.dumps(diag, indent=2))
+        return
+    # <<< End guard
 
     # --- attach team Zs ---
     if tz_map is not None and gw_key_m in fut.columns:
