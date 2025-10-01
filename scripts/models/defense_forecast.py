@@ -467,19 +467,23 @@ def _write_def(df: pd.DataFrame, paths: List[Path]) -> List[str]:
 # ===================== CONSOLIDATED WRITER (season-level) =====================
 
 def _read_any(path: Path) -> pd.DataFrame:
-    if not path.exists(): return pd.DataFrame()
+    if not path.exists():
+        return pd.DataFrame()
     if path.suffix.lower() == ".csv":
-        # date_sched may be already string; coerce later
-        return pd.read_csv(path, parse_dates=["date_sched"]) if "date_sched" in pd.read_csv(path, nrows=0).columns else pd.read_csv(path)
+        # Keep strings as-is; we'll coerce for sorting later.
+        return pd.read_csv(path)
     if path.suffix.lower() in (".parquet", ".pq"):
         return pd.read_parquet(path)
     raise ValueError(f"Unsupported file to read: {path}")
+
 
 def _update_consolidated(
     out_df: pd.DataFrame,
     season_dir: Path,
     out_format: str,
     desired_order: List[str],
+    run_gw_from: int,
+    run_gw_to: int,
 ) -> List[str]:
     """
     Maintain season-level consolidated files:
@@ -490,6 +494,11 @@ def _update_consolidated(
     targets: List[Path] = []
     if out_format in ("csv", "both"): targets.append(Path(str(cons_stem) + ".csv"))
     if out_format in ("parquet", "both"): targets.append(Path(str(cons_stem) + ".parquet"))
+
+    # Tag this batch with run window (used to decide precedence on overlaps)
+    out_df = out_df.copy()
+    out_df["_run_gw_from"] = int(run_gw_from)
+    out_df["_run_gw_to"] = int(run_gw_to)
 
     # Load whichever consolidated exists (prefer union if both exist)
     old_csv = Path(str(cons_stem) + ".csv")
@@ -504,6 +513,12 @@ def _update_consolidated(
             # union in case they diverged
             old = pd.concat([old, old_p], ignore_index=True)
 
+    # Ensure batch meta columns exist on old if prior runs predate this change
+    if "_run_gw_from" not in old.columns:
+        old["_run_gw_from"] = -1
+    if "_run_gw_to" not in old.columns:
+        old["_run_gw_to"] = -1
+
     # Normalize dtypes for keys
     for c in ("season","team_id","player_id","opponent_id","game_id"):
         if c in out_df.columns:
@@ -516,27 +531,40 @@ def _update_consolidated(
     new = out_df.reindex(columns=all_cols)
     old = old.reindex(columns=all_cols)
 
-    # Robust dedup key (DGW-safe): prefer game_id when present, otherwise gw_orig+date_sched+opponent_id
-    key_candidates = [c for c in ["season","player_id","team_id","game_id","gw_orig","date_sched","opponent_id"] if c in all_cols]
-    if not key_candidates:
-        # fallback (shouldn't happen)
-        key_candidates = [c for c in ["season","player_id","team_id","gw_orig"] if c in all_cols]
-
+    # Merge old and new batches into a single frame for de-duplication and tie-breaking.
+    # Use concat so we keep all rows; later logic sorts and drop_duplicates to resolve overlaps.
     merged = pd.concat([old, new], ignore_index=True)
 
-    # Ensure date_sched is datetime for sorting & CSV formatting later
+    # Build a temporary datetime for robust tie-breaking; DO NOT persist this column
     if "date_sched" in merged.columns:
-        merged["date_sched"] = pd.to_datetime(merged["date_sched"], errors="coerce")
+        merged["_date_sched_dt"] = pd.to_datetime(merged["date_sched"], errors="coerce")
+    else:
+        merged["_date_sched_dt"] = pd.NaT
 
-    merged = merged.drop_duplicates(subset=key_candidates, keep="last")
+    # Latest-window-wins de-dup (points/GA logic):
+    # For identical (season, player_id, gw_orig) keep the row with the highest _run_gw_to.
+    dedup_key = [c for c in ["season","player_id","gw_orig"] if c in merged.columns]
+    if not dedup_key:
+        # fallback (should be rare)
+        dedup_key = [c for c in ["season","player_id","team_id","gw_orig"] if c in merged.columns]
+
+    merged = merged.sort_values(
+        dedup_key + ["_run_gw_to"] + (["_date_sched_dt"] if "_date_sched_dt" in merged.columns else []),
+        kind="mergesort"
+    ).drop_duplicates(subset=dedup_key, keep="last")
 
     # Sort and project to the desired output column order we already use for window files
-    keep_cols = [c for c in desired_order if c in merged.columns]
+    
+    # Keep batch columns to preserve precedence information for future merges
+    keep_cols = [c for c in desired_order if c in merged.columns] + ["_run_gw_from","_run_gw_to","_date_sched_dt"]
     merged = merged[keep_cols].copy()
 
     sort_keys = [k for k in ["gw_orig","team_id","player_id"] if k in merged.columns]
     if sort_keys:
-        merged = merged.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+        merged = merged.sort_values(sort_keys + ["_date_sched_dt"], kind="mergesort").reset_index(drop=True)
+
+    # Drop temp date column before writing
+    merged = merged.drop(columns=["_date_sched_dt"], errors="ignore")
 
     # Write back according to --out-format
     written: List[str] = []
@@ -1028,6 +1056,8 @@ def main():
         season_dir=season_dir,
         out_format=args.out_format,
         desired_order=desired_order,
+        run_gw_from=gw_from_eff,
+        run_gw_to=gw_to_eff,
     )
 
     diag = {
