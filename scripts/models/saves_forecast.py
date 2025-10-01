@@ -413,12 +413,20 @@ def _write_saves(df: pd.DataFrame, paths: List[Path]) -> List[str]:
 def _consolidated_paths(base_dir: Path, season: str) -> List[Path]:
     season_dir = base_dir / str(season)
     season_dir.mkdir(parents=True, exist_ok=True)
-    return [season_dir / "consolidated.parquet", season_dir / "consolidated.csv"]
+    # keep the existing filenames to avoid breaking downstream consumers
+    return [season_dir / "expected_saves.parquet", season_dir / "expected_saves.csv"]
 
-def _update_consolidated(new_df: pd.DataFrame, base_dir: Path, season: str) -> List[str]:
+def _update_consolidated(
+    new_df: pd.DataFrame,
+    base_dir: Path,
+    season: str,
+    run_gw_from: int,
+    run_gw_to: int,
+) -> List[str]:
     """
     Merge window output into season-level consolidated file (parquet + csv).
-    De-duplicate on (season, gw_key, team_id, player_id) keeping last.
+    Latest-window-wins rule per (season, player_id, gw_orig):
+      keep the row coming from the batch with the highest `_run_gw_to`.
     """
     if new_df.empty:
         return []
@@ -426,45 +434,75 @@ def _update_consolidated(new_df: pd.DataFrame, base_dir: Path, season: str) -> L
     season_dir = base_dir / str(season)
     season_dir.mkdir(parents=True, exist_ok=True)
 
-    # Choose best available GW key (prefer gw_orig).
+    # Prefer gw_orig as canonical GW key
     gw_key = "gw_orig" if "gw_orig" in new_df.columns else (
         "gw_played" if "gw_played" in new_df.columns else ("gw" if "gw" in new_df.columns else None)
     )
-
     if gw_key is None:
-        # Nothing to consolidate robustly.
         return []
 
-    # Load existing parquet if present.
-    cons_parq = season_dir / "consolidated.parquet"
+    # Tag the incoming batch with run window
+    new_df = new_df.copy()
+    new_df["_run_gw_from"] = int(run_gw_from)
+    new_df["_run_gw_to"] = int(run_gw_to)
+
+    # Load existing consolidated (union parquet+csv if both exist)
+    cons_parq = season_dir / "expected_saves.parquet"
+    cons_csv  = season_dir / "expected_saves.csv"
+    old = pd.DataFrame()
     if cons_parq.exists():
         try:
-            cons = pd.read_parquet(cons_parq)
+            old = pd.read_parquet(cons_parq)
         except Exception:
-            cons = pd.DataFrame(columns=new_df.columns)
+            old = pd.DataFrame()
+    if cons_csv.exists():
+        try:
+            old_csv = pd.read_csv(cons_csv)
+            old = old_csv if old.empty else pd.concat([old, old_csv], ignore_index=True)
+        except Exception:
+            pass
+
+    # Backfill batch-meta columns for older files
+    if "_run_gw_from" not in old.columns:
+        old["_run_gw_from"] = -1
+    if "_run_gw_to" not in old.columns:
+        old["_run_gw_to"] = -1
+
+    # Normalize key dtypes
+    for c in ("season","team_id","player_id","opponent_id","game_id"):
+        if c in new_df.columns: new_df[c] = new_df[c].astype(str)
+        if c in old.columns:    old[c]    = old[c].astype(str)
+
+    # Align schemas (outer union) then concat
+    all_cols = list(dict.fromkeys([*old.columns.tolist(), *new_df.columns.tolist()]))
+    old = old.reindex(columns=all_cols)
+    new = new_df.reindex(columns=all_cols)
+    merged = pd.concat([old, new], ignore_index=True, sort=False)
+
+    # Temporary datetime for stable sorting (do not persist)
+    if "date_sched" in merged.columns:
+        merged["_date_sched_dt"] = pd.to_datetime(merged["date_sched"], errors="coerce")
     else:
-        cons = pd.DataFrame(columns=new_df.columns)
+        merged["_date_sched_dt"] = pd.NaT
 
-    # Align columns (outer union), then concat and drop dups keeping latest.
-    merged = pd.concat([cons, new_df], ignore_index=True, sort=False)
+    # Latest-window-wins de-dup key
+    dedup_key = [c for c in ["season","player_id","gw_orig"] if c in merged.columns]
+    if not dedup_key:
+        dedup_key = [c for c in ["season","player_id",gw_key] if c in merged.columns]
 
-    # Enforce integer dtypes before dedup/sort for stable keys.
-    for col, dtype in [("gw_played","Int16"),("gw_orig","Int16"),
-                       ("fdr","Int8"),("is_home","Int8"),("venue_bin","Int8")]:
-        if col in merged.columns:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce").astype(dtype)
+    merged = merged.sort_values(
+        dedup_key + ["_run_gw_to"] + (["_date_sched_dt"] if "_date_sched_dt" in merged.columns else []),
+        kind="mergesort"
+    ).drop_duplicates(subset=dedup_key, keep="last")
 
-    key_cols = ["season", gw_key, "team_id", "player_id"]
-    keep_cols = [c for c in key_cols if c in merged.columns]
-    if len(keep_cols) == len(key_cols):
-        merged = merged.drop_duplicates(subset=key_cols, keep="last")
-        sort_keys = [k for k in [gw_key, "team_id", "player_id"] if k in merged.columns]
-        if sort_keys:
-            merged = merged.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+    # Final ordering for output and cleanup
+    sort_keys = [k for k in [gw_key, "team_id", "player_id"] if k in merged.columns]
+    if sort_keys:
+        merged = merged.sort_values(sort_keys + ["_date_sched_dt"], kind="mergesort").reset_index(drop=True)
+    merged = merged.drop(columns=["_date_sched_dt"], errors="ignore")
 
-    # Write parquet + csv (csv with date-only date_sched).
-    paths = _consolidated_paths(base_dir, season)
-    parq_path, csv_path = paths[0], paths[1]
+    # Write parquet + csv (csv with date-only date_sched)
+    parq_path, csv_path = _consolidated_paths(base_dir, season)
     merged.to_parquet(parq_path, index=False)
 
     csv_out = merged.copy()
@@ -816,7 +854,13 @@ def main():
     written_paths = _write_saves(out, out_paths)
 
     # ---- update consolidated (season-level) ----
-    consolidated_paths = _update_consolidated(out, args.out_dir, args.future_season)
+    consolidated_paths = _update_consolidated(
+        new_df=out,
+        base_dir=args.out_dir,
+        season=args.future_season,
+        run_gw_from=gw_from_eff,
+        run_gw_to=gw_to_eff,
+    )
 
     diag = {
         "rows": int(len(out)),
