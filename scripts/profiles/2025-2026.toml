@@ -1,0 +1,21 @@
+[defaults]
+features_root = "data/processed/registry/features"
+form_version  = "v2"
+fix_root      = "data/processed/registry/fixtures"
+team_fixtures_filename = "fixture_calendar.csv"
+teams_json    = "data/processed/registry/master_teams.json"
+league_filter = "ENG-Premier League"
+
+# time window
+as_of = "now"
+as_of_tz = "Africa/Lagos"
+as_of_gw = 6
+n_future = 3
+
+# io
+out_dir = "data/predictions/goals_assists"
+out_format = "both"
+
+# behavior
+skip_gk = true
+apply_calibration = true

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -32,7 +32,7 @@ REQUIRED_OUT_COLS = [
 ACCEPTED_IN_COLS = {
     "season", "gw", "gw_orig",
     "player_id", "team_id", "team_code", "player", "pos",
-    "p1","p60", "pred_minutes", "xMins_mean",
+    "p1", "p60", "pred_minutes", "xMins_mean",
     "xPts", "exp_pts_var",
     "__p_cs__", "team_prob_cs", "cs_prob",
     "team_ga_lambda90", "__lambda90__", "team_exp_gc",
@@ -67,7 +67,7 @@ def _read_any(path: str | Path) -> pd.DataFrame:
     if p.endswith(".csv"):
         try:
             head = pd.read_csv(p, nrows=0)
-            parse_dates = [c for c in ("date_sched","date_played","kickoff_time") if c in head.columns]
+            parse_dates = [c for c in ("date_sched", "date_played", "kickoff_time") if c in head.columns]
             return pd.read_csv(p, parse_dates=parse_dates, low_memory=False)
         except Exception:
             return pd.read_csv(p, low_memory=False)
@@ -96,6 +96,7 @@ def _candidate_paths(root: Path, season: str, gw_from: int, gw_to: int, zero_pad
     a, b = _fmt_gw(gw_from, zero_pad), _fmt_gw(gw_to, zero_pad)
     return [season_dir / f"GW{a}_{b}.csv", season_dir / f"GW{a}_{b}.parquet"]
 
+
 def _glob_fallback(root: Path, season: str, gw_from: int, gw_to: int) -> Optional[Path]:
     season_dir = root / str(season)
     if not season_dir.exists():
@@ -111,6 +112,7 @@ def _glob_fallback(root: Path, season: str, gw_from: int, gw_to: int) -> Optiona
             except Exception:
                 continue
     return None
+
 
 def _resolve_preds_path(explicit: Optional[str | Path],
                         root: Optional[str | Path],
@@ -153,8 +155,10 @@ def _write_dual(df: pd.DataFrame, paths: List[Path]) -> List[str]:
     for p in paths:
         if p.suffix.lower() == ".csv":
             tmp = df.copy()
-            if "date_sched" in tmp.columns and pd.api.types.is_datetime64_any_dtype(tmp["date_sched"]):
-                tmp["date_sched"] = pd.to_datetime(tmp["date_sched"], errors="coerce").dt.strftime("%Y-%m-%d")
+            # stringify dates for human CSVs, keep date-only
+            for c in ("date_sched", "date_played", "kickoff_time"):
+                if c in tmp.columns and pd.api.types.is_datetime64_any_dtype(tmp[c]):
+                    tmp[c] = pd.to_datetime(tmp[c], errors="coerce").dt.strftime("%Y-%m-%d")
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp.to_csv(p, index=False)
             written.append(str(p))
@@ -181,8 +185,13 @@ def _update_consolidated(new_df: pd.DataFrame, out_dir: Path) -> List[str]:
     cons_csv = out_dir / "optimizer_input.csv"
     cons_parq = out_dir / "optimizer_input.parquet"
 
+    # Read old with proper date parsing to avoid object-mix
+    parse_dates = ["date_sched", "date_played", "kickoff_time"]
     if cons_csv.exists():
-        old = pd.read_csv(cons_csv, low_memory=False)
+        try:
+            old = pd.read_csv(cons_csv, low_memory=False, parse_dates=[c for c in parse_dates if c in pd.read_csv(cons_csv, nrows=0).columns])
+        except Exception:
+            old = pd.read_csv(cons_csv, low_memory=False)
     else:
         old = pd.DataFrame(columns=new_df.columns)
 
@@ -200,6 +209,32 @@ def _update_consolidated(new_df: pd.DataFrame, out_dir: Path) -> List[str]:
     old_mark = old.merge(key_df.assign(__hit__=1), on=KEY_FOR_STACK, how="left")
     old_kept = old_mark[old_mark["__hit__"].isna()].drop(columns="__hit__")
     merged = pd.concat([old_kept, new], ignore_index=True, sort=False)
+
+    # ---- Normalize & coerce dtypes for parquet stability ----
+    # Force temporal cols to tz-naive datetime64[ns], date-only
+    def _norm_dates_inplace(df: pd.DataFrame):
+        for c in ("date_sched", "date_played", "kickoff_time"):
+            if c in df.columns:
+                s = pd.to_datetime(df[c], errors="coerce")
+                try:
+                    if getattr(s.dt, "tz", None) is not None:
+                        s = s.dt.tz_localize(None)
+                except Exception:
+                    pass
+                df[c] = s.dt.normalize()
+    _norm_dates_inplace(merged)
+
+    # Make sure string-ish cols are not 'object'
+    for c in ["season", "player_id", "team_id", "pos", "team", "player",
+              "opponent", "opponent_id", "fbref_id", "game_id"]:
+        if c in merged.columns:
+            merged[c] = merged[c].astype("string")
+
+    # Booleans
+    if "is_home" in merged.columns:
+        merged["is_home"] = merged["is_home"].astype("boolean")
+    if "is_dgw" in merged.columns:
+        merged["is_dgw"] = merged["is_dgw"].astype("bool")
 
     # Sort for readability
     sort_cols = [c for c in ["season", "gw", "team_id", "player_id"] if c in merged.columns]
@@ -220,6 +255,7 @@ def _update_consolidated(new_df: pd.DataFrame, out_dir: Path) -> List[str]:
         written.append(str(cons_parq))
     return written
 
+
 # ===============================
 # Validation & Dtypes
 # ===============================
@@ -232,25 +268,41 @@ def _normalize_pos(s: pd.Series) -> pd.Series:
         raise ValueError(f"Unexpected pos values: {sorted(mapped[bad].dropna().unique().tolist())}")
     return mapped
 
+def _normalize_date_only_inplace(df: pd.DataFrame, cols: Tuple[str, ...] = ("date_sched", "date_played", "kickoff_time")) -> None:
+    """Coerce columns to tz-naive datetime64[ns] and normalize to date-only (00:00:00)."""
+    for c in cols:
+        if c in df.columns:
+            s = pd.to_datetime(df[c], errors="coerce")
+            # if tz-aware, drop tz
+            try:
+                if getattr(s.dt, "tz", None) is not None:
+                    s = s.dt.tz_localize(None)
+            except Exception:
+                # Some pandas versions raise if already tz-naive; ignore
+                pass
+            df[c] = s.dt.normalize()
+
 def _coerce_output_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     # strings
     for c in ["season", "player_id", "team_id", "pos", "team"]:
-        df[c] = df[c].astype("string")
+        if c in df.columns:
+            df[c] = df[c].astype("string")
     if "player" in df.columns:
         df["player"] = df["player"].astype("string")
-    for c in ["opponent","opponent_id","fbref_id","game_id"]:
+    for c in ["opponent", "opponent_id", "fbref_id", "game_id"]:
         if c in df.columns:
             df[c] = df[c].astype("string")
     if "is_home" in df.columns:
         df["is_home"] = df["is_home"].astype("boolean")
 
-    for c in ("date_sched","date_played","kickoff_time"):
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
+    # datetimes → tz-naive, date-only
+    _normalize_date_only_inplace(df, ("date_sched", "date_played", "kickoff_time"))
 
     # ints / bools
-    df["gw"] = pd.to_numeric(df["gw"], downcast="integer").astype("int64")
-    df["is_dgw"] = df["is_dgw"].astype("bool")
+    if "gw" in df.columns:
+        df["gw"] = pd.to_numeric(df["gw"], downcast="integer").astype("int64")
+    if "is_dgw" in df.columns:
+        df["is_dgw"] = df["is_dgw"].astype("bool")
 
     # floats
     for c in ["price", "sell_price", "p60", "xPts", "exp_pts_var", "cs_prob", "captain_uplift", "fdr"]:
@@ -287,7 +339,7 @@ def _load_team_state(path: str) -> dict:
         return json.load(f)
 
 def _owned_sell_map(team_state: dict) -> Dict[str, float]:
-    return {e["player_id"]: float(e["sell_price"]) for e in team_state.get("squad", [])}
+    return {str(e["player_id"]): float(e["sell_price"]) for e in team_state.get("squad", [])}
 
 def _load_master(master_path: Optional[str]) -> Optional[dict]:
     if not master_path:
@@ -382,6 +434,7 @@ def _combine_prod_compl_one_minus(series: pd.Series) -> float:
 
 def _aggregate_player_gw(df: pd.DataFrame) -> pd.DataFrame:
     keys = ["season", "gw", "player_id"]
+
     def agg_fn(g: pd.DataFrame) -> pd.Series:
         out = {
             "team_id": g["team_id"].iloc[0],
@@ -395,10 +448,11 @@ def _aggregate_player_gw(df: pd.DataFrame) -> pd.DataFrame:
         # fdr: mean across legs if present
         if "fdr" in g.columns:
             out["fdr"] = pd.to_numeric(g["fdr"], errors="coerce").mean()
-        for c in ["team_code","player",*LEGACY_META_COLS]:
+        for c in ["team_code", "player", *LEGACY_META_COLS]:
             if c in g.columns and c != "fdr":  # avoid overwriting aggregated fdr
                 out[c] = g[c].iloc[0]
         return pd.Series(out)
+
     agg = df.groupby(keys, as_index=False).apply(agg_fn)
     if isinstance(agg.columns, pd.MultiIndex):
         agg.columns = [c[0] if c[0] else c[1] for c in agg.columns]
@@ -441,11 +495,11 @@ def _load_team_code_map(path: Optional[str]) -> Dict[str, str]:
         for item in obj:
             if not isinstance(item, dict):
                 continue
-        tid = item.get("team_id") or item.get("id")
-        code = item.get("code") or item.get("fpl_code") or item.get("short_name") or item.get("name")
-        code = _maybe_code_from_name(code)
-        if tid and code:
-            by_id[str(tid)] = code
+            tid = item.get("team_id") or item.get("id")
+            code = item.get("code") or item.get("fpl_code") or item.get("short_name") or item.get("name")
+            code = _maybe_code_from_name(code)
+            if tid and code:
+                by_id[str(tid)] = code
     return {k: v.upper() for k, v in by_id.items()}
 
 def _resolve_team(
@@ -476,7 +530,7 @@ def _resolve_team(
             bad = df.loc[codes.isna(), ["team_id"]].drop_duplicates().head(20)
             raise ValueError(f"Missing team code for some team_ids (strict). Examples:\n{bad}")
         return codes.fillna(df["team_id"].astype("string").str.upper().str[:3])
-    mapped = df["team_id"].astype("string").map(lambda tid: by_id.get(str(tid))) if by_id else pd.Series([pd.NA]*len(df), dtype="string")
+    mapped = df["team_id"].astype("string").map(lambda tid: by_id.get(str(tid))) if by_id else pd.Series([pd.NA] * len(df), dtype="string")
     if strict and mapped.isna().any():
         bad = df.loc[mapped.isna(), ["team_id"]].drop_duplicates()
         if missing_out:
@@ -529,6 +583,7 @@ def _ensure_player_names(df: pd.DataFrame, master: Optional[dict]) -> pd.DataFra
     if master is None:
         df["player"] = pd.NA
         return df
+
     def _get_name(pid: str) -> Optional[str]:
         entry = master.get(str(pid))
         if not entry:
@@ -539,6 +594,7 @@ def _ensure_player_names(df: pd.DataFrame, master: Optional[dict]) -> pd.DataFra
         second = str(entry.get("second_name") or "").strip()
         full = (first + " " + second).strip()
         return full or None
+
     df["player"] = df["player_id"].astype("string").map(_get_name)
     return df
 
@@ -582,6 +638,7 @@ def build_optimizer_input(
     out_dir = Path(out_dir)
     ts = _load_team_state(team_state_path)
     own_sell = _owned_sell_map(ts)
+
     df = _read_any(preds_path)
 
     # Trim columns
@@ -639,14 +696,19 @@ def build_optimizer_input(
     master = _load_master(master_path)
     df = _ensure_player_names(df, master)
 
+    # ----- Normalize temporal columns now (tz-naive, date-only) -----
+    _normalize_date_only_inplace(df, ("date_sched", "date_played", "kickoff_time"))
+
     # prices from master
     season_short = _to_short_season(str(df["season"].iloc[0]))
+
     def _price_lookup(row) -> Optional[float]:
         m = master.get(str(row["player_id"]))
         if not m:
             return None
         gw = int(price_gw if price_gw is not None else row["gw"])
         return _price_from_master(m, season_short, gw)
+
     price_series = pd.to_numeric(df.apply(_price_lookup, axis=1), errors="coerce")
     missing_mask = price_series.isna()
     if missing_mask.any():
@@ -658,10 +720,10 @@ def build_optimizer_input(
             price_series.loc[missing_mask] = pd.to_numeric(fills, errors="coerce")
         elif on_missing_price == "use_preds":
             preds_price = None
-            for col in ["price","now_price","current_price","now_cost","cost"]:
+            for col in ["price", "now_price", "current_price", "now_cost", "cost"]:
                 if col in df.columns:
                     s = pd.to_numeric(df[col], errors="coerce")
-                    if col in {"now_cost","cost"}:
+                    if col in {"now_cost", "cost"}:
                         s = s / 10.0
                     if not s.isna().any():
                         preds_price = s
@@ -669,13 +731,13 @@ def build_optimizer_input(
             if preds_price is None:
                 raise ValueError("on-missing-price=use_preds, but no usable price column present in predictions.")
             price_series.loc[missing_mask] = preds_price.loc[missing_mask]
-        elif on_missing_price in {"drop","error"}:
+        elif on_missing_price in {"drop", "error"}:
             pass
         else:
             raise ValueError("Unknown --on-missing-price policy")
 
         if missing_mask.any() and missing_price_out:
-            review_cols = [c for c in ["season","gw","player_id","player","team_id","pos","xPts","cs_prob","p60"] if c in df.columns]
+            review_cols = [c for c in ["season", "gw", "player_id", "player", "team_id", "pos", "xPts", "cs_prob", "p60"] if c in df.columns]
             review = df.loc[missing_mask, review_cols].copy()
             review["price_lookup_gw"] = int(price_gw) if price_gw is not None else df.loc[missing_mask, "gw"]
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -691,7 +753,7 @@ def build_optimizer_input(
 
     # sell_price
     if strict_owned_sell:
-        df["sell_price"] = df.apply(lambda r: _owned_sell_map(ts).get(str(r["player_id"]), r["price"]), axis=1)
+        df["sell_price"] = df["player_id"].astype("string").map(own_sell).fillna(df["price"]).astype(float)
     else:
         df["sell_price"] = df["price"]
 
@@ -740,7 +802,7 @@ def build_optimizer_input(
     # ----- Write GW-windowed + consolidated -----
     gw_series = pd.to_numeric(output_df["gw"], errors="coerce").dropna().astype(int)
     gw_from_eff = int(gw_series.min()) if len(gw_series) else 0
-    gw_to_eff   = int(gw_series.max()) if len(gw_series) else 0
+    gw_to_eff = int(gw_series.max()) if len(gw_series) else 0
     season_for_paths = future_season or str(output_df["season"].iloc[0])
 
     window_paths = _out_paths(out_dir, season_for_paths, gw_from_eff, gw_to_eff, zero_pad_filenames)
@@ -783,7 +845,7 @@ def main():
     # prices
     ap.add_argument("--master", required=True)
     ap.add_argument("--price-gw", type=int)
-    ap.add_argument("--on-missing-price", choices=["error","use_earliest_in_season","use_preds","drop"], default="error")
+    ap.add_argument("--on-missing-price", choices=["error", "use_earliest_in_season", "use_preds", "drop"], default="error")
     ap.add_argument("--missing-price-out")
     # misc
     ap.add_argument("--drop-rows-missing-core", action="store_true")

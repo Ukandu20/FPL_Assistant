@@ -22,19 +22,11 @@ Highlights
 
 New in this version
 -------------------
-• Folder naming (seasonized):
-  - <out_dir>/<season>/multi/hold/gw{start}-gw{end}/base/K{K}/plan.json
-  - <out_dir>/<season>/multi/hold/gw{start}-gw{end}/chips/<CHIP>/gw{g}/K{K}/plan.json
-• Output schema mirrors single_gw:
-  - No is_home in outputs; use venue 'H'/'A'/null.
-  - fdr emitted as int|null.
-  - transfers: {out:[...], in:[...], pairs_min:[...]} and still written to transfers.json.
-  - bench per-GW mirrors single_gw: {"order":[p1,p2,p3], "gk": {...}}.
-  - xi_by_pos provided per GW; meta.team_summary added (squad + start-GW XI).
-• Error out if --only-chip-gw includes any GW outside the horizon.
-• GK captaincy is **forbidden** (both normal and TC).
-• Vice-captain per GW (like single_gw) and --report md output for each variant folder.
-• Robust C/VC: after XI repair, rebase captain & vice onto the final XI (no GK).
+• Unavailable players (from team_state["unavailable"], DOUBTFUL is allowed):
+  - Cannot be selected to start, bench, FH temp 15 or FH XI; cannot be bought.
+  - Optional WC rule: --wc-force-sell-unavailable forces selling owned unavailable players.
+• Players with no future rows across the horizon are softly prioritized for replacement via --replace-priority-w.
+• Folder naming (seasonized) + reporting, unchanged.
 """
 
 from __future__ import annotations
@@ -219,6 +211,8 @@ def solve_hold_horizon(
     mip_gap: Optional[float],
     threads: Optional[int],
     verbose: bool,
+    replace_priority_w: float = 0.0,               # soft nudge for players lacking future rows
+    wc_force_sell_unavailable: bool = False,       # optional WC hard sell rule
 ) -> dict:
     # ---- Load state ----
     with open(team_state_path, "r", encoding="utf-8") as f:
@@ -231,6 +225,28 @@ def solve_hold_horizon(
     owned_ids0: Set[str] = {str(p["player_id"]) for p in owned0}
     sell_map0: Dict[str, float] = {
         str(p["player_id"]): float(p.get("sell_price", p.get("price", 0.0))) for p in owned0
+    }
+
+    # ---- Unavailable (derive active set; DOUBTFUL allowed) ----
+    raw_unav = state.get("unavailable") or []
+    def _active_unavailable(entry: dict, curr_gw: int) -> bool:
+        status = str(entry.get("status","")).upper()
+        if status == "DOUBTFUL":
+            return False
+        until_gw = entry.get("until_gw")
+        if until_gw is not None and curr_gw > int(until_gw):
+            return False
+        mr = entry.get("matches_remaining")
+        if mr is not None and int(mr) <= 0:
+            return False
+        # reason TRANSFERRED means definitely unavailable too
+        reason = str(entry.get("reason","")).upper()
+        if reason == "TRANSFERRED":
+            return True
+        return True
+
+    active_unavailable_ids: Set[str] = {
+        str(e.get("player_id")) for e in raw_unav if _active_unavailable(e, snapshot_gw)
     }
 
     # ---- Load data ----
@@ -347,6 +363,20 @@ def solve_hold_horizon(
             m += sell0[i] == 0
             m += in_squad[i] == buy0[i]
 
+    # Never buy actively unavailable players
+    unav_idx = set()
+    for p in active_unavailable_ids:
+        if p in pid_index:
+            unav_idx.add(pid_index[p])
+    for i in unav_idx:
+        m += buy0[i] == 0
+
+    # Optional WC: force-sell any owned unavailable players
+    if chip == "WC" and wc_force_sell_unavailable:
+        for i in unav_idx:
+            if owned_prev[i] == 1:
+                m += in_squad[i] == 0  # forces sell0[i] == 1 by transition
+
     # ----- Budget & hits (WC special) -----
     transfers_cnt0 = pulp.lpSum(buy0[i] for i in range(P))
     if chip == "WC":
@@ -412,6 +442,15 @@ def solve_hold_horizon(
         MID_min, MID_max = 3,5
         FWD_min, FWD_max = 1,3
 
+    # Soft replacement nudge (players lacking rows later)
+    # Build a mask of "has_missing_future" per player
+    has_future = {i: False for i in range(P)}
+    later_gws = set(gw_list[1:])
+    for i in range(P):
+        pid_i = pid[i]
+        if df_all[(df_all["player_id"].astype(str) == pid_i) & (df_all["gw"].isin(later_gws))].shape[0] > 0:
+            has_future[i] = True
+
     for t in range(G):
         for i in range(P):
             m += start[(t,i)] <= in_squad[i]
@@ -450,6 +489,12 @@ def solve_hold_horizon(
                 m += cap_n[(t,i)]  == 0
                 m += vice[(t,i)]   == 0
 
+        # Ineligibility: starters & bench cannot use unavailable players
+        for i in unav_idx:
+            m += start[(t,i)] == 0
+            for r in [1,2,3]:
+                m += bench[r][(t,i)] == 0
+
         # FH week support (temporary squad/XI)
         is_fh = (chip == "FH" and gw_list[t] == int(chip_gw or -1))
         if is_fh:
@@ -472,7 +517,7 @@ def solve_hold_horizon(
             for i in range(P):
                 m += tmp_sta[(t,i)] <= tmp_in[(t,i)]
 
-            # FH captains/vice: also forbid GK; exactly one captain and one vice; not equal
+            # FH captains/vice: forbid GK; exactly one captain and one vice; not equal
             m += pulp.lpSum(tmp_capt[(t,i)] for i in range(P)) + pulp.lpSum(tmp_capn[(t,i)] for i in range(P)) == 1
             m += pulp.lpSum(tmp_vice[(t,i)] for i in range(P)) == 1
             for i in range(P):
@@ -485,6 +530,14 @@ def solve_hold_horizon(
                     m += tmp_capn[(t,i)] == 0
                     m += tmp_vice[(t,i)] == 0
 
+            # FH must also respect unavailability (no tmp_in/tmp_sta for them)
+            for i in unav_idx:
+                m += tmp_in[(t,i)] == 0
+                m += tmp_sta[(t,i)] == 0
+                m += tmp_capn[(t,i)] == 0
+                m += tmp_capt[(t,i)] == 0
+                m += tmp_vice[(t,i)] == 0
+
     # ----- Locks & bans -----
     for pid_locked in lock_ids:
         if pid_locked in pid_index:
@@ -495,7 +548,12 @@ def solve_hold_horizon(
             i = pid_index[pid_banned]
             m += in_squad[i] == 0
             for t in range(G):
+                # also zero FH if relevant
+                m += start[(t,i)] == 0
+                for r in [1,2,3]:
+                    m += bench[r][(t,i)] == 0
                 m += tmp_in[(t,i)] == 0
+                m += tmp_sta[(t,i)] == 0
 
     # ----- Objective -----
     obj = 0
@@ -522,6 +580,12 @@ def solve_hold_horizon(
         else:
             ev_term = all15ev if is_bb else xi_ev
             obj += ev_term + (upl_tc if is_tc else upl_n) - float(risk_lambda) * xi_var - EPS_BENCH * bench_ev
+
+        # soft nudge to avoid keeping players with no future rows (reward selling at t=0)
+        # implemented by subtracting small weight on keeping such players
+    if replace_priority_w > 0.0:
+        # penalize owning (in_squad) such players
+        obj -= float(replace_priority_w) * pulp.lpSum(in_squad[i] * (0 if has_future[i] else 1) for i in range(P))
 
     if chip != "WC":
         obj -= HIT_COST * hits0
@@ -575,6 +639,9 @@ def solve_hold_horizon(
             avail = [i for i in range(P) if (pulp.value(tmp_in[(t,i)]) or 0) > 0.5]
         else:
             avail = [i for i in range(P) if (pulp.value(in_squad[i]) or 0) > 0.5]
+        # remove unavailable from avail, just in case
+        avail = [i for i in avail if i not in unav_idx]
+
         gks = sorted([i for i in avail if pos_arr[i]=="GK"], key=lambda i: -ev[t,i])
         if not gks: return raw[:11] if len(raw)>=11 else raw
         base = [gks[0]]
@@ -685,7 +752,7 @@ def solve_hold_horizon(
                     picked = i; break
             if picked is not None:
                 picked_rank.append(picked)
-        remaining = [i for i in outfield_nonstar if i not in picked_rank]
+        remaining = [i for i in outfield_nonstar if i not in picked_rank and i not in unav_idx]
         remaining_sorted = sorted(remaining, key=lambda i: -ev[t,i])
         while len(picked_rank) < 3 and remaining_sorted:
             picked_rank.append(remaining_sorted.pop(0))
@@ -825,6 +892,7 @@ def solve_hold_horizon(
                 "exact_transfers": (None if exact_transfers is None else int(exact_transfers)),
             },
             "bank_before": _round1(bank0),
+            "active_unavailable_ids": sorted(list(active_unavailable_ids)),
         },
         "objective": {
             "per_gw": per_gw,
@@ -850,7 +918,7 @@ def solve_hold_horizon(
             "XI is exactly 11 and obeys FPL formation bounds.",
             "Bench: outfield ranks are mirrored as an ordered list; GK bench is separate.",
             "GK captaincy is forbidden by constraint.",
-            "Player objects expose opponent and venue ('H'/'A'); no is_home field in output.",
+            "Unavailable players cannot be selected, benched, or bought; DOUBTFUL stays eligible.",
         ],
     }
     return out
@@ -869,6 +937,8 @@ def _render_md_report(plan: dict) -> str:
     lines.append("")
     lines.append(f"- Season: **{meta.get('season','')}**  | Snapshot GW: **{meta.get('snapshot_gw','?')}**")
     lines.append(f"- Bank before: **{meta.get('bank_before',0)}**")
+    if meta.get("active_unavailable_ids"):
+        lines.append(f"- Active unavailable: {', '.join(meta['active_unavailable_ids'])}")
     lines.append("")
     lines.append(f"## Objective")
     lines.append(f"- Total EV (sum): **{obj.get('ev')}**")
@@ -933,7 +1003,9 @@ def run_sweep_hold(
     skip_chips: bool = False,
     only_chip: Optional[str] = None,             # "WC" | "FH" | "TC" | "BB"
     only_chip_gws: Optional[List[int]] = None,   # applies to FH/TC/BB within horizon
-    report_fmt: Optional[str] = None             # "md" | None
+    report_fmt: Optional[str] = None,            # "md" | None
+    replace_priority_w: float = 0.0,
+    wc_force_sell_unavailable: bool = False,
 ) -> Dict[str,str]:
     with open(team_state, "r", encoding="utf-8") as f:
         state = json.load(f)
@@ -1002,14 +1074,16 @@ def run_sweep_hold(
             mip_gap=mip_gap,
             threads=threads,
             verbose=verbose,
+            replace_priority_w=replace_priority_w,
+            wc_force_sell_unavailable=wc_force_sell_unavailable,
         )
         _write_variant(os.path.join(base_root, f"K{K}"), plan, f"BASE_K{K}")
 
     # CHIPS
     if not skip_chips:
         chips = ["WC","FH","TC","BB"] if not only_chip else [only_chip]
-        for chip in chips:
-            if chip == "WC":
+        for chip_name in chips:
+            if chip_name == "WC":
                 for K in ks:
                     plan = solve_hold_horizon(
                         team_state_path=team_state, optimizer_input_path=optimizer_input,
@@ -1020,6 +1094,8 @@ def run_sweep_hold(
                         max_from_team=max_from_team, forced_formation=formation,
                         chip="WC", chip_gw=gw_start,
                         time_limit=time_limit, mip_gap=mip_gap, threads=threads, verbose=verbose,
+                        replace_priority_w=replace_priority_w,
+                        wc_force_sell_unavailable=wc_force_sell_unavailable,
                     )
                     _write_variant(os.path.join(chips_root, "WC", f"gw{gw_start}", f"K{K}"), plan, f"WC_K{K}")
             else:
@@ -1033,11 +1109,13 @@ def run_sweep_hold(
                             allow_hits=allow_hits, max_extra_transfers=max_extra_transfers,
                             exact_transfers=K, lock_ids=lock_ids, ban_ids=ban_ids,
                             max_from_team=max_from_team, forced_formation=formation,
-                            chip=chip, chip_gw=g,
+                            chip=chip_name, chip_gw=g,
                             time_limit=time_limit, mip_gap=mip_gap, threads=threads, verbose=verbose,
+                            replace_priority_w=replace_priority_w,
+                            wc_force_sell_unavailable=wc_force_sell_unavailable,
                         )
-                        _write_variant(os.path.join(chips_root, chip, f"gw{g}", f"K{K}"),
-                                       plan, f"{chip}_GW{g}_K{K}")
+                        _write_variant(os.path.join(chips_root, chip_name, f"gw{g}", f"K{K}"),
+                                       plan, f"{chip_name}_GW{g}_K{K}")
 
     return written
 
@@ -1084,6 +1162,13 @@ def main():
     ap.add_argument("--only-chip", choices=["WC","FH","TC","BB"], help="Run only this chip variant")
     ap.add_argument("--only-chip-gw", help="Comma-separated GW(s) for FH/TC/BB (must be inside horizon)")
 
+    # Quality-of-life
+    ap.add_argument("--replace-priority-w", type=float, default=0.0,
+                    help="Soft penalty on owning players with no future rows in the horizon (nudges selling them)")
+
+    ap.add_argument("--wc-force-sell-unavailable", action="store_true",
+                    help="On WC, force-sell any actively unavailable owned players")
+
     # Report
     ap.add_argument("--report", choices=["md"], help="Emit a shareable report file per variant (report.md)")
 
@@ -1124,6 +1209,8 @@ def main():
         only_chip=(args.only_chip or None),
         only_chip_gws=only_chip_gws,
         report_fmt=(args.report or None),
+        replace_priority_w=float(args.replace_priority_w),
+        wc_force_sell_unavailable=bool(args.wc_force_sell_unavailable),
     )
     print(json.dumps(written, indent=2))
 

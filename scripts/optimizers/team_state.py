@@ -80,6 +80,79 @@ class SquadEntry(BaseModel):
             raise ValueError(f"team (short code) must be 2–4 letters (e.g., 'MCI'), got '{v}'.")
         return v
 
+# -------- Unavailability --------
+UNAVAIL_REASONS = Literal[
+    "INJURY", "SUSPENSION", "AFCON", "NATIONS_CUP", "PERSONAL", "REST", "TRANSFERRING", "TRANSFERRED", "UNKNOWN"
+]
+UNAVAIL_STATUS = Literal[
+    "OUT", "SUSPENDED", "DOUBTFUL", "RESTED", "UNKNOWN"
+]
+
+class UnavailableEntry(BaseModel):
+    """
+    A record indicating the player is (or was) unavailable.
+    - DOUBTFUL status is treated as *available* unless otherwise changed.
+    - TRANSFERRED reason is treated as unavailable until you clear it.
+    - matches_remaining is a simple GW-based counter (decrements when GW increases).
+    """
+    player_id: str
+    reason: UNAVAIL_REASONS = "UNKNOWN"
+    status: UNAVAIL_STATUS = "OUT"
+    detail: Optional[str] = None
+    source: Optional[str] = None
+
+    added_gw: int = Field(ge=1)
+    last_accounted_gw: int = Field(ge=1)
+    until_gw: Optional[int] = Field(default=None, ge=1)
+    matches_remaining: Optional[int] = Field(default=None, ge=0)
+
+    active: bool = True  # remains in list even when False (audit)
+
+    @field_validator("player_id")
+    @classmethod
+    def _pid_ok(cls, v: str) -> str:
+        if not is_alnum_id(v):
+            raise ValueError("player_id must be canonical alphanumeric (not a team code).")
+        return v
+
+def _is_entry_active(entry: UnavailableEntry, curr_gw: int) -> bool:
+    """Active means: within window, matches_remaining not exhausted, and NOT 'DOUBTFUL'.
+       TRANSFERRED is always treated as unavailable (active) until you clear it."""
+    if entry.status == "DOUBTFUL":
+        return False
+    if entry.reason == "TRANSFERRED":
+        return True
+    if entry.until_gw is not None and curr_gw > entry.until_gw:
+        return False
+    if entry.matches_remaining is not None and entry.matches_remaining <= 0:
+        return False
+    return True
+
+def tick_unavailability(state: "TeamState", *, to_gw: Optional[int] = None) -> None:
+    """Advance suspension counters to current GW; recompute 'active'."""
+    curr = int(to_gw if to_gw is not None else state.gw)
+    changed = False
+    for i, e in enumerate(list(state.unavailable or [])):
+        delta = max(0, curr - e.last_accounted_gw)
+        if delta and e.matches_remaining is not None and e.matches_remaining > 0:
+            new_left = max(0, e.matches_remaining - delta)  # GW proxy for "matches"
+            if new_left != e.matches_remaining:
+                state.unavailable[i].matches_remaining = new_left
+                changed = True
+        if e.last_accounted_gw != curr:
+            state.unavailable[i].last_accounted_gw = curr
+            changed = True
+        new_active = _is_entry_active(state.unavailable[i], curr)
+        if state.unavailable[i].active != new_active:
+            state.unavailable[i].active = new_active
+            changed = True
+    if changed:
+        pass  # no-op; state mutated
+
+def active_unavailable_ids(state: "TeamState") -> List[str]:
+    tick_unavailability(state)
+    return [e.player_id for e in (state.unavailable or []) if e.active]
+
 class TeamState(BaseModel):
     # Season/GW pointers
     season: str
@@ -106,6 +179,7 @@ class TeamState(BaseModel):
 
     # Squad
     squad: List[SquadEntry]
+    unavailable: List[UnavailableEntry] = []
 
     @field_validator("squad")
     @classmethod
@@ -130,9 +204,11 @@ def dump_json(obj: dict, path: str | Path) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def load_team_state_strict(path: str | Path) -> TeamState:
-    """Strict load: validate immediately (no migration)."""
+    """Strict load: validate immediately (no migration), and tick unavailability."""
     js = load_json(path)
-    return TeamState.model_validate(js)
+    state = TeamState.model_validate(js)
+    tick_unavailability(state)
+    return state
 
 def save_team_state(state: TeamState, path: str | Path) -> None:
     js = json.loads(state.model_dump_json())
@@ -177,7 +253,7 @@ def load_team_state_relaxed(path: str | Path,
                             save_if_migrated: bool = True) -> TeamState:
     """
     Relaxed load: if auto_migrate and teams_map provided, rewrite legacy 'team_id' codes before validation.
-    Falls back to strict validation if nothing to migrate.
+    Falls back to strict validation if nothing to migrate. Also ticks unavailability.
     """
     js = load_json(path)
     code2id = load_teams_map(teams_map_path) if teams_map_path else None
@@ -189,7 +265,9 @@ def load_team_state_relaxed(path: str | Path,
             print(f"[team_state] Auto-migrated {changed} squad entr{'y' if changed==1 else 'ies'} (team_id codes -> canonical ids).")
 
     # Validate after (possible) migration
-    return TeamState.model_validate(js)
+    state = TeamState.model_validate(js)
+    tick_unavailability(state)
+    return state
 
 # =========================
 # Season / Position helpers
@@ -465,6 +543,7 @@ def prices_snapshot_at_gw(
         state.squad[i].sell_price = fpl_selling_price(p.buy_price, cp)
 
     state.gw = snapshot_gw
+    tick_unavailability(state, to_gw=state.gw)  # keep unavailability consistent
 
 # =========================
 # Value helpers
@@ -822,6 +901,11 @@ def fh_restore(state: TeamState) -> None:
 # CLI command impls
 # =========================
 
+def load_team_state_and_tick(path: str | Path) -> TeamState:
+    state = load_team_state_relaxed(path)
+    tick_unavailability(state)
+    return state
+
 def _cli_init(args):
     state = TeamState(
         season=args.season,
@@ -838,6 +922,7 @@ def _cli_init(args):
         fh_backup_bank=None,
         fh_backup_squad=None,
         squad=[],
+        unavailable=[],
     )
     save_team_state(state, args.out)
     print(f"Wrote {args.out}")
@@ -847,19 +932,20 @@ def _cli_show(args):
     print(state.model_dump_json(indent=2))
 
 def _cli_set_bank(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     state.bank = float(args.bank)
     save_team_state(state, args.path)
     print("OK")
 
 def _cli_set_gw(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     state.gw = int(args.gw)
+    tick_unavailability(state, to_gw=state.gw)  # UNAVAIL TICK
     save_team_state(state, args.path)
     print("OK")
 
 def _cli_set_chip(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     chip = args.chip
     value = args.value
     if chip not in state.chips.model_fields:
@@ -869,7 +955,7 @@ def _cli_set_chip(args):
     print("OK")
 
 def _cli_use_chip(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     chip = args.chip
     gw = int(args.gw or (state.gw + 1))
     state.chips_log.append(ChipUsage(gw=gw, chip=chip))
@@ -879,7 +965,7 @@ def _cli_use_chip(args):
     print("OK")
 
 def _cli_add_player(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     if any(p.player_id == args.player_id for p in state.squad):
         raise ValueError(f"player {args.player_id} already in squad")
     if len(state.squad) >= 15:
@@ -904,7 +990,7 @@ def _cli_add_player(args):
     print("OK")
 
 def _cli_remove_player(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     before = len(state.squad)
     state.squad = [p for p in state.squad if p.player_id != args.player_id]
     if len(state.squad) == before:
@@ -913,7 +999,7 @@ def _cli_remove_player(args):
     print("OK")
 
 def _cli_clear_squad(args):
-    state = load_team_state_strict(args.path)
+    state = load_team_state_and_tick(args.path)
     state.squad = []
     save_team_state(state, args.path)
     print("OK (squad cleared)")
@@ -1094,13 +1180,83 @@ def _cli_migrate_codes(args):
         sys.exit(2)
     print(f"OK (migrated {changed} entr{'y' if changed==1 else 'ies'}).")
 
+# ---------------- Unavailability CLI ----------------
+
+def _cli_unavail_add(args):
+    state = load_team_state_and_tick(args.path)
+    # update existing if present, else append
+    found = False
+    for i, e in enumerate(state.unavailable or []):
+        if e.player_id == args.player_id:
+            state.unavailable[i].reason = args.reason
+            state.unavailable[i].status = args.status
+            state.unavailable[i].detail = args.detail
+            state.unavailable[i].source = args.source
+            state.unavailable[i].until_gw = args.until_gw
+            state.unavailable[i].matches_remaining = args.matches
+            state.unavailable[i].last_accounted_gw = state.gw
+            found = True
+            break
+    if not found:
+        new = UnavailableEntry(
+            player_id=args.player_id,
+            reason=args.reason,
+            status=args.status,
+            detail=args.detail,
+            source=args.source,
+            added_gw=state.gw,
+            last_accounted_gw=state.gw,
+            until_gw=args.until_gw,
+            matches_remaining=args.matches,
+            active=True,
+        )
+        (state.unavailable or []).append(new)
+    tick_unavailability(state)
+    save_team_state(state, args.path)
+    print("OK (unavailable added/updated)")
+
+def _cli_unavail_set_until(args):
+    state = load_team_state_and_tick(args.path)
+    pid = args.player_id
+    found = False
+    for i, e in enumerate(state.unavailable or []):
+        if e.player_id == pid:
+            state.unavailable[i].until_gw = args.until_gw
+            found = True
+    if not found:
+        raise ValueError(f"{pid} not found in unavailable list")
+    tick_unavailability(state)
+    save_team_state(state, args.path)
+    print("OK (until_gw set)")
+
+def _cli_unavail_clear(args):
+    state = load_team_state_and_tick(args.path)
+    before = len(state.unavailable or [])
+    state.unavailable = [e for e in (state.unavailable or []) if e.player_id != args.player_id]
+    if len(state.unavailable) == before:
+        raise ValueError("player_id not in unavailable list")
+    save_team_state(state, args.path)
+    print("OK (unavailable entry removed)")
+
+def _cli_unavail_list(args):
+    state = load_team_state_and_tick(args.path)
+    tick_unavailability(state)
+    js = [json.loads(e.model_dump_json()) for e in (state.unavailable or [])]
+    print(json.dumps(js, indent=2, ensure_ascii=False))
+
+def _cli_unavail_tick(args):
+    state = load_team_state_and_tick(args.path)
+    tick_unavailability(state)
+    save_team_state(state, args.path)
+    print("OK (unavailability ticked)")
+
 # =========================
 # Parser
 # =========================
 
 def _build_parser():
     ap = argparse.ArgumentParser(
-        description="Manage team state (master integration, snapshots, transactions, composition checks, FH backup, legacy migration)"
+        description="Manage team state (master integration, snapshots, transactions, composition checks, FH backup, legacy migration, unavailability)"
     )
     sub = ap.add_subparsers(required=True)
 
@@ -1277,7 +1433,42 @@ def _build_parser():
     p.add_argument("--validate", action="store_true", help="with --dry-run, also attempt validation after migration")
     p.set_defaults(func=_cli_migrate_codes)
 
+    # ---- Unavailability commands ----
+    p = sub.add_parser("unavail-add", help="add/update an unavailable record")
+    p.add_argument("path")
+    p.add_argument("--player-id", required=True)
+    p.add_argument("--reason", choices=list(UNAVAIL_REASONS.__args__), default="UNKNOWN")
+    p.add_argument("--status", choices=list(UNAVAIL_STATUS.__args__), default="OUT")
+    p.add_argument("--detail")
+    p.add_argument("--source")
+    p.add_argument("--until-gw", type=int)
+    p.add_argument("--matches", type=int)
+    p.set_defaults(func=_cli_unavail_add)
+
+    p = sub.add_parser("unavail-set-until", help="set until_gw for an unavailable record")
+    p.add_argument("path")
+    p.add_argument("--player-id", required=True)
+    p.add_argument("--until-gw", type=int, required=True)
+    p.set_defaults(func=_cli_unavail_set_until)
+
+    p = sub.add_parser("unavail-clear", help="remove an unavailable record")
+    p.add_argument("path")
+    p.add_argument("--player-id", required=True)
+    p.set_defaults(func=_cli_unavail_clear)
+
+    p = sub.add_parser("unavail-list", help="list all unavailable records (active flag auto-updated)")
+    p.add_argument("path")
+    p.set_defaults(func=_cli_unavail_list)
+
+    p = sub.add_parser("unavail-tick", help="recompute active flags vs current gw")
+    p.add_argument("path")
+    p.set_defaults(func=_cli_unavail_tick)
+
     return ap
+
+# =========================
+# Main
+# =========================
 
 def main():
     parser = _build_parser()

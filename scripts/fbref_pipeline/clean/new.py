@@ -3,18 +3,15 @@
 """
 csv_cleaner.py – ALL-IN-ONE cleaner (transfer-aware)
 
-Your latest requirements (implemented):
-1) Round filter:
-   - If `round` column exists: DROP rows where `round` does NOT contain "Matchweek" (case-insensitive).
+Adds (non-breaking):
+• Per-season team windows from player_match → registry JSON sets legacy `team`/`team_id` to the
+  *latest* team; emits `teams` array only if a player changed teams (A→B→…).
+• As-of filler for per-row CSVs: ONLY fills missing `team`/`team_id` using the windows; never overwrites.
+• Audit to catch any (player_id, date) rows that would claim >1 team_id.
 
-2) Season/League meta preference (strong override):
-   - In some preprocessed files the meta columns are like:
-       unnamed_level_<x>_season, unnamed_level_<x>_league
-     (and in other variants they may appear as level_1_season/level_1_league or unnamed_*_season/league)
-   - If ANY meta season/league column exists:
-       • DROP existing `season` and `league` columns (because you said they are not correct)
-       • RENAME the meta columns to `season` and `league`
-       • DROP leftover meta duplicates after promotion
+NEW:
+• Robust CSV header reading: tries 3-row header then falls back to 1-row header (prevents crash on single-header files)
+• --all-known-leagues (explicit) + --write-consolidated (write fbref/_all/... consolidated CSVs)
 """
 
 from __future__ import annotations
@@ -53,8 +50,6 @@ SEASON_PLAYER_JSON = "season_players.json"
 LOOKUP_PLAYER_JSON = "_id_lookup_players.json"
 LOOKUP_TEAM_JSON   = "_id_lookup_teams.json"
 
-KNOWN_FOLDERS = ("player_season", "player_match", "team_season", "team_match")
-
 lock = threading.Lock()
 
 
@@ -87,18 +82,6 @@ def strip_prefix(fname: str) -> str:
         if fname.startswith(pre):
             return fname[len(pre):]
     return fname
-
-def canonical_out_stem(path: Path) -> str:
-    """
-    Canonical output stem for both canonical-prefixed and raw season_/match_ filenames.
-    """
-    s = path.stem
-    s = strip_prefix(s)
-    if s.startswith("season_"):
-        return s[len("season_"):]
-    if s.startswith("match_"):
-        return s[len("match_"):]
-    return s
 
 def get_player_id(name: str, mp: dict) -> str:
     if not name:
@@ -155,24 +138,16 @@ def last_fpl_pos(pid: str, mp_global: dict, curr_season: str) -> Optional[str]:
     return rec["career"][latest]["position"]
 
 
-def ensure_front_columns(df: pd.DataFrame, front: tuple[str, ...] = ("league", "season")) -> pd.DataFrame:
-    """
-    Move requested columns to the front (in order) if they exist.
-    Keeps relative order of all other columns.
-    """
-    cols = list(df.columns)
-    front_cols = [c for c in front if c in cols]
-    rest = [c for c in cols if c not in front_cols]
-    return df[front_cols + rest]
-
-
-
 # ────────── relegation helper ──────────
 def _write_relegations(clean_dir: Path,
                        league: str,
                        season: str,
                        relegated: set[str],
                        fill_na_zero: bool = False):
+    """
+    Inject `is_relegated` into team_season, team_match, player_match,
+    and player_season for `season`.
+    """
     for folder in ("team_season", "team_match", "player_match", "player_season"):
         base = clean_dir / "fbref" / league / season / folder
         if not base.exists():
@@ -194,21 +169,9 @@ def _write_relegations(clean_dir: Path,
 
 # ────────── header helpers ──────────
 def normalize(col: str) -> str:
-    """
-    Normalize column labels:
-    - handles pandas "Unnamed: 12" and "Unnamed: 28_level_1_league"
-    - keeps existing behavior for typical cases
-    """
-    col = str(col)
-
-    # Convert "Unnamed: " prefix into something consistent
-    col = re.sub(r"(?i)^unnamed:\s*", "unnamed_", col)
-
-    # Lowercase + basic cleanup
-    col = col.lower()
+    col = re.sub(r"(?i)^unnamed(?:_\d+)?_", "", str(col)).lower()
     col = re.sub(r"[^a-z0-9_]+", "_", col)
-    col = re.sub(r"__+", "_", col).strip("_")
-    return col
+    return re.sub(r"__+", "_", col).strip("_")
 
 def flatten_header(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels == 1:
@@ -232,133 +195,16 @@ def flatten_header(df: pd.DataFrame) -> pd.DataFrame:
     flat.columns = names
     return flat.loc[:, ~flat.columns.duplicated()]
 
-def _pick_meta_col(cols: list[str], kind: str) -> Optional[str]:
-    """
-    Choose the best meta column for 'season' or 'league' with your stated preference:
-
-    Preference order (most preferred first):
-      1) unnamed_level_*_<kind>   (your preprocessed form)
-      2) level_1_<kind>           (common normalized form)
-      3) any col starting with 'unnamed' containing kind (catch-all)
-    """
-    kind = kind.lower().strip()
-
-    # 1) unnamed_level_*_<kind>
-    rx1 = re.compile(rf"^unnamed_level_\d+_{kind}$", re.I)
-    for c in cols:
-        if rx1.match(c):
-            return c
-
-    # 2) level_1_<kind>
-    c2 = f"level_1_{kind}"
-    for c in cols:
-        if c.lower() == c2:
-            return c
-
-    # 3) any unnamed* containing kind
-    for c in cols:
-        cl = c.lower()
-        if cl.startswith("unnamed") and (kind in cl):
-            return c
-
-    return None
-
-def enforce_meta_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enforce canonical season/league columns with strong preference for meta columns.
-
-    If meta exists:
-      - DROP existing 'season' and 'league' columns (wrong format per your requirement)
-      - RENAME meta -> 'season'/'league'
-      - DROP leftover meta columns afterwards
-    """
-    cols = list(df.columns)
-
-    meta_season = _pick_meta_col(cols, "season")
-    meta_league = _pick_meta_col(cols, "league")
-
-    has_meta = (meta_season in df.columns) or (meta_league in df.columns)
-    if not has_meta:
-        return df
-
-    # Drop wrong canonical columns (even if they exist)
-    drop_cols = []
-    if "season" in df.columns and meta_season and meta_season in df.columns:
-        drop_cols.append("season")
-    if "league" in df.columns and meta_league and meta_league in df.columns:
-        drop_cols.append("league")
-    if drop_cols:
-        df = df.drop(columns=drop_cols, errors="ignore")
-
-    # Promote meta -> canonical
-    rename_map = {}
-    if meta_season and meta_season in df.columns and meta_season != "season":
-        rename_map[meta_season] = "season"
-    if meta_league and meta_league in df.columns and meta_league != "league":
-        rename_map[meta_league] = "league"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Drop leftover meta duplicates after promotion
-    leftovers = []
-    for c in df.columns:
-        cl = str(c).lower()
-        if cl in ("season", "league"):
-            continue
-        if cl == "level_1_season" or cl == "level_1_league":
-            leftovers.append(c)
-        if cl.startswith("unnamed") and (("season" in cl) or ("league" in cl)):
-            leftovers.append(c)
-
-    if leftovers:
-        seen = set()
-        leftovers = [c for c in leftovers if not (c in seen or seen.add(c))]
-        df = df.drop(columns=leftovers, errors="ignore")
-
-    return df
-
 def folder_for(stem: str) -> str:
-    st = stem.lower()
-    if st.startswith("player_season_"):
+    if stem.startswith("player_season_"):
         return "player_season"
-    if st.startswith("player_match_"):
+    if stem.startswith("player_match_"):
         return "player_match"
-    if st.startswith("team_season_"):
+    if stem.startswith("team_season_"):
         return "team_season"
-    if st.startswith("team_match_"):
+    if stem.startswith("team_match_"):
         return "team_match"
-    # raw naming fallback
-    if st.startswith("season_"):
-        return "player_season"
-    if st.startswith("match_"):
-        return "player_match"
-    return "player_match"  # legacy fallback
-
-def infer_folder(path: Path) -> str:
-    parts = [p.lower() for p in path.parts]
-    parts_set = set(parts)
-
-    # canonical cleaned layout already? respect it
-    for f in KNOWN_FOLDERS:
-        if f in parts_set:
-            return f
-
-    # raw layout signals
-    if "player" in parts_set:
-        st = path.stem.lower()
-        if st.startswith("season_"):
-            return "player_season"
-        if st.startswith("match_"):
-            return "player_match"
-
-    if "team" in parts_set:
-        st = path.stem.lower()
-        if st.startswith("season_"):
-            return "team_season"
-        if st.startswith("match_"):
-            return "team_match"
-
-    return folder_for(path.stem)
+    return "player_match"
 
 def split_game_cols(df: pd.DataFrame, team_map: dict):
     parts = df["game"].astype(str).str.extract(GAME_RE.pattern)
@@ -374,13 +220,21 @@ def split_game_cols(df: pd.DataFrame, team_map: dict):
 
 
 def _safe_read_fbref_csv(path: Path, is_schedule: bool) -> pd.DataFrame:
+    """
+    FBref exports are inconsistent: many have 3 header rows (MultiIndex), but some have 1.
+    This tries MultiIndex headers first (when expected), then falls back to a single header row.
+
+    If a file is empty/broken, returns an empty df and logs (so a single bad file doesn't crash the run).
+    """
     try:
         if is_schedule:
             return pd.read_csv(path, header=0)
 
+        # Try 3-level header first
         try:
             return pd.read_csv(path, header=[0, 1, 2])
         except pd.errors.ParserError:
+            # Fallback to single header
             return pd.read_csv(path, header=0)
 
     except pd.errors.EmptyDataError:
@@ -423,6 +277,17 @@ def merge_team(master, season, league, tid, tname, pmap):
 
 # ────────── transfer windows + as-of fill + audit ──────────
 def _build_team_windows_from_cleaned_player_match(base_dir: Path) -> pd.DataFrame:
+    """
+    Reads cleaned player_match CSVs in <base_dir>/player_match/*.csv and returns spans:
+    [player_id, team, team_id, first_game(date), last_game(date)]
+
+    Robust behavior:
+    - Not all player_match CSVs have game_date.
+    - If game_date exists -> use it.
+    - Else if a 'date' column exists -> use it.
+    - Else if a 'game' column exists -> attempt regex extraction (YYYY-MM-DD ...)
+    - Else -> skip file.
+    """
     pm_dir = base_dir / "player_match"
     frames: list[pd.DataFrame] = []
 
@@ -436,18 +301,22 @@ def _build_team_windows_from_cleaned_player_match(base_dir: Path) -> pd.DataFram
         if df.empty:
             continue
 
-        need = {"player_id", "team", "team_id"}
-        if not need.issubset(df.columns):
+        # must have the IDs + team info to be useful
+        base_need = {"player_id", "team", "team_id"}
+        if not base_need.issubset(df.columns):
             continue
 
+        # determine a usable date column
         if "game_date" in df.columns:
             dt = pd.to_datetime(df["game_date"], errors="coerce")
         elif "date" in df.columns:
             dt = pd.to_datetime(df["date"], errors="coerce")
         elif "game" in df.columns:
+            # try to pull YYYY-MM-DD from the "game" string
             extracted = df["game"].astype(str).str.extract(r"(?P<d>\d{4}-\d{2}-\d{2})")["d"]
             dt = pd.to_datetime(extracted, errors="coerce")
         else:
+            # no usable date signal
             continue
 
         tmp = df[["player_id", "team", "team_id"]].copy()
@@ -477,6 +346,7 @@ def _build_team_windows_from_cleaned_player_match(base_dir: Path) -> pd.DataFram
     spans["first_game"] = spans["first_game"].dt.date
     spans["last_game"] = spans["last_game"].dt.date
     return spans
+
 
 def _choose_latest_team_row(spans_for_player: pd.DataFrame) -> pd.Series:
     g = spans_for_player.sort_values(["last_game", "first_game"], ascending=[False, False])
@@ -565,8 +435,7 @@ def clean_csv(
     pos_map,
     team_map,
     prev_team_codes: set[str] | None,
-    force: bool = False,
-    forced_sub: str | None = None,
+    force=False,
 ):
     stem = path.stem
     for pat, repl in rules:
@@ -574,16 +443,13 @@ def clean_csv(
             stem = pat.sub(repl, stem)
             break
 
-    sub = forced_sub or infer_folder(path)
-
-    out_name = canonical_out_stem(path) + ".csv"
-    out = clean_root / "fbref" / league / season / sub / out_name
-
+    out = clean_root / "fbref" / league / season / folder_for(stem) / f"{strip_prefix(stem)}.csv"
     if out.exists() and not force:
         return
 
     sched = path.stem.endswith("schedule")
 
+    # (Optional) helps debug weird files
     logging.debug("Reading: %s", path)
 
     df = _safe_read_fbref_csv(path, sched)
@@ -591,22 +457,7 @@ def clean_csv(
         return
 
     df = flatten_header(df)
-
-    # ✅ your preference: use unnamed_level_*_season/league (or variants) as canonical, drop wrong season/league
-    df = enforce_meta_columns(df)
-    df = ensure_front_columns(df, ("league", "season"))
-
-
-    # ✅ your check: drop rows where round doesn't contain Matchweek
-    if "round" in df.columns:
-        before = len(df)
-        mw = df["round"].astype(str).str.contains(r"(?i)\bmatchweek\b", na=False)
-        df = df.loc[mw].copy()
-        dropped = before - len(df)
-        if dropped:
-            logging.info("Dropped %d row(s) where round != Matchweek in %s", dropped, path.name)
-        if df.empty:
-            return
+    sub = folder_for(path.stem)
 
     # 1️⃣ map teams
     for col in df.columns:
@@ -713,7 +564,7 @@ def clean_csv(
 
         df["team_id"] = df.apply(row_tid, axis=1)
 
-    # promoted flag
+    # promoted flag (only if previous season team codes were provided)
     if "team" in df.columns and prev_team_codes is not None:
         df["is_promoted"] = df["team"].apply(
             lambda t: pd.NA if t == "" else int(t not in prev_team_codes)
@@ -747,13 +598,29 @@ def _consolidate_all_leagues(
     leagues: list[str],
     seasons: list[str],
     *,
-    out_league_name: str = "consolidate",
+    out_league_name: str = "_all",
     folders: tuple[str, ...] = ("player_match", "team_match", "player_season", "team_season"),
     add_source_paths: bool = False,
 ) -> None:
+    """
+    Write consolidated CSVs across leagues into:
+      clean_dir/fbref/<out_league_name>/<season>/<folder>/<file>.csv
+
+    Behavior rules:
+    - If a `league` column already exists in the file, keep it as-is (do NOT insert/overwrite).
+      Otherwise, add `league` = <league folder name>.
+    - If `unnamed_27_level_1_season` exists, rename it to `season`
+      (also supports normalized `level_1_season`).
+    - If `unnamed_28_level_1_league` exists, drop it
+      (also supports normalized `level_1_league`).
+    """
     if not leagues or not seasons:
         logging.warning("No leagues/seasons to consolidate.")
         return
+
+    # Column quirks to fix during consolidation (support both raw and normalized names)
+    SEASON_BAD_COLS = ("unnamed_27_level_1_season", "level_1_season")
+    LEAGUE_BAD_COLS = ("unnamed_28_level_1_league", "level_1_league")
 
     for season in seasons:
         for folder in folders:
@@ -786,38 +653,45 @@ def _consolidate_all_leagues(
                     if df.empty:
                         continue
 
-                    # ✅ enforce correct meta season/league
-                    df = enforce_meta_columns(df)
-                    df = ensure_front_columns(df, ("league", "season"))
+                    # 1) Rename the weird season column -> season (only if season doesn't already exist)
+                    if "season" not in df.columns:
+                        for c in SEASON_BAD_COLS:
+                            if c in df.columns:
+                                df = df.rename(columns={c: "season"})
+                                break
 
+                    # 2) Drop the weird league column if present
+                    drop_cols = [c for c in LEAGUE_BAD_COLS if c in df.columns]
+                    if drop_cols:
+                        df = df.drop(columns=drop_cols, errors="ignore")
 
-                    # fallback: if still missing, insert from loop context
+                    # 3) League handling: keep existing league col; otherwise add it
                     if "league" not in df.columns:
                         df.insert(0, "league", lg)
-                    if "season" not in df.columns:
-                        insert_at = 1 if "league" in df.columns else 0
-                        df.insert(insert_at, "season", season)
+                    # else: keep existing df["league"] untouched
 
-                    # optional provenance
-                    if add_source_paths and "source_file" not in df.columns:
-                        insert_at = 2 if {"league", "season"} <= set(df.columns) else 0
-                        df.insert(insert_at, "source_file", str(fp))
+                    # Optional provenance
+                    if add_source_paths:
+                        if "source_file" not in df.columns:
+                            df.insert(1 if "league" in df.columns else 0, "source_file", str(fp))
+                        else:
+                            # keep existing, but you might want to ensure it's correct
+                            pass
 
                     frames.append(df)
 
                 if not frames:
                     continue
 
-                out_df = pd.concat(frames, ignore_index=True, sort=False)
+                out = pd.concat(frames, ignore_index=True, sort=False)
                 out_fp = out_base / fname
-                out_df.to_csv(out_fp, index=False, na_rep="")
-
+                out.to_csv(out_fp, index=False, na_rep="")
 
 # ────────── orchestrator ──────────
 def main():
     ap = argparse.ArgumentParser()
 
-    mx = ap.add_mutually_exclusive_group(required=False)
+    mx = ap.add_mutually_exclusive_group()
     mx.add_argument("--league", help="Clean one league only (folder name under raw fbref root).")
     mx.add_argument("--all-known-leagues", action="store_true",
                     help="Clean all leagues found under raw fbref root (explicit).")
@@ -832,21 +706,20 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     ap.add_argument("--write-consolidated", action="store_true",
-                    help="Also write consolidated CSVs across leagues into fbref/consolidate/...")
+                    help="Also write consolidated CSVs across leagues into fbref/_all/<season>/...")
 
     args = ap.parse_args()
-
-    if not args.league and not args.all_known_leagues:
-        ap.error("You must pass either --league <name> or --all-known-leagues")
 
     logging.basicConfig(
         level=args.log_level.upper(), format="%(asctime)s %(levelname)s: %(message)s"
     )
 
+    # resolve raw root so both layouts work
     raw_root = args.raw_dir
     if (args.raw_dir / "fbref").exists():
         raw_root = args.raw_dir / "fbref"
 
+    # rules (fixes the syntax issue from your earlier snippet)
     rules = []
     if args.rules and args.rules.exists():
         raw_rules = json.loads(args.rules.read_text("utf-8"))
@@ -865,11 +738,15 @@ def main():
     processed_leagues: list[str] = []
     processed_seasons: set[str] = set()
 
+    # iterate leagues under resolved raw_root
     for league_dir in raw_root.iterdir():
         if not league_dir.is_dir():
             continue
         league = league_dir.name
 
+        # League filtering:
+        # - if --league is provided: only that league
+        # - else (including --all-known-leagues or no flag): all leagues
         if args.league and league != args.league:
             continue
 
@@ -882,6 +759,7 @@ def main():
         prev_team_codes: set[str] | None = None
         prev_season_name: str | None = None
 
+        # seasons are subfolders under league_dir
         for season_dir in sorted(league_dir.iterdir()):
             if not season_dir.is_dir():
                 continue
@@ -891,22 +769,16 @@ def main():
 
             processed_seasons.add(season)
 
+            # discover CSVs
             ps_files = [*season_dir.rglob("*player_season_*.csv")]
-
-            player_dir = season_dir / "player"
-            raw_player_season = []
-            if player_dir.exists() and player_dir.is_dir():
-                raw_player_season = [*player_dir.glob("season_*.csv")]
-
-            chosen_ps = sorted(set(ps_files) | set(raw_player_season))
-            other_files = [p for p in season_dir.rglob("*.csv") if p not in set(chosen_ps)]
+            other_files = [p for p in season_dir.rglob("*.csv") if p not in ps_files]
 
             logging.info(
-                "[%s %s] found %d player-season CSVs (+%d raw player/season_*), %d other CSVs",
-                league, season, len(ps_files), len(raw_player_season), len(other_files)
+                "[%s %s] found %d player-season CSVs, %d other CSVs",
+                league, season, len(ps_files), len(other_files)
             )
 
-            if not chosen_ps and not other_files:
+            if not ps_files and not other_files:
                 logging.warning("[%s %s] no CSVs found under %s", league, season, season_dir)
                 continue
 
@@ -915,6 +787,7 @@ def main():
             mapper = ThreadPoolExecutor(args.workers).map if args.workers > 1 else map
             prev_codes_for_clean = prev_team_codes if prev_team_codes is not None else None
 
+            # 1) player-season
             list(mapper(
                 lambda f: clean_csv(
                     f, season, league, args.clean_dir, rules,
@@ -922,11 +795,11 @@ def main():
                     season_players, season_teams, pos_counts,
                     pos_map, team_map, prev_codes_for_clean,
                     args.force,
-                    forced_sub="player_season",
                 ),
-                chosen_ps,
+                ps_files,
             ))
 
+            # 2) other files
             list(mapper(
                 lambda f: clean_csv(
                     f, season, league, args.clean_dir, rules,
@@ -934,11 +807,11 @@ def main():
                     season_players, season_teams, pos_counts,
                     pos_map, team_map, prev_codes_for_clean,
                     args.force,
-                    forced_sub=None,
                 ),
                 other_files,
             ))
 
+            # 3) majority vote positions
             for pid, rec in season_players.items():
                 raw = pos_counts[pid].most_common(1)[0][0] if pos_counts[pid] else rec["pri_position"]
                 rec["pri_position"] = raw
@@ -946,6 +819,7 @@ def main():
                 if last_fpl_pos(pid, mp_global, season) is None:
                     rec["fpl_pos"] = rec["position"]
 
+            # 4) sync positions + as-of fill + audit
             base_dir = args.clean_dir / "fbref" / league / season
             spans = _build_team_windows_from_cleaned_player_match(base_dir)
             asof_map = _build_asof_map(spans) if not spans.empty else {}
@@ -965,6 +839,7 @@ def main():
                 if asof_map:
                     _fill_team_asof_missing(fp, asof_map)
 
+            # 5) set latest team + windows in season_players, write JSONs
             if not spans.empty:
                 spans_map = {pid: g for pid, g in spans.groupby("player_id")}
                 for pid, rec in season_players.items():
@@ -994,6 +869,7 @@ def main():
             save_json(args.clean_dir / "fbref" / league / "registry" / LEAGUE_MP_JSON, mp_league)
             save_json(args.clean_dir / "fbref" / league / "registry" / LEAGUE_MT_JSON, mt_league)
 
+            # relegations
             curr_team_codes = {trec["name"] for trec in season_teams.values()}
             if prev_season_name is not None and prev_team_codes is not None:
                 relegated_prev = prev_team_codes - curr_team_codes
@@ -1007,20 +883,23 @@ def main():
             prev_team_codes = curr_team_codes
             prev_season_name = season
 
+        # finalize last season: zero-fill is_relegated for current season
         if prev_season_name is not None:
             logging.info("Zero-filling is_relegated for current season %s %s", league, prev_season_name)
             _write_relegations(args.clean_dir, league, prev_season_name, set(), fill_na_zero=True)
 
+    # save global registries
     save_json(args.clean_dir / "registry" / LOOKUP_PLAYER_JSON, mp_lookup)
     save_json(args.clean_dir / "registry" / LOOKUP_TEAM_JSON, mt_lookup)
     save_json(args.clean_dir / "registry" / MASTER_PLAYER_JSON, mp_global)
     save_json(args.clean_dir / "registry" / MASTER_TEAM_JSON, mt_global)
 
+    # consolidated outputs
     if args.write_consolidated:
         seasons_list = sorted(processed_seasons)
         leagues_list = processed_leagues
         logging.info(
-            "Writing consolidated CSVs for %d league(s) across %d season(s) into fbref/consolidate/...",
+            "Writing consolidated CSVs for %d league(s) across %d season(s) into fbref/_all/...",
             len(leagues_list), len(seasons_list)
         )
         _consolidate_all_leagues(args.clean_dir, leagues_list, seasons_list)
