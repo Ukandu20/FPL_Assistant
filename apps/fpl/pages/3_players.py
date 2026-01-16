@@ -423,21 +423,26 @@ with st.sidebar.popover("Positions"):
 
 #Matchweek Filter
 # GW slider bounds
-gw_min = int(merged["gw"].min())
-gw_max = int(merged["gw"].max())
+gw_series = merged["gw"].dropna()
+if gw_series.empty:
+    st.sidebar.warning("No gameweek data available.")
+    filtered_df = filtered_df.iloc[0:0]
+else:
+    gw_min = int(gw_series.min())
+    gw_max = int(gw_series.max())
 
-gw_start, gw_end = st.sidebar.slider(
-    "Gameweek range",
-    min_value=gw_min,
-    max_value=gw_max,
-    value=(gw_min, gw_max),
-    step=1
-)
+    gw_start, gw_end = st.sidebar.slider(
+        "Gameweek range",
+        min_value=gw_min,
+        max_value=gw_max,
+        value=(gw_min, gw_max),
+        step=1
+    )
 
-filtered_df = filtered_df[
-    (filtered_df["gw"] >= gw_start) &
-    (filtered_df["gw"] <= gw_end)
-]
+    filtered_df = filtered_df[
+        (filtered_df["gw"] >= gw_start) &
+        (filtered_df["gw"] <= gw_end)
+    ]
 
 #minutes Threshold Filter
 min_minutes = st.sidebar.number_input(
@@ -530,6 +535,10 @@ player_summary = totals_90s(
     group_cols=meta_data,    # your groupby keys
     count_cols=counts        # summed stats
 )
+
+if player_summary.empty:
+    st.warning("No matching players found. Adjust filters to see results.")
+    st.stop()
 
 player_summary["mins_90"] = (player_summary["min"] / 90).replace(0, np.nan)
 
@@ -724,8 +733,8 @@ with main:
                 text='Top 5 xG Overperformers & Underperformers',
                 x=0.3
                 ),
-            yaxis_title='Tackles & Interceptions',
-            xaxis_title='Recoveries',)   # ✅ optional: copy layout too
+            xaxis_title='Tackles & Interceptions',
+            yaxis_title='Recoveries',)   # ✅ optional: copy layout too
 
         st.plotly_chart(fig, use_container_width=True)
 
