@@ -508,6 +508,7 @@ def scrape_one(
     player_stats: Optional[List[str]] = None,
     team_stats: Optional[List[str]] = None,
     skip_existing: bool = False,
+    skip_schedule: bool = False,
 ) -> Dict[str, Any]:
     """
     Scrape one league+season into the raw FBref folder structure.
@@ -571,9 +572,9 @@ def scrape_one(
     latest_fixture_meta: Optional[Dict[str, Any]] = None
 
     reused_schedule = False
-    if skip_existing and _csv_exists(schedule_base):
+    if skip_existing and skip_schedule and _csv_exists(schedule_base) and args_skip_schedule:
         log.info(
-            "Reusing existing schedule CSV for %s %s (--skip-existing).",
+            "Reusing existing schedule CSV for %s %s (--skip-existing + --skip-schedule).",
             league,
             season_str,
         )
@@ -587,6 +588,7 @@ def scrape_one(
                 league,
                 season_str,
             )
+
 
     if not reused_schedule:
         log.info("Scraping schedule for %s %s", league, season_str)
@@ -1013,6 +1015,15 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--skip-schedule",
+        action="store_true",
+        help=(
+            "If set, and a schedule CSV already exists, reuse it instead of scraping schedule. "
+            "By default schedule is scraped every run."
+        ),
+    )
+
+    p.add_argument(
         "--rerun-failed",
         action="store_true",
         help=(
@@ -1131,6 +1142,7 @@ def main() -> None:
                 player_stats=args.player_stats,
                 team_stats=args.team_stats,
                 skip_existing=args.skip_existing,
+                skip_schedule=args.skip_schedule,
             )
 
             job = ScrapeJobId(

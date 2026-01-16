@@ -384,7 +384,10 @@ def scrape_one(
     # new:
     player_stats: Optional[List[str]] = None,
     team_stats: Optional[List[str]] = None,
-    skip_existing: bool = False,
+    skip_existing_player: bool = False,
+    skip_existing_team: bool = False,
+
+    
 ) -> Dict[str, Any]:
     log = logging.getLogger("fbref")
     season_str = str(season)
@@ -393,8 +396,8 @@ def scrape_one(
 
     log.info(
         "Season-level scrape START: league=%s season=%s "
-        "[levels=%s team_mode=%s no_cache=%s force_cache=%s skip_existing=%s layout=%s]",
-        league, season_str, levels, team_mode, no_cache, force_cache, skip_existing, layout,
+        "[levels=%s team_mode=%s no_cache=%s force_cache=%s skip_player=%s skip_team=%s layout=%s]",
+        league, season_str, levels, team_mode, no_cache, force_cache, skip_existing_player, skip_existing_team, layout,
     )
 
     fb_kwargs = dict(leagues=league, seasons=season_str, no_cache=no_cache)
@@ -433,9 +436,17 @@ def scrape_one(
 
     if echo_config:
         log.info("Output dir: %s", out_dir.resolve())
-        log.info("Levels=%s | Team mode=%s | Layout=%s | Skip existing=%s", levels, team_mode, layout, skip_existing)
+        log.info(
+            "Levels=%s | Team mode=%s | Layout=%s | Skip player=%s | Skip team=%s",
+            levels,
+            team_mode,
+            layout,
+            skip_existing_player,
+            skip_existing_team,
+        )
         log.info("Player season stats to run: %s", ", ".join(player_run))
         log.info("Team season stats to run:   %s", ", ".join(team_run))
+
 
     # Meta summary
     player_summary: Dict[str, List[str]] = {
@@ -462,7 +473,7 @@ def scrape_one(
             else:
                 path_base = out_dir / label
 
-            if skip_existing and _csv_exists_nonempty(path_base):
+            if skip_existing_player and _csv_exists_nonempty(path_base):
                 log.info("Skipping player_season stat=%s for %s %s (existing non-empty CSV)", stat, league, season_str)
                 player_summary["skipped_existing"].append(stat)
                 continue
@@ -509,7 +520,7 @@ def scrape_one(
             else:
                 path_base = out_dir / label
 
-            if skip_existing and _csv_exists_nonempty(path_base):
+            if skip_existing_team and _csv_exists_nonempty(path_base):
                 log.info("Skipping team_season stat=%s for %s %s (existing non-empty CSV)", stat, league, season_str)
                 team_summary["skipped_existing"].append(stat)
                 continue
@@ -674,8 +685,21 @@ def main() -> None:
     p.add_argument(
         "--skip-existing",
         action="store_true",
-        help="If set, skip any stat whose output CSV already exists and is non-empty.",
+        help="If set, skip player_season and team_season stats whose output CSV already exists and is non-empty.",
     )
+
+    p.add_argument(
+        "--skip-existing-player",
+        action="store_true",
+        help="If set, skip player_season stats whose output CSV already exists and is non-empty.",
+    )
+    
+    p.add_argument(
+        "--skip-existing-team",
+        action="store_true",
+        help="If set, skip team_season stats whose output CSV already exists and is non-empty.",
+    )
+
 
     p.add_argument(
         "--meta-path",
@@ -716,6 +740,17 @@ def main() -> None:
 
     effective_no_cache = bool(args.no_cache or args.refresh)
 
+    # Backward compatible: --skip-existing means skip both
+    skip_player = bool(args.skip_existing or args.skip_existing_player)
+    skip_team = bool(args.skip_existing or args.skip_existing_team)
+
+        # If we are explicitly rerunning failures, do NOT skip existing outputs,
+    # otherwise we can "rerun" but actually skip because a non-empty file exists.
+    if args.rerun_failed:
+        skip_player = False
+        skip_team = False
+
+
     # leagues
     leagues = ALL_KNOWN_LEAGUES if args.all_known_leagues else args.league
 
@@ -730,7 +765,7 @@ def main() -> None:
     log.info(
         "FBref season-level scrape configuration: leagues=%s seasons=%s levels=%s team_mode=%s "
         "no_cache=%s force_cache=%s refresh=%s layout=%s out_dir=%s "
-        "skip_existing=%s rerun_failed=%s failed_sources=%s run_mode=%s",
+        "skip_player=%s skip_team=%s rerun_failed=%s failed_sources=%s run_mode=%s",
         leagues,
         args.seasons if args.seasons else "auto (seasons_from_league)",
         args.levels,
@@ -740,11 +775,13 @@ def main() -> None:
         args.refresh,
         args.layout,
         args.out_dir,
-        args.skip_existing,
+        skip_player,
+        skip_team,
         args.rerun_failed,
         sorted(failed_sources),
         args.run_mode,
     )
+
 
     out_base = Path(args.out_dir)
 
@@ -805,7 +842,8 @@ def main() -> None:
                 echo_config=args.echo_config,
                 player_stats=player_stats,
                 team_stats=team_stats,
-                skip_existing=args.skip_existing,
+                skip_existing_player=skip_player,
+                skip_existing_team=skip_team,
             )
 
             run_info = {
