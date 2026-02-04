@@ -55,7 +55,10 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import soccerdata as sd
+from lxml import html
 from requests.exceptions import HTTPError  # precise import
+from soccerdata._common import standardize_colnames
+from soccerdata.fbref import BIG_FIVE_DICT, _parse_table
 
 from scripts.fbref_pipeline.utils.fbref_utils import (
     STAT_MAP,          # expects keys: "team_match", "player_match"
@@ -150,10 +153,181 @@ def _parse_retry_after(exc: Exception) -> Optional[float]:
         return None
 
 
+def _is_comps_forbidden(exc: Exception) -> bool:
+    msg = str(exc)
+    if "https://fbref.com/en/comps/" in msg:
+        return True
+    if "fbref.com/en/comps/" in msg and "403" in msg:
+        return True
+    return False
+
+
+def _read_leagues_from_cache(fb: sd.FBref, split_up_big5: bool = False) -> pd.DataFrame:
+    filepath = fb.data_dir / "leagues.html"
+    if not filepath.is_file():
+        raise FileNotFoundError(f"No cached leagues file at {filepath}")
+
+    tree = html.parse(filepath.open("rb"))
+    dfs = []
+    for html_table in tree.xpath("//table[contains(@id, 'comps')]"):
+        df_table = _parse_table(html_table)
+        df_table["url"] = html_table.xpath(".//th[@data-stat='league_name']/a/@href")
+        dfs.append(df_table)
+
+    if not dfs:
+        raise ValueError("No league tables found in cached leagues.html")
+
+    df = (
+        pd.concat(dfs)
+        .pipe(standardize_colnames)
+        .rename(columns={"competition_name": "league"})
+        .pipe(fb._translate_league)
+        .drop_duplicates(subset="league")
+        .set_index("league")
+        .sort_index()
+    )
+    df["first_season"] = df["first_season"].apply(fb._season_code.parse)
+    df["last_season"] = df["last_season"].apply(fb._season_code.parse)
+
+    leagues = fb.leagues
+    if "Big 5 European Leagues Combined" in fb.leagues and split_up_big5:
+        leagues = list(
+            (set(fb.leagues) - {"Big 5 European Leagues Combined"})
+            | set(BIG_FIVE_DICT.values())
+        )
+    return df[df.index.isin(leagues)]
+
+
+def _ensure_leagues_html_in_data_dir(
+    fb: sd.FBref,
+    leagues_html_path: Optional[str],
+) -> bool:
+    """
+    Ensure fb.data_dir/leagues.html exists by copying from a user-provided path.
+    Returns True if leagues.html exists after this function (either already or copied).
+    """
+    target = fb.data_dir / "leagues.html"
+    if target.is_file():
+        return True
+
+    if not leagues_html_path:
+        return False
+
+    src = Path(leagues_html_path)
+    if not src.is_file():
+        logging.getLogger("fbref").warning("Provided leagues.html not found: %s", src)
+        return False
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.read_bytes())
+        logging.getLogger("fbref").info("Copied leagues.html into soccerdata cache: %s", target)
+        return True
+    except Exception as e:
+        logging.getLogger("fbref").warning("Failed to copy leagues.html into %s: %s", target, e)
+        return False
+
+
+
+def _enable_cached_leagues_fallback(fb: sd.FBref) -> bool:
+    if not (fb.data_dir / "leagues.html").is_file():
+        return False
+
+    orig_read_leagues = fb.read_leagues
+
+    def _read_leagues_cached(split_up_big5: bool = False):
+        try:
+            return orig_read_leagues(split_up_big5=split_up_big5)
+        except Exception as e:
+            if _is_comps_forbidden(e):
+                logging.getLogger("fbref").warning(
+                    "FBref comps blocked; falling back to cached leagues.html"
+                )
+                return _read_leagues_from_cache(fb, split_up_big5=split_up_big5)
+            raise
+
+    fb.read_leagues = _read_leagues_cached  # type: ignore[assignment]
+    return True
+
+
+def _refresh_comps_cache_with_tls(fb: sd.FBref, headers: Dict[str, str]) -> bool:
+    try:
+        import tls_requests  # type: ignore
+    except Exception:
+        logging.getLogger("fbref").warning(
+            "tls_requests not available; cannot refresh leagues cache via TLS client."
+        )
+        return False
+
+    url = "https://fbref.com/en/comps/"
+    filepath = fb.data_dir / "leagues.html"
+    try:
+        resp = tls_requests.get(url, headers=headers or None)
+        if getattr(resp, "status_code", None) != 200:
+            logging.getLogger("fbref").warning(
+                "tls_requests comps fetch failed with status=%s",
+                getattr(resp, "status_code", None),
+            )
+            return False
+        filepath.write_bytes(resp.content)
+        return True
+    except Exception as e:
+        logging.getLogger("fbref").warning(
+            "tls_requests comps fetch failed: %s",
+            e,
+        )
+        return False
+
+
+def _install_session_headers(fb: sd.FBref, headers: Dict[str, str]) -> None:
+    if not headers:
+        return
+
+    log = logging.getLogger("fbref")
+    try:
+        orig_init = fb._init_session
+    except Exception:
+        orig_init = None
+
+    if orig_init is not None:
+        def _init_session_with_headers():
+            sess = orig_init()
+            try:
+                sess.headers.update(headers)
+            except Exception:
+                pass
+            return sess
+
+        fb._init_session = _init_session_with_headers  # type: ignore[assignment]
+
+    try:
+        fb._session.headers.update(headers)
+    except Exception as e:
+        log.warning("Failed to set custom headers on FBref session: %s", e)
+
+
+def _parse_header_args(user_agent: Optional[str], headers: Optional[List[str]]) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    if user_agent:
+        parsed["User-Agent"] = user_agent.strip()
+    if headers:
+        for raw in headers:
+            if ":" not in raw:
+                raise SystemExit("Invalid --header; expected 'Key: Value'")
+            key, value = raw.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                raise SystemExit("Invalid --header; empty key")
+            parsed[key] = value
+    return parsed
+
+
 def _call_with_optional_kw(
     fn: Callable[..., Any],
     kwargs: Dict[str, Any],
     optional_kw: Optional[Dict[str, Any]] = None,
+    require_optional_kw: bool = False,
 ):
     """
     Call fn(**kwargs, **optional_kw) if the function supports those keywords.
@@ -169,6 +343,11 @@ def _call_with_optional_kw(
             msg = str(e)
             # If the error mentions any of our optional keywords, retry without them.
             if any(f"'{k}'" in msg or k in msg for k in optional_kw.keys()):
+                if require_optional_kw:
+                    raise RuntimeError(
+                        f"{getattr(fn, '__name__', repr(fn))} does not accept optional "
+                        f"kwargs {list(optional_kw.keys())}; aborting to avoid network calls."
+                    ) from e
                 logging.getLogger("fbref").warning(
                     "Optional kwargs %s not accepted by %s; retrying without them. "
                     "If you expected cache-only behaviour, be aware this call "
@@ -189,6 +368,7 @@ def _with_backoff(
     base_delay: float = 3.2,
     kwargs: Optional[Dict[str, Any]] = None,
     optional_kw: Optional[Dict[str, Any]] = None,
+    require_optional_kw: bool = False,
     count_as_network: bool = True,
     periodic_every: int = 8,
     periodic_secs: float = 15.0,
@@ -206,7 +386,12 @@ def _with_backoff(
 
     for attempt in range(max_retries):
         try:
-            result = _call_with_optional_kw(fn, kwargs=kwargs, optional_kw=optional_kw)
+            result = _call_with_optional_kw(
+                fn,
+                kwargs=kwargs,
+                optional_kw=optional_kw,
+                require_optional_kw=require_optional_kw,
+            )
             if count_as_network:
                 _GLOBAL["net_calls"] += 1
             _periodic_rest(periodic_every, periodic_secs, skip=not count_as_network)
@@ -259,18 +444,21 @@ def _schema_only_from_previous(
                     fb_prev.read_team_match_stats,
                     kwargs={"stat_type": stat},
                     optional_kw={"force_cache": True},
+                    require_optional_kw=True,
                 )
             elif level == "player_match" and stat:
                 prev = _call_with_optional_kw(
                     fb_prev.read_player_match_stats,
                     kwargs={"stat_type": stat},
                     optional_kw={"force_cache": True},
+                    require_optional_kw=True,
                 )
             elif level == "schedule":
                 prev = _call_with_optional_kw(
                     fb_prev.read_schedule,
                     kwargs={},
                     optional_kw={"force_cache": True},
+                    require_optional_kw=True,
                 )
             else:
                 prev = None
@@ -504,11 +692,14 @@ def scrape_one(
     periodic_secs: float = 15.0,
     team_mode: str = "aggregate",  # 'aggregate' | 'auto' | 'direct'
     proxy: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
     levels: str = "both",
     player_stats: Optional[List[str]] = None,
     team_stats: Optional[List[str]] = None,
     skip_existing: bool = False,
     skip_schedule: bool = False,
+    leagues_html_path: Optional[str] = None,
+
 ) -> Dict[str, Any]:
     """
     Scrape one league+season into the raw FBref folder structure.
@@ -538,6 +729,13 @@ def scrape_one(
     if proxy:
         fb_kwargs["proxy"] = proxy
     fb = sd.FBref(**fb_kwargs)
+    _install_session_headers(fb, headers or {})
+
+    # IMPORTANT: patch read_leagues() early so schedule/read_seasons can't die on /en/comps/ 403
+    _enable_cached_leagues_fallback(fb)
+    # If user supplied a cached leagues.html, copy it into fb.data_dir up front.
+    _ensure_leagues_html_in_data_dir(fb, leagues_html_path)
+
 
     try:
         fb_prev = sd.FBref(
@@ -546,6 +744,7 @@ def scrape_one(
             no_cache=no_cache,
             proxy=proxy,
         )
+        _install_session_headers(fb_prev, headers or {})
     except Exception:
         fb_prev = None
 
@@ -567,14 +766,14 @@ def scrape_one(
 
     # 1) Schedule (reuse option)
     schedule_base = out_dir / "schedule"
-    schedule_df: pd.DataFrame
+    schedule_df: pd.DataFrame = pd.DataFrame()
     last_match_date_str: Optional[str] = None
     latest_fixture_meta: Optional[Dict[str, Any]] = None
 
     reused_schedule = False
-    if skip_existing and skip_schedule and _csv_exists(schedule_base) and args_skip_schedule:
+    if skip_schedule and _csv_exists(schedule_base):
         log.info(
-            "Reusing existing schedule CSV for %s %s (--skip-existing + --skip-schedule).",
+            "Reusing existing schedule CSV for %s %s (--skip-schedule).",
             league,
             season_str,
         )
@@ -590,6 +789,7 @@ def scrape_one(
             )
 
 
+
     if not reused_schedule:
         log.info("Scraping schedule for %s %s", league, season_str)
         try:
@@ -599,6 +799,7 @@ def scrape_one(
                 base_delay=backoff_base,
                 kwargs={},
                 optional_kw={"force_cache": force_cache},
+                require_optional_kw=force_cache,
                 count_as_network=not force_cache,
                 periodic_every=periodic_every,
                 periodic_secs=periodic_secs,
@@ -607,14 +808,53 @@ def scrape_one(
                 raise ValueError("empty_or_invalid")
             schedule_df = _normalize(schedule_df, league, season_str)
         except Exception as e:
-            log.warning(
-                "Missing/unavailable schedule for %s %s: %s — writing schema-only CSV",
-                league,
-                season_str,
-                e,
-            )
-            schedule_df = _schema_only_from_previous(fb_prev, "schedule", None)
-            schedule_df = _normalize(schedule_df, league, season_str)
+            recovered = False
+
+            if _is_comps_forbidden(e):
+                # If leagues.html is missing/stale, try refreshing it via TLS client first
+                if not (fb.data_dir / "leagues.html").is_file():
+                    _refresh_comps_cache_with_tls(fb, headers or {})
+
+                _enable_cached_leagues_fallback(fb)
+
+                log.warning(
+                    "Retrying schedule for %s %s using cached leagues.html after comps 403.",
+                    league,
+                    season_str,
+                )
+                try:
+                    schedule_df = _with_backoff(
+                        fb.read_schedule,
+                        max_retries=max_retries,
+                        base_delay=backoff_base,
+                        kwargs={},
+                        optional_kw={"force_cache": force_cache},
+                        require_optional_kw=force_cache,
+                        count_as_network=not force_cache,
+                        periodic_every=periodic_every,
+                        periodic_secs=periodic_secs,
+                    )
+                    if not isinstance(schedule_df, pd.DataFrame) or schedule_df.empty:
+                        raise ValueError("empty_or_invalid")
+                    schedule_df = _normalize(schedule_df, league, season_str)
+                    recovered = True
+                except Exception as e2:
+                    log.warning(
+                        "Cached leagues retry failed for %s %s: %s",
+                        league,
+                        season_str,
+                        e2,
+                    )
+
+            if not recovered:
+                log.warning(
+                    "Missing/unavailable schedule for %s %s: %s — writing schema-only CSV",
+                    league,
+                    season_str,
+                    e,
+                )
+                schedule_df = _schema_only_from_previous(fb_prev, "schedule", None)
+                schedule_df = _normalize(schedule_df, league, season_str)
 
         safe_write(schedule_df, schedule_base)
         _snooze(delay)
@@ -710,6 +950,7 @@ def scrape_one(
                     base_delay=backoff_base,
                     kwargs={"stat_type": stat},
                     optional_kw={"force_cache": force_cache},
+                    require_optional_kw=force_cache,
                     count_as_network=not force_cache,
                     periodic_every=periodic_every,
                     periodic_secs=periodic_secs,
@@ -759,7 +1000,8 @@ def scrape_one(
         for stat in stats_to_run:
             wrote = False
             wrote_schema_only = False
-            out_path_base = out_dir / f"team_match_{stat}"
+            out_path_base = out_dir / "team_match" / stat
+
 
             if skip_existing and _csv_exists(out_path_base):
                 existing_df = _load_existing_csv(out_path_base)
@@ -811,6 +1053,7 @@ def scrape_one(
                         base_delay=backoff_base,
                         kwargs={"stat_type": stat, "opponent_stats": False},
                         optional_kw={"force_cache": force_cache},
+                        require_optional_kw=force_cache,
                         count_as_network=not force_cache,
                         periodic_every=periodic_every,
                         periodic_secs=periodic_secs,
@@ -913,6 +1156,16 @@ def main() -> None:
         help="Specific seasons to scrape (e.g. 2025-2026). If omitted, seasons_from_league(...) is used per league.",
     )
     p.add_argument(
+    "--leagues-html",
+    type=str,
+    default=None,
+    help=(
+        "Path to a pre-downloaded FBref comps page saved as leagues.html. "
+        "If provided, it will be copied into soccerdata's FBref cache folder "
+        "(fb.data_dir) so schedule scraping can avoid https://fbref.com/en/comps/ 403."
+    ),
+    )
+    p.add_argument(
         "--no-cache",
         action="store_true",
         help="Bypass soccerdata HTTP cache for this run (useful for manual refresh).",
@@ -984,6 +1237,18 @@ def main() -> None:
         type=str,
         default=None,
         help='Optional proxy passed to soccerdata (e.g., "tor" or "http://user:pass@host:port").',
+    )
+    p.add_argument(
+        "--user-agent",
+        type=str,
+        default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        help="Override User-Agent header for FBref requests.",
+    )
+    p.add_argument(
+        "--header",
+        action="append",
+        default=None,
+        help="Extra HTTP header in the form 'Key: Value'. Can be repeated.",
     )
     p.add_argument(
         "--player-stats",
@@ -1059,6 +1324,7 @@ def main() -> None:
     log = logging.getLogger("fbref")
 
     effective_no_cache = bool(args.no_cache or args.refresh)
+    headers = _parse_header_args(args.user_agent, args.header)
 
     if args.all_known_leagues:
         leagues = ALL_KNOWN_LEAGUES
@@ -1068,7 +1334,7 @@ def main() -> None:
     log.info(
         "FBref scrape configuration: leagues=%s seasons=%s levels=%s "
         "team_mode=%s no_cache=%s force_cache=%s refresh=%s out_dir=%s skip_existing=%s "
-        "rerun_failed=%s failed_sources=%s run_mode=%s",
+        "rerun_failed=%s failed_sources=%s run_mode=%s user_agent=%s extra_headers=%d",
         leagues,
         args.seasons if args.seasons else "auto (seasons_from_league)",
         args.levels,
@@ -1081,6 +1347,8 @@ def main() -> None:
         args.rerun_failed,
         args.failed_sources,
         args.run_mode,
+        headers.get("User-Agent"),
+        max(0, len(headers) - (1 if "User-Agent" in headers else 0)),
     )
 
     out_base = Path(args.out_dir)
@@ -1138,11 +1406,13 @@ def main() -> None:
                 periodic_secs=args.periodic_secs,
                 team_mode=args.team_mode,
                 proxy=args.proxy,
+                headers=headers,
                 levels=args.levels,
                 player_stats=args.player_stats,
                 team_stats=args.team_stats,
                 skip_existing=args.skip_existing,
                 skip_schedule=args.skip_schedule,
+                leagues_html_path=args.leagues_html, 
             )
 
             job = ScrapeJobId(
