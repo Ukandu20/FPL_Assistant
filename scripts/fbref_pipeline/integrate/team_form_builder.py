@@ -20,9 +20,9 @@ Highlights (v2.10):
 • EWMA option for rolling stats (past-only; no leakage) + priors for early weeks.
 
 Outputs (per season):
-  data/processed/features/<version>/<SEASON>/team_form.csv
-  data/processed/features/<version>/<SEASON>/team_form.meta.json
-  data/processed/features/<version>/<SEASON>/logs/identity_mismatches.csv  (if any)
+  data/processed/registry/features/<version>/<SEASON>/team_form.csv
+  data/processed/registry/features/<version>/<SEASON>/team_form.meta.json
+  data/processed/registry/features/<version>/<SEASON>/logs/identity_mismatches.csv  (if any)
 """
 
 from __future__ import annotations
@@ -770,7 +770,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", help="e.g. 2025-2026; omit for batch")
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
-    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/features"))
+    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"))
 
     # Versioning controls
     ap.add_argument("--version", default=None, help="Version folder (e.g., v9). Use with --auto-version to pick next.")

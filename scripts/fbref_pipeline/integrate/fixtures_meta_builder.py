@@ -513,7 +513,7 @@ def main():
     ap.add_argument("--team-map", type=Path, default=Path("data/processed/registry/_id_lookup_teams.json"))
     ap.add_argument("--short-map", type=Path, default=Path("data/config/teams.json"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/fixtures"))
-    ap.add_argument("--features-root", type=Path, default=Path("data/processed/features"))
+    ap.add_argument("--features-root", type=Path, default=Path("data/processed/registry/features"))
     ap.add_argument("--attach-fdr", default=None,
                     help="If set (e.g., 'latest' or 'v7'), also write "
                          "features/<views-subdir>/<SEASON>/fixture_calendar_with_fdr__<version>.csv")

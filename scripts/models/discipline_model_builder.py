@@ -269,9 +269,9 @@ def _write_missing_join_csv(out_pred_dir: Path, frame: pd.DataFrame, miss_mask: 
 # ------------------ main ------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--features-dir", type=Path, default=Path("data/processed/features"))
+    ap.add_argument("--features-dir", type=Path, default=Path("data/processed/registry/features"))
     ap.add_argument("--version", required=True)
-    ap.add_argument("--team-form-dir", type=Path, default=Path("data/processed/features"))
+    ap.add_argument("--team-form-dir", type=Path, default=Path("data/processed/registry/features"))
     ap.add_argument("--test-season", required=True)
     ap.add_argument("--test-last-n", type=int, default=10)
 
