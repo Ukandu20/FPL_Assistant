@@ -2,6 +2,7 @@
   {
     "team_code": "MCI",
     "club_name": "Manchester City",
+    "clubelo_stem": "Man_City",
     "transfermarkt_slug": "manchester-city",
     "verein_id": 281,
     "url": "https://www.transfermarkt.com/manchester-city/mitarbeiterhistorie/verein/281"
@@ -9,6 +10,7 @@
   {
     "team_code": "ARS",
     "club_name": "Arsenal",
+    "clubelo_stem": "Arsenal",
     "transfermarkt_slug": "fc-arsenal",
     "verein_id": 11,
     "url": "https://www.transfermarkt.com/fc-arsenal/mitarbeiterhistorie/verein/11"
@@ -16,6 +18,7 @@
   {
     "team_code": "CHE",
     "club_name": "Chelsea",
+    "clubelo_stem": "Chelsea",
     "transfermarkt_slug": "fc-chelsea",
     "verein_id": 631,
     "url": "https://www.transfermarkt.com/fc-chelsea/mitarbeiterhistorie/verein/631"
@@ -23,6 +26,7 @@
   {
     "team_code": "LIV",
     "club_name": "Liverpool",
+    "clubelo_stem": "Liverpool",
     "transfermarkt_slug": "fc-liverpool",
     "verein_id": 31,
     "url": "https://www.transfermarkt.com/fc-liverpool/mitarbeiterhistorie/verein/31"
@@ -30,6 +34,7 @@
   {
     "team_code": "TOT",
     "club_name": "Tottenham Hotspur",
+    "clubelo_stem": "Tottenham",
     "transfermarkt_slug": "tottenham-hotspur",
     "verein_id": 148,
     "url": "https://www.transfermarkt.com/tottenham-hotspur/mitarbeiterhistorie/verein/148"
@@ -37,6 +42,7 @@
   {
     "team_code": "MUN",
     "club_name": "Manchester United",
+    "clubelo_stem": "Man_United",
     "transfermarkt_slug": "manchester-united",
     "verein_id": 985,
     "url": "https://www.transfermarkt.com/manchester-united/mitarbeiterhistorie/verein/985"
@@ -44,6 +50,7 @@
   {
     "team_code": "NEW",
     "club_name": "Newcastle United",
+    "clubelo_stem": "Newcastle",
     "transfermarkt_slug": "newcastle-united",
     "verein_id": 762,
     "url": "https://www.transfermarkt.com/newcastle-united/mitarbeiterhistorie/verein/762"
@@ -51,6 +58,7 @@
   {
     "team_code": "NFO",
     "club_name": "Nottingham Forest",
+    "clubelo_stem": "Forest",
     "transfermarkt_slug": "nottingham-forest",
     "verein_id": 703,
     "url": "https://www.transfermarkt.com/nottingham-forest/mitarbeiterhistorie/verein/703"
@@ -58,6 +66,7 @@
   {
     "team_code": "AVL",
     "club_name": "Aston Villa",
+    "clubelo_stem": "Aston_Villa",
     "transfermarkt_slug": "aston-villa",
     "verein_id": 405,
     "url": "https://www.transfermarkt.com/aston-villa/mitarbeiterhistorie/verein/405"
@@ -65,6 +74,7 @@
   {
     "team_code": "CRY",
     "club_name": "Crystal Palace",
+    "clubelo_stem": "Crystal_Palace",
     "transfermarkt_slug": "crystal-palace",
     "verein_id": 873,
     "url": "https://www.transfermarkt.com/crystal-palace/mitarbeiterhistorie/verein/873"
@@ -72,6 +82,7 @@
   {
     "team_code": "BOU",
     "club_name": "AFC Bournemouth",
+    "clubelo_stem": "Bournemouth",
     "transfermarkt_slug": "afc-bournemouth",
     "verein_id": 989,
     "url": "https://www.transfermarkt.com/afc-bournemouth/mitarbeiterhistorie/verein/989"
@@ -79,6 +90,7 @@
   {
     "team_code": "BHA",
     "club_name": "Brighton & Hove Albion",
+    "clubelo_stem": "Brighton",
     "transfermarkt_slug": "brighton-amp-hove-albion",
     "verein_id": 1237,
     "url": "https://www.transfermarkt.com/brighton-amp-hove-albion/mitarbeiterhistorie/verein/1237"
@@ -86,6 +98,7 @@
   {
     "team_code": "BRE",
     "club_name": "Brentford",
+    "clubelo_stem": "Brentford",
     "transfermarkt_slug": "fc-brentford",
     "verein_id": 1148,
     "url": "https://www.transfermarkt.com/fc-brentford/mitarbeiterhistorie/verein/1148"
@@ -93,6 +106,7 @@
   {
     "team_code": "EVE",
     "club_name": "Everton",
+    "clubelo_stem": "Everton",
     "transfermarkt_slug": "fc-everton",
     "verein_id": 29,
     "url": "https://www.transfermarkt.com/fc-everton/mitarbeiterhistorie/verein/29"
@@ -100,6 +114,7 @@
   {
     "team_code": "FUL",
     "club_name": "Fulham",
+    "clubelo_stem": "Fulham",
     "transfermarkt_slug": "fc-fulham",
     "verein_id": 931,
     "url": "https://www.transfermarkt.com/fc-fulham/mitarbeiterhistorie/verein/931"
@@ -107,6 +122,7 @@
   {
     "team_code": "SUN",
     "club_name": "Sunderland",
+    "clubelo_stem": "Sunderland",
     "transfermarkt_slug": "afc-sunderland",
     "verein_id": 289,
     "url": "https://www.transfermarkt.com/afc-sunderland/mitarbeiterhistorie/verein/289"
@@ -114,6 +130,7 @@
   {
     "team_code": "WHU",
     "club_name": "West Ham United",
+    "clubelo_stem": "West_Ham",
     "transfermarkt_slug": "west-ham-united",
     "verein_id": 379,
     "url": "https://www.transfermarkt.com/west-ham-united/mitarbeiterhistorie/verein/379"
@@ -121,6 +138,7 @@
   {
     "team_code": "LEE",
     "club_name": "Leeds United",
+    "clubelo_stem": "Leeds",
     "transfermarkt_slug": "leeds-united",
     "verein_id": 399,
     "url": "https://www.transfermarkt.com/leeds-united/mitarbeiterhistorie/verein/399"
@@ -128,6 +146,7 @@
   {
     "team_code": "WOL",
     "club_name": "Wolverhampton Wanderers",
+    "clubelo_stem": "Wolves",
     "transfermarkt_slug": "wolverhampton-wanderers",
     "verein_id": 543,
     "url": "https://www.transfermarkt.com/wolverhampton-wanderers/mitarbeiterhistorie/verein/543"
@@ -135,6 +154,7 @@
   {
     "team_code": "BUR",
     "club_name": "Burnley",
+    "clubelo_stem": "Burnley",
     "transfermarkt_slug": "fc-burnley",
     "verein_id": 1132,
     "url": "https://www.transfermarkt.com/fc-burnley/mitarbeiterhistorie/verein/1132"
