@@ -1,0 +1,15 @@
+{
+  "fullname_alias_map": {
+    "naif aguerd": "nayef aguerd",
+    "mathis cherki": "rayan cherki",
+    "pierre kalulu kyatengwa": "pierre kalulu"
+  },
+  "firstname_alias_map": {
+    "naif": [
+      "nayef"
+    ],
+    "mathis": [
+      "rayan"
+    ]
+  }
+}

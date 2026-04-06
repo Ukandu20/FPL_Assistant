@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 r"""team_form_builder.py – schema v2.10
-(Fix A merge, prefer flags, identity-mismatch CSV logging, FDR 2–5, hybrid bucketing, EWMA)
+(Fix A merge, prefer flags, identity-mismatch CSV logging, FDR 2–5 + continuous, hybrid bucketing,
+ home-adv correction, early-GW shrinkage, EWMA, FDR audits)
 
 Inputs (per season):
   data/processed/fixtures/<SEASON>/fixture_calendar.csv
@@ -13,7 +14,10 @@ Inputs (per season):
 Highlights (v2.10):
 • Prefer provided flags (is_home/venue) to split sides; fall back to id equality only for missing flags.
 • Log rows where provided is_home conflicts with team_id vs home/away ids into logs/identity_mismatches.csv.
-• FDR difficulty 2..5 (5 = hardest). Hybrid bucketing: GW < cutoff uses fixed-z; else season percentiles.
+• FDR difficulty 2..5 (5 = hardest) plus continuous *_cont columns.
+• Hybrid bucketing: GW < cutoff uses fixed-z; else season percentiles.
+• Optional home-advantage correction and early-GW shrinkage toward neutral.
+• Optional FDR audit (Spearman vs goals scored/conceded).
 • Fixture formation falls back to pairing by (season,fpl_id) when side IDs are inconsistent (guarded).
 • Merge-back Fix A: when using relaxed merge keys (season,fpl_id), drop RHS home_id/away_id to avoid suffixes.
 • NEW: Drop any left-side placeholder fdr_* before merge; coalesce any _x/_y after merge; always materialize plain columns.
@@ -63,7 +67,10 @@ LEGACY_FDR = [
 ]
 
 DEFAULT_MEANS = {"gf": 1.40, "xg": 1.45, "ga": 1.40, "xga": 1.45, "poss": 50.0}
-FDR_COLS = ["fdr_att_home","fdr_def_home","fdr_home","fdr_att_away","fdr_def_away","fdr_away"]
+FDR_BUCKET_COLS = ["fdr_att_home","fdr_def_home","fdr_home","fdr_att_away","fdr_def_away","fdr_away"]
+FDR_CONT_COLS = ["fdr_att_home_cont","fdr_def_home_cont","fdr_home_cont",
+                 "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont"]
+FDR_COLS = FDR_BUCKET_COLS + FDR_CONT_COLS
 
 # ───────────────────────── version helpers ─────────────────────────
 
@@ -362,13 +369,11 @@ def _parse_is_home_flags(_df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, bool]
     usable = (home_mask.any() and away_mask.any())
     return home_mask.fillna(False), away_mask.fillna(False), bool(usable)
 
-def _compute_fixture_fdr_difficulty(
+def _compute_fixture_fdr_scores(
     df: pd.DataFrame,
     season: str,
     w_att: float = 0.5,
     w_def: float = 0.5,
-    bucket_mode: str = "hybrid",
-    hybrid_cutoff: int = 6
 ) -> pd.DataFrame:
     need = [
         "season","fpl_id","team_id","home_id","away_id","date_played",
@@ -456,7 +461,7 @@ def _compute_fixture_fdr_difficulty(
     fixtures["date_played"] = fixtures["date_played_home"].combine_first(fixtures["date_played_away"])
     fixtures.drop(columns=["date_played_home","date_played_away"], inplace=True)
 
-    # Difficulty components (scores; later bucket to 2..5)
+    # Difficulty components (continuous scores)
     home_att_diff = - fixtures["away_def_xga_away_z"]
     home_def_diff = + fixtures["away_att_xg_away_z"]
     fixtures["fdr_att_home_score"] = home_att_diff
@@ -469,10 +474,148 @@ def _compute_fixture_fdr_difficulty(
     fixtures["fdr_def_away_score"] = away_def_diff
     fixtures["fdr_away_score"]     = w_att * away_att_diff + w_def * away_def_diff
 
-    # Bucketing
+    return fixtures[[
+        "season","fpl_id","home_id","away_id","date_played","gw_orig",
+        "fdr_att_home_score","fdr_def_home_score","fdr_home_score",
+        "fdr_att_away_score","fdr_def_away_score","fdr_away_score"
+    ]]
+
+def _build_fixture_outcomes(df: pd.DataFrame, season: str) -> pd.DataFrame:
+    """Return fixture-level outcomes (home/away gf/ga), keyed by season+fpl_id+home_id+away_id."""
+    need = ["season","fpl_id","team_id","home_id","away_id","gf","ga"]
+    missing = set(need) - set(df.columns)
+    if missing:
+        logging.debug("%s: missing outcome columns for FDR audit: %s", season, missing)
+        return pd.DataFrame(columns=["season","fpl_id","home_id","away_id","home_gf","home_ga","away_gf","away_ga"])
+
+    home_mask_flag, away_mask_flag, flags_usable = _parse_is_home_flags(df)
+    if flags_usable:
+        is_home_mask = home_mask_flag
+        is_away_mask = away_mask_flag
+    else:
+        tid  = df["team_id"].astype(str); hid  = df["home_id"].astype(str); aid  = df["away_id"].astype(str)
+        is_home_mask = (tid == hid)
+        is_away_mask = (tid == aid)
+
+    home_rows = df[is_home_mask][["season","fpl_id","home_id","away_id","gf","ga"]].rename(
+        columns={"gf":"home_gf","ga":"home_ga"}
+    )
+    away_rows = df[is_away_mask][["season","fpl_id","home_id","away_id","gf","ga"]].rename(
+        columns={"gf":"away_gf","ga":"away_ga"}
+    )
+    fixtures = pd.merge(
+        home_rows, away_rows,
+        on=["season","fpl_id","home_id","away_id"],
+        how="inner", validate="one_to_one"
+    )
+    if fixtures.empty:
+        h_sz = home_rows.groupby(["season","fpl_id"]).size().max()
+        a_sz = away_rows.groupby(["season","fpl_id"]).size().max()
+        if h_sz == 1 and a_sz == 1:
+            fixtures = pd.merge(
+                home_rows.drop(columns=["home_id","away_id"], errors="ignore"),
+                away_rows.drop(columns=["home_id","away_id"], errors="ignore"),
+                on=["season","fpl_id"], how="inner", validate="one_to_one"
+            )
+            ids = (df[["season","fpl_id","home_id","away_id"]]
+                     .drop_duplicates()
+                     .sort_values(["season","fpl_id"])
+                     .drop_duplicates(["season","fpl_id"], keep="first"))
+            fixtures = fixtures.merge(ids, on=["season","fpl_id"], how="left")
+    return fixtures
+
+def _estimate_home_adv(fixtures: pd.DataFrame, outcomes: pd.DataFrame) -> float:
+    """Estimate home advantage (score units) via simple linear fit on score_diff -> goal_diff."""
+    if fixtures.empty or outcomes.empty:
+        return 0.0
+    key = ["season","fpl_id","home_id","away_id"]
+    merged = fixtures.merge(outcomes, on=key, how="inner")
+    if merged.empty:
+        return 0.0
+    merged = merged.dropna(subset=["home_gf","away_gf","fdr_home_score","fdr_away_score"])
+    if len(merged) < 20:
+        return 0.0
+    score_diff = merged["fdr_home_score"].to_numpy() - merged["fdr_away_score"].to_numpy()
+    gd = merged["home_gf"].to_numpy() - merged["away_gf"].to_numpy()
+    var = np.var(score_diff)
+    if not np.isfinite(var) or var < 1e-6:
+        return 0.0
+    cov = np.cov(score_diff, gd, ddof=0)[0,1]
+    b = cov / var
+    if not np.isfinite(b) or b <= 0:
+        return 0.0
+    a = float(np.mean(gd) - b * np.mean(score_diff))
+    home_adv = a / b
+    return float(np.clip(home_adv, -1.5, 1.5))
+
+def _spearman(a: pd.Series, b: pd.Series) -> float:
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    mask = a.notna() & b.notna()
+    if mask.sum() < 3:
+        return float("nan")
+    ra = a[mask].rank()
+    rb = b[mask].rank()
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+def _compute_fixture_fdr_difficulty(
+    df: pd.DataFrame,
+    season: str,
+    w_att: float = 0.5,
+    w_def: float = 0.5,
+    bucket_mode: str = "hybrid",
+    hybrid_cutoff: int = 6,
+    home_adv_mode: str = "auto",
+    home_adv_value: float = 0.0,
+    shrink_matches: int = 6,
+    do_audit: bool = True,
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], float]:
+    fixtures = _compute_fixture_fdr_scores(df, season, w_att=w_att, w_def=w_def)
+    if fixtures.empty:
+        empty = pd.DataFrame(columns=[
+            "season","fpl_id","home_id","away_id","date_played",
+            "fdr_att_home","fdr_def_home","fdr_home",
+            "fdr_att_away","fdr_def_away","fdr_away",
+            "fdr_att_home_cont","fdr_def_home_cont","fdr_home_cont",
+            "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont",
+        ])
+        return empty, None, 0.0
+
+    outcomes = _build_fixture_outcomes(df, season)
+    if home_adv_mode == "auto":
+        home_adv = _estimate_home_adv(fixtures, outcomes)
+    elif home_adv_mode == "constant":
+        home_adv = float(home_adv_value)
+    else:
+        home_adv = 0.0
+
+    if home_adv != 0.0:
+        fixtures["fdr_att_home_score"] = fixtures["fdr_att_home_score"] - (home_adv * w_att)
+        fixtures["fdr_def_home_score"] = fixtures["fdr_def_home_score"] - (home_adv * w_def)
+        fixtures["fdr_att_away_score"] = fixtures["fdr_att_away_score"] + (home_adv * w_att)
+        fixtures["fdr_def_away_score"] = fixtures["fdr_def_away_score"] + (home_adv * w_def)
+        fixtures["fdr_home_score"] = w_att * fixtures["fdr_att_home_score"] + w_def * fixtures["fdr_def_home_score"]
+        fixtures["fdr_away_score"] = w_att * fixtures["fdr_att_away_score"] + w_def * fixtures["fdr_def_away_score"]
+
+    # Uncertainty shrinkage toward neutral (0) for early GWs
+    if shrink_matches and shrink_matches > 0 and "gw_orig" in fixtures.columns:
+        n_prior = (pd.to_numeric(fixtures["gw_orig"], errors="coerce") - 1).clip(lower=0)
+        alpha = (n_prior / float(shrink_matches)).clip(lower=0.0, upper=1.0).fillna(1.0)
+        for c in ["fdr_att_home_score","fdr_def_home_score","fdr_home_score",
+                  "fdr_att_away_score","fdr_def_away_score","fdr_away_score"]:
+            fixtures[c] = fixtures[c] * alpha
+
+    # Continuous outputs (post-adjustment)
+    fixtures["fdr_att_home_cont"] = fixtures["fdr_att_home_score"]
+    fixtures["fdr_def_home_cont"] = fixtures["fdr_def_home_score"]
+    fixtures["fdr_home_cont"]     = fixtures["fdr_home_score"]
+    fixtures["fdr_att_away_cont"] = fixtures["fdr_att_away_score"]
+    fixtures["fdr_def_away_cont"] = fixtures["fdr_def_away_score"]
+    fixtures["fdr_away_cont"]     = fixtures["fdr_away_score"]
+
+    # Bucketing (2..5) from continuous scores
     cols = ["fdr_att_home_score","fdr_def_home_score","fdr_home_score",
             "fdr_att_away_score","fdr_def_away_score","fdr_away_score"]
-
     if bucket_mode == "global":
         for c in cols:
             fixtures[c.replace("_score","")] = _bucket_fixed_z(fixtures[c])
@@ -486,11 +629,31 @@ def _compute_fixture_fdr_difficulty(
             z = _bucket_fixed_z(fixtures[c])
             fixtures[c.replace("_score","")] = np.where(use_z, z, g)
 
+    # Audit: correlations vs outcomes (played fixtures only)
+    audit_df = None
+    if do_audit and not outcomes.empty:
+        key = ["season","fpl_id","home_id","away_id"]
+        audit = fixtures.merge(outcomes, on=key, how="inner")
+        audit = audit.dropna(subset=["home_gf","away_gf"])
+        if len(audit) >= 10:
+            rows = []
+            rows.append({"season": season, "metric": "home_fdr_vs_home_ga", "n": int(len(audit)),
+                         "spearman": _spearman(audit["fdr_home_cont"], audit["home_ga"])})
+            rows.append({"season": season, "metric": "home_fdr_vs_home_gf", "n": int(len(audit)),
+                         "spearman": _spearman(audit["fdr_home_cont"], audit["home_gf"])})
+            rows.append({"season": season, "metric": "away_fdr_vs_away_ga", "n": int(len(audit)),
+                         "spearman": _spearman(audit["fdr_away_cont"], audit["away_ga"])})
+            rows.append({"season": season, "metric": "away_fdr_vs_away_gf", "n": int(len(audit)),
+                         "spearman": _spearman(audit["fdr_away_cont"], audit["away_gf"])})
+            audit_df = pd.DataFrame(rows)
+
     return fixtures[[
         "season","fpl_id","home_id","away_id","date_played",
         "fdr_att_home","fdr_def_home","fdr_home",
-        "fdr_att_away","fdr_def_away","fdr_away"
-    ]]
+        "fdr_att_away","fdr_def_away","fdr_away",
+        "fdr_att_home_cont","fdr_def_home_cont","fdr_home_cont",
+        "fdr_att_away_cont","fdr_def_away_cont","fdr_away_cont",
+    ]], audit_df, home_adv
 
 # ───────────────────────── per-season build ─────────────────────────
 
@@ -512,6 +675,10 @@ def build_team_form(
     hybrid_cutoff: int,
     w_att: float,
     w_def: float,
+    home_adv_mode: str,
+    home_adv: float,
+    fdr_shrink_matches: int,
+    fdr_audit: bool,
 ) -> bool:
     cal_fp = fixtures_root / season / "fixture_calendar.csv"
     dst_dir = out_dir / out_version / season
@@ -605,14 +772,18 @@ def build_team_form(
     df = df.drop(columns=[c for c in LEGACY_FDR if c in df.columns], errors="ignore")
 
     # Fixture-level FDR difficulty (one row per fixture)
-    fixtures_fdr = _compute_fixture_fdr_difficulty(
-        df, season, w_att=w_att, w_def=w_def, bucket_mode=bucket_mode, hybrid_cutoff=hybrid_cutoff
+    fixtures_fdr, fdr_audit_df, home_adv_used = _compute_fixture_fdr_difficulty(
+        df, season,
+        w_att=w_att, w_def=w_def,
+        bucket_mode=bucket_mode, hybrid_cutoff=hybrid_cutoff,
+        home_adv_mode=home_adv_mode, home_adv_value=home_adv,
+        shrink_matches=fdr_shrink_matches, do_audit=fdr_audit
     )
 
     # -------- Merge-back (Fix A + anti-suffixing) --------
-    # Ensure RHS safe: don't carry date_played to avoid _x/_y later
+    # Ensure RHS safe: don't carry date_played/gw_orig to avoid _x/_y later
     if not fixtures_fdr.empty:
-        fixtures_fdr = fixtures_fdr.drop(columns=["date_played"], errors="ignore")
+        fixtures_fdr = fixtures_fdr.drop(columns=["date_played","gw_orig"], errors="ignore")
 
     # Drop any left-side placeholder fdr_* before merge to prevent _x/_y
     df = df.drop(columns=[c for c in FDR_COLS if c in df.columns], errors="ignore")
@@ -678,6 +849,15 @@ def build_team_form(
     dst_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(dst_csv, index=False)
 
+    # FDR audit (optional)
+    audit_fp = None
+    if fdr_audit and fdr_audit_df is not None and not fdr_audit_df.empty:
+        log_dir = dst_dir / LOG_SUBDIR
+        log_dir.mkdir(parents=True, exist_ok=True)
+        audit_fp = log_dir / "fdr_audit.csv"
+        fdr_audit_df.to_csv(audit_fp, index=False)
+        logging.info("[%s] Wrote FDR audit -> %s", season, audit_fp)
+
     # Meta
     existing_meta = load_json(meta_fp)
     build_no = int(existing_meta.get("build_no", 0)) + 1 if (reuse_version and meta_fp.exists()) else 1
@@ -697,7 +877,10 @@ def build_team_form(
         "halflife": halflife if use_ewma else None,
         "fdr": {"type": "difficulty_v2_q2to5",
                 "weights": {"att": w_att, "def": w_def},
-                "bucket_mode": bucket_mode, "hybrid_cutoff": hybrid_cutoff},
+                "bucket_mode": bucket_mode, "hybrid_cutoff": hybrid_cutoff,
+                "home_adv_mode": home_adv_mode, "home_adv": float(home_adv_used),
+                "shrink_matches": int(fdr_shrink_matches),
+                "audit_csv": (str(audit_fp.as_posix()) if audit_fp else None)},
         "seasons_built": all_seasons,
         "hash": _meta_hash(df),
         "features": features_list,
@@ -735,6 +918,10 @@ def run_batch(
     hybrid_cutoff: int,
     w_att: float,
     w_def: float,
+    home_adv_mode: str,
+    home_adv: float,
+    fdr_shrink_matches: int,
+    fdr_audit: bool,
 ):
     all_seasons = sorted(seasons)
     cal_all = _load_all(fixtures_root, all_seasons, strict_ids=strict_ids)
@@ -759,6 +946,10 @@ def run_batch(
                 hybrid_cutoff=hybrid_cutoff,
                 w_att=w_att,
                 w_def=w_def,
+                home_adv_mode=home_adv_mode,
+                home_adv=home_adv,
+                fdr_shrink_matches=fdr_shrink_matches,
+                fdr_audit=fdr_audit,
             )
             if ok and write_latest:
                 _write_latest_pointer(out_dir, out_version)
@@ -793,6 +984,17 @@ def main() -> None:
     ap.add_argument("--hybrid-cutoff", type=int, default=6, help="GW threshold for hybrid mode")
     ap.add_argument("--w-att", type=float, default=0.5, help="weight for attack difficulty component (0..1)")
     ap.add_argument("--w-def", type=float, default=0.5, help="weight for defense difficulty component (0..1)")
+    ap.add_argument("--home-adv-mode", choices=["auto","constant","none"], default="auto",
+                    help="Home advantage correction: auto estimates from outcomes, constant uses --home-adv, none disables.")
+    ap.add_argument("--home-adv", type=float, default=0.0,
+                    help="Home advantage (score units) used when --home-adv-mode=constant.")
+    ap.add_argument("--fdr-shrink-matches", type=int, default=6,
+                    help="Shrink FDR scores toward 0 for early GWs using gw_orig-1 prior matches (0 disables).")
+    ap.add_argument("--fdr-audit", dest="fdr_audit", action="store_true",
+                    help="Write FDR audit correlations to logs/fdr_audit.csv when possible.")
+    ap.add_argument("--no-fdr-audit", dest="fdr_audit", action="store_false",
+                    help="Disable FDR audit output.")
+    ap.set_defaults(fdr_audit=True)
 
     # Behavior
     ap.add_argument("--strict-ids", action="store_true", default=False,
@@ -832,6 +1034,10 @@ def main() -> None:
         hybrid_cutoff=args.hybrid_cutoff,
         w_att=args.w_att,
         w_def=args.w_def,
+        home_adv_mode=args.home_adv_mode,
+        home_adv=args.home_adv,
+        fdr_shrink_matches=args.fdr_shrink_matches,
+        fdr_audit=args.fdr_audit,
     )
 
 if __name__ == "__main__":

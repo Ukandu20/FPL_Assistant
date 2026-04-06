@@ -1,134 +1,88 @@
-import requests
 import json
 import time
+from typing import Any
+
+import requests
+
+
+FPL_API_BASE = "https://fantasy.premierleague.com/api"
+DEFAULT_TIMEOUT = 20
+DEFAULT_ATTEMPTS = 3
+RETRY_SLEEP_SECONDS = 2
+DEFAULT_HEADERS = {
+    "User-Agent": "FPL-Assistant/1.0 (+https://fantasy.premierleague.com/)",
+    "Accept": "application/json",
+}
+
+
+class FPLApiError(RuntimeError):
+    """Raised when the FPL API cannot be reached or returns an invalid response."""
+
+
+def _request_json(url: str, *, attempts: int = DEFAULT_ATTEMPTS, timeout: int = DEFAULT_TIMEOUT) -> Any:
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(RETRY_SLEEP_SECONDS)
+        except ValueError as exc:
+            raise FPLApiError(f"FPL API returned invalid JSON from {url}") from exc
+
+    raise FPLApiError(
+        f"Failed to fetch {url} after {attempts} attempts. "
+        "Check internet access and DNS resolution for fantasy.premierleague.com."
+    ) from last_error
+
 
 def get_data():
-    """ Retrieve the fpl player data from the hard-coded url
-    """
-    response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    responseStr = response.text
-    data = json.loads(responseStr)
-    return data
+    """Retrieve the FPL bootstrap data."""
+    return _request_json(f"{FPL_API_BASE}/bootstrap-static/")
+
 
 def get_individual_player_data(player_id):
-    """ Retrieve the player-specific detailed data
+    """Retrieve player-specific detailed data."""
+    return _request_json(f"{FPL_API_BASE}/element-summary/{player_id}/")
 
-    Args:
-        player_id (int): ID of the player whose data is to be retrieved
-    """
-    base_url = "https://fantasy.premierleague.com/api/element-summary/"
-    full_url = base_url + str(player_id) + "/"
-    response = ''
-    while response == '':
-        try:
-            response = requests.get(full_url)
-        except:
-            time.sleep(5)
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    data = json.loads(response.text)
-    return data
 
 def get_entry_data(entry_id):
-    """ Retrieve the summary/history data for a specific entry/team
+    """Retrieve the summary/history data for a specific entry/team."""
+    return _request_json(f"{FPL_API_BASE}/entry/{entry_id}/history/")
 
-    Args:
-        entry_id (int) : ID of the team whose data is to be retrieved
-    """
-    base_url = "https://fantasy.premierleague.com/api/entry/"
-    full_url = base_url + str(entry_id) + "/history/"
-    response = ''
-    while response == '':
-        try:
-            response = requests.get(full_url)
-        except:
-            time.sleep(5)
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    data = json.loads(response.text)
-    return data
 
 def get_entry_personal_data(entry_id):
-    """ Retrieve the summary/history data for a specific entry/team
+    """Retrieve the personal data for a specific entry/team."""
+    return _request_json(f"{FPL_API_BASE}/entry/{entry_id}/")
 
-    Args:
-        entry_id (int) : ID of the team whose data is to be retrieved
-    """
-    base_url = "https://fantasy.premierleague.com/api/entry/"
-    full_url = base_url + str(entry_id) + "/"
-    response = ''
-    while response == '':
-        try:
-            response = requests.get(full_url)
-        except:
-            time.sleep(5)
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    data = json.loads(response.text)
-    return data
 
-def get_entry_gws_data(entry_id,num_gws,start_gw=1):
-    """ Retrieve the gw-by-gw data for a specific entry/team
-
-    Args:
-        entry_id (int) : ID of the team whose data is to be retrieved
-    """
-    base_url = "https://fantasy.premierleague.com/api/entry/"
+def get_entry_gws_data(entry_id, num_gws, start_gw=1):
+    """Retrieve GW-by-GW data for a specific entry/team."""
     gw_data = []
-    for i in range(start_gw, num_gws+1):
-        full_url = base_url + str(entry_id) + "/event/" + str(i) + "/picks/"
-        response = ''
-        while response == '':
-            try:
-                response = requests.get(full_url)
-            except:
-                time.sleep(5)
-        if response.status_code != 200:
-            raise Exception("Response was code " + str(response.status_code))
-        data = json.loads(response.text)
-        gw_data += [data]
+    for i in range(start_gw, num_gws + 1):
+        gw_data.append(_request_json(f"{FPL_API_BASE}/entry/{entry_id}/event/{i}/picks/"))
     return gw_data
 
-def get_entry_transfers_data(entry_id):
-    """ Retrieve the transfer data for a specific entry/team
 
-    Args:
-        entry_id (int) : ID of the team whose data is to be retrieved
-    """
-    base_url = "https://fantasy.premierleague.com/api/entry/"
-    full_url = base_url + str(entry_id) + "/transfers/"
-    response = ''
-    while response == '':
-        try:
-            response = requests.get(full_url)
-        except:
-            time.sleep(5)
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    data = json.loads(response.text)
-    return data
+def get_entry_transfers_data(entry_id):
+    """Retrieve transfer data for a specific entry/team."""
+    return _request_json(f"{FPL_API_BASE}/entry/{entry_id}/transfers/")
+
 
 def get_fixtures_data():
-    """ Retrieve the fixtures data for the season
-    """
-    url = "https://fantasy.premierleague.com/api/fixtures/"
-    response = ''
-    while response == '':
-        try:
-            response = requests.get(url)
-        except:
-            time.sleep(5)
-    if response.status_code != 200:
-        raise Exception("Response was code " + str(response.status_code))
-    data = json.loads(response.text)
-    return data
+    """Retrieve fixtures data for the season."""
+    return _request_json(f"{FPL_API_BASE}/fixtures/")
+
 
 def main():
     data = get_data()
-    with open('raw.json', 'w') as outf:
+    with open("raw.json", "w") as outf:
         json.dump(data, outf)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

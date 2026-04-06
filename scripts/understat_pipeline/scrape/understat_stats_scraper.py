@@ -66,6 +66,7 @@ SHOT_RESULTS = {
 TABLE_CHOICES = [
     "schedule",
     "team_match",
+    "team_season",
     "player_season",
     "player_match",
     "shot_events",
@@ -501,6 +502,9 @@ class UnderstatApi:
                         "away_goals": _as_int(match["goals"]["a"]),
                         "home_xg": _as_float(match["xG"]["h"]),
                         "away_xg": _as_float(match["xG"]["a"]),
+                        "forecast_home_win": _as_float((match.get("forecast") or {}).get("w")),
+                        "forecast_draw": _as_float((match.get("forecast") or {}).get("d")),
+                        "forecast_away_win": _as_float((match.get("forecast") or {}).get("l")),
                         "is_result": _as_bool(match["isResult"]),
                         "has_data": has_data,
                         "url": UNDERSTAT_URL + f"/match/{match_id}",
@@ -575,19 +579,44 @@ class UnderstatApi:
                     if match_id not in stats:
                         stats[match_id] = schedule[match_id]
 
-                    ppda = match["ppda"]
-                    team_ppda = (ppda["att"] / ppda["def"]) if ppda["def"] != 0 else pd.NA
+                    ppda = match.get("ppda", {})
+                    ppda_allowed = match.get("ppda_allowed", {})
+                    team_ppda = pd.NA
+                    team_ppda_allowed = pd.NA
+
+                    if isinstance(ppda, dict):
+                        ppda_att = _as_float(ppda.get("att"))
+                        ppda_def = _as_float(ppda.get("def"))
+                        if ppda_def not in (None, 0):
+                            team_ppda = _as_float(ppda_att / ppda_def if ppda_att is not None else pd.NA)
+
+                    if isinstance(ppda_allowed, dict):
+                        ppda_allowed_att = _as_float(ppda_allowed.get("att"))
+                        ppda_allowed_def = _as_float(ppda_allowed.get("def"))
+                        if ppda_allowed_def not in (None, 0):
+                            team_ppda_allowed = _as_float(
+                                ppda_allowed_att / ppda_allowed_def if ppda_allowed_att is not None else pd.NA
+                            )
 
                     stats[match_id].update(
                         {
                             f"{prefix}_points": _as_int(match["pts"]),
                             f"{prefix}_expected_points": _as_float(match["xpts"]),
                             f"{prefix}_goals": _as_int(match["scored"]),
+                            f"{prefix}_goals_against": _as_int(match.get("missed")),
                             f"{prefix}_xg": _as_float(match["xG"]),
+                            f"{prefix}_xga": _as_float(match.get("xGA")),
                             f"{prefix}_np_xg": _as_float(match["npxG"]),
+                            f"{prefix}_np_xga": _as_float(match.get("npxGA")),
                             f"{prefix}_np_xg_difference": _as_float(match["npxGD"]),
+                            f"{prefix}_wins": _as_int(match.get("wins")),
+                            f"{prefix}_draws": _as_int(match.get("draws")),
+                            f"{prefix}_losses": _as_int(match.get("loses")),
+                            f"{prefix}_result": _as_str(match.get("result")),
                             f"{prefix}_ppda": _as_float(team_ppda),
+                            f"{prefix}_ppda_allowed": _as_float(team_ppda_allowed),
                             f"{prefix}_deep_completions": _as_int(match["deep"]),
+                            f"{prefix}_deep_completions_allowed": _as_int(match.get("deep_allowed")),
                         }
                     )
 
@@ -603,6 +632,162 @@ class UnderstatApi:
             .sort_index()
             .convert_dtypes()
         )
+
+    def read_team_season_stats(self, force_cache: bool = False) -> pd.DataFrame:
+        df_team_match = self.read_team_match_stats(force_cache=force_cache)
+        index = ["league", "season", "team"]
+        if len(df_team_match) == 0:
+            return pd.DataFrame(index=index)
+
+        tm = df_team_match.reset_index()
+
+        home = tm[
+            [
+                "league",
+                "season",
+                "league_id",
+                "season_id",
+                "game_id",
+                "home_team_id",
+                "home_team",
+                "home_team_code",
+                "away_team_id",
+                "away_team",
+                "away_team_code",
+                "home_points",
+                "home_expected_points",
+                "home_goals",
+                "home_goals_against",
+                "home_xg",
+                "home_xga",
+                "home_np_xg",
+                "home_np_xga",
+                "home_np_xg_difference",
+                "home_ppda",
+                "home_ppda_allowed",
+                "home_deep_completions",
+                "home_deep_completions_allowed",
+            ]
+        ].rename(
+            columns={
+                "home_team_id": "team_id",
+                "home_team": "team",
+                "home_team_code": "team_code",
+                "away_team_id": "opponent_id",
+                "away_team": "opponent",
+                "away_team_code": "opponent_code",
+                "home_points": "points",
+                "home_expected_points": "expected_points",
+                "home_goals": "goals_for",
+                "home_goals_against": "goals_against",
+                "home_xg": "xg",
+                "home_xga": "xga",
+                "home_np_xg": "np_xg",
+                "home_np_xga": "np_xga",
+                "home_np_xg_difference": "np_xg_difference",
+                "home_ppda": "ppda",
+                "home_ppda_allowed": "ppda_allowed",
+                "home_deep_completions": "deep_completions",
+                "home_deep_completions_allowed": "deep_completions_allowed",
+            }
+        )
+        home["is_home"] = True
+
+        away = tm[
+            [
+                "league",
+                "season",
+                "league_id",
+                "season_id",
+                "game_id",
+                "away_team_id",
+                "away_team",
+                "away_team_code",
+                "home_team_id",
+                "home_team",
+                "home_team_code",
+                "away_points",
+                "away_expected_points",
+                "away_goals",
+                "away_goals_against",
+                "away_xg",
+                "away_xga",
+                "away_np_xg",
+                "away_np_xga",
+                "away_np_xg_difference",
+                "away_ppda",
+                "away_ppda_allowed",
+                "away_deep_completions",
+                "away_deep_completions_allowed",
+            ]
+        ].rename(
+            columns={
+                "away_team_id": "team_id",
+                "away_team": "team",
+                "away_team_code": "team_code",
+                "home_team_id": "opponent_id",
+                "home_team": "opponent",
+                "home_team_code": "opponent_code",
+                "away_points": "points",
+                "away_expected_points": "expected_points",
+                "away_goals": "goals_for",
+                "away_goals_against": "goals_against",
+                "away_xg": "xg",
+                "away_xga": "xga",
+                "away_np_xg": "np_xg",
+                "away_np_xga": "np_xga",
+                "away_np_xg_difference": "np_xg_difference",
+                "away_ppda": "ppda",
+                "away_ppda_allowed": "ppda_allowed",
+                "away_deep_completions": "deep_completions",
+                "away_deep_completions_allowed": "deep_completions_allowed",
+            }
+        )
+        away["is_home"] = False
+
+        team_match = pd.concat([home, away], ignore_index=True)
+        team_match["win"] = (team_match["goals_for"] > team_match["goals_against"]).astype("Int64")
+        team_match["draw"] = (team_match["goals_for"] == team_match["goals_against"]).astype("Int64")
+        team_match["loss"] = (team_match["goals_for"] < team_match["goals_against"]).astype("Int64")
+
+        out = (
+            team_match.groupby(["league", "season", "team"], as_index=False)
+            .agg(
+                league_id=("league_id", "first"),
+                season_id=("season_id", "first"),
+                team_id=("team_id", "first"),
+                team_code=("team_code", "first"),
+                matches=("game_id", "count"),
+                home_matches=("is_home", "sum"),
+                wins=("win", "sum"),
+                draws=("draw", "sum"),
+                losses=("loss", "sum"),
+                points=("points", "sum"),
+                expected_points=("expected_points", "sum"),
+                goals_for=("goals_for", "sum"),
+                goals_against=("goals_against", "sum"),
+                xg=("xg", "sum"),
+                xga=("xga", "sum"),
+                np_xg=("np_xg", "sum"),
+                np_xga=("np_xga", "sum"),
+                np_xg_difference=("np_xg_difference", "sum"),
+                deep_completions=("deep_completions", "sum"),
+                deep_completions_allowed=("deep_completions_allowed", "sum"),
+                ppda=("ppda", "mean"),
+                ppda_allowed=("ppda_allowed", "mean"),
+            )
+            .assign(
+                away_matches=lambda g: g["matches"] - g["home_matches"],
+                goal_difference=lambda g: g["goals_for"] - g["goals_against"],
+                xg_difference=lambda g: g["xg"] - g["xga"],
+                np_xg_against=lambda g: g["np_xga"],
+            )
+            .set_index(index)
+            .sort_index()
+            .convert_dtypes()
+        )
+
+        return out
 
     def read_player_season_stats(self, force_cache: bool = False) -> pd.DataFrame:
         df_seasons = self.read_seasons()
@@ -706,6 +891,8 @@ class UnderstatApi:
                 for player in team_players.values():
                     team_id = player["team_id"]
                     team = team_id_to_name[team_id]
+                    roster_in = _as_int(player.get("roster_in"))
+                    roster_out = _as_int(player.get("roster_out"))
                     stats.append(
                         {
                             "league": league,
@@ -717,9 +904,13 @@ class UnderstatApi:
                             "team": team,
                             "team_id": _as_int(team_id),
                             "player": _as_str(player["player"]),
+                            "roster_id": _as_int(player.get("id")),
                             "player_id": _as_int(player["player_id"]),
+                            "home_away": _as_str(player.get("h_a")),
                             "position": _as_str(player["position"]),
                             "position_id": _as_int(player["positionOrder"]),
+                            "roster_in": roster_in,
+                            "roster_out": roster_out,
                             "minutes": _as_int(player["time"]),
                             "goals": _as_int(player["goals"]),
                             "own_goals": _as_int(player["own_goals"]),
@@ -782,6 +973,9 @@ class UnderstatApi:
                     team_id = team_name_to_id[team]
                     assist_player = _as_str(shot["player_assisted"])
                     assist_player_id = player_name_to_id.get(str(assist_player), pd.NA)
+                    shot_type_raw = _as_str(shot.get("shotType"))
+                    shot_situation_raw = _as_str(shot.get("situation"))
+                    shot_result_raw = _as_str(shot.get("result"))
                     shots.append(
                         {
                             "league_id": league_id,
@@ -790,21 +984,32 @@ class UnderstatApi:
                             "season": season,
                             "game_id": game_id,
                             "game": game,
+                            "understat_match_id": _as_int(shot.get("match_id")),
+                            "understat_season": _as_str(shot.get("season")),
                             "date": shot["date"],
                             "shot_id": _as_int(shot["id"]),
+                            "home_away": _as_str(shot.get("h_a")),
                             "team_id": team_id,
                             "team": team,
+                            "home_team_name": _as_str(shot.get("h_team")),
+                            "away_team_name": _as_str(shot.get("a_team")),
+                            "home_goals": _as_int(shot.get("h_goals")),
+                            "away_goals": _as_int(shot.get("a_goals")),
                             "player_id": _as_int(shot["player_id"]),
                             "player": shot["player"],
                             "assist_player_id": assist_player_id,
                             "assist_player": assist_player,
+                            "last_action": _as_str(shot.get("lastAction")),
                             "xg": _as_float(shot["xG"]),
                             "location_x": _as_float(shot["X"]),
                             "location_y": _as_float(shot["Y"]),
                             "minute": _as_int(shot["minute"]),
-                            "body_part": SHOT_BODY_PARTS.get(shot["shotType"], pd.NA),
-                            "situation": SHOT_SITUATIONS.get(shot["situation"], pd.NA),
-                            "result": SHOT_RESULTS.get(shot["result"], pd.NA),
+                            "shot_type_raw": shot_type_raw,
+                            "situation_raw": shot_situation_raw,
+                            "result_raw": shot_result_raw,
+                            "body_part": SHOT_BODY_PARTS.get(shot_type_raw, pd.NA),
+                            "situation": SHOT_SITUATIONS.get(shot_situation_raw, pd.NA),
+                            "result": SHOT_RESULTS.get(shot_result_raw, pd.NA),
                         }
                     )
 
@@ -926,6 +1131,29 @@ def scrape_one(
             except Exception as e:
                 log.warning("Failed to scrape team_match for %s %s: %s", league, season, e)
                 summary["failed"].append("team_match")
+            _snooze(delay)
+
+    if "team_season" in tables:
+        out_path_base = out_dir / "team_season"
+        if _maybe_skip(out_path_base):
+            log.info("Skipping team_season for %s %s (existing CSV).", league, season)
+            summary["skipped_existing"].append("team_season")
+        else:
+            try:
+                df = _with_backoff(
+                    us.read_team_season_stats,
+                    max_retries=max_retries,
+                    base_delay=backoff_base,
+                    kwargs={"force_cache": force_cache},
+                    count_as_network=not force_cache,
+                    periodic_every=periodic_every,
+                    periodic_secs=periodic_secs,
+                )
+                safe_write(df, out_path_base)
+                summary["scraped_ok"].append("team_season")
+            except Exception as e:
+                log.warning("Failed to scrape team_season for %s %s: %s", league, season, e)
+                summary["failed"].append("team_season")
             _snooze(delay)
 
     if "player_season" in tables:

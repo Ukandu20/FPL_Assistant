@@ -37,7 +37,12 @@ import pandas as pd
 
 from scripts.fpl_pipeline.utils.parse_helpers import *  # noqa: F401,F403
 from scripts.fpl_pipeline.clean.cleaners import clean_players, id_players, get_player_ids
-from scripts.fpl_pipeline.scrape.api_client import get_data, get_individual_player_data, get_fixtures_data
+from scripts.fpl_pipeline.scrape.api_client import (
+    FPLApiError,
+    get_data,
+    get_individual_player_data,
+    get_fixtures_data,
+)
 from scripts.fpl_pipeline.analysis.gw_data_collector import collect_gw, merge_gw
 
 
@@ -357,7 +362,10 @@ def main():
     parser.add_argument("--fresh", action="store_true",
                         help="Optional: remove known generated CSVs in season folder before writing.")
     args = parser.parse_args()
-    parse_data(args.season, args.fresh)
+    try:
+        parse_data(args.season, args.fresh)
+    except FPLApiError as exc:
+        parser.exit(1, f"ERROR: {exc}\n")
 
 if __name__ == "__main__":
     main()
