@@ -2,23 +2,23 @@ from __future__ import annotations
 
 import io
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault(
-    "SOCCERDATA_DIR",
-    str((Path(__file__).resolve().parents[1] / "data" / "_soccerdata_cache_test").resolve()),
+from fpl_assistant.providers.fbref import (
+    PatchedFBref,
+    build_fbref_reader,
+    match_stats_scraper,
+    resolve_browser_path,
+    season_stats_scraper,
 )
-
-from scripts.fbref_pipeline.scrape import match_stats_scraper, season_stats_scraper
-from scripts.fbref_pipeline.scrape.fbref_adapter import PatchedFBref, build_fbref_reader, resolve_browser_path
+from fpl_assistant.testing.paths import get_test_run_dir, get_test_soccerdata_dir
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "fbref_adapter"
-TMP_ROOT = Path(__file__).parent / ".tmp_fbref_adapter"
+TMP_ROOT = get_test_run_dir("fbref_adapter")
+os.environ.setdefault("SOCCERDATA_DIR", str(get_test_soccerdata_dir().resolve()))
 
 
 def _workspace_tmp(name: str) -> Path:

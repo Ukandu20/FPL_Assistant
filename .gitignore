@@ -1,6 +1,7 @@
-data
-src
 Fantasy-Premier-League
+data/
+src/data/
+apps/fpl/data/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -44,6 +45,9 @@ htmlcov/
 .coverage.*
 .cache
 .pytest_cache/
+artifacts/
+tests/.tmp_*/
+downloaded_files/
 nosetests.xml
 coverage.xml
 *.cover

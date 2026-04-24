@@ -2,21 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault(
-    "SOCCERDATA_DIR",
-    str((Path(__file__).resolve().parents[1] / "data" / "_soccerdata_cache_test").resolve()),
-)
-
-from scripts.fbref_pipeline.scrape import whoscored_match_stats_scraper as ws
-from scripts.fbref_pipeline.scrape import whoscored_scraper as ws_legacy
-from scripts.fbref_pipeline.scrape.whoscored_native_backend import (
+from fpl_assistant.providers.whoscored import whoscored_match_stats_scraper as ws
+from fpl_assistant.providers.whoscored import whoscored_scraper as ws_legacy
+from fpl_assistant.providers.whoscored import (
     CompetitionConfig,
     extract_match_centre_payload,
     parse_calendar_mask,
@@ -25,9 +18,11 @@ from scripts.fbref_pipeline.scrape.whoscored_native_backend import (
     parse_schedule_month_payload,
     parse_season_options,
 )
+from fpl_assistant.testing.paths import get_test_soccerdata_dir
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "whoscored"
+os.environ.setdefault("SOCCERDATA_DIR", str(get_test_soccerdata_dir().resolve()))
 
 
 def _sample_payload() -> dict:

@@ -1,185 +1,45 @@
 #!/usr/bin/env python3
 # apps/streamlit_app.py
 from __future__ import annotations
-import json, subprocess, sys, shutil, time, re
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Iterable, Counter
 
-import pandas as pd
-import streamlit as st
+import json
+import sys
 from collections import Counter
+from typing import Optional
+
+import streamlit as st
+
+from fpl_assistant.apps.services import control_panel as cp
 
 # ----------------------------- CONFIG ----------------------------------------
-REPO_ROOT         = Path(".").resolve()
-DATA_ROOT         = REPO_ROOT / "data"
-PRED_ROOT         = DATA_ROOT / "predictions"
-PLANS_ROOT        = DATA_ROOT / "plans"
-REGISTRY_ROOT     = DATA_ROOT / "processed" / "registry"
-TEAM_STATE_PATH   = DATA_ROOT / "state" / "team_state.json"
-TEAMS_JSON        = REGISTRY_ROOT / "master_teams.json"
-
-DEFAULT_LEAGUE    = "ENG-Premier League"
+DEFAULT_LEAGUE = cp.DEFAULT_LEAGUE
+PRED_ROOT = cp.PRED_ROOT
+PLANS_ROOT = cp.PLANS_ROOT
+TEAM_STATE_PATH = cp.TEAM_STATE_PATH
 
 # ----------------------------- HELPERS ----------------------------------------
-def _load_json(p: Path, fallback: dict | None = None) -> dict:
-    if not p.exists(): return fallback or {}
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+_load_json = cp.load_json
+_save_json = cp.save_json
+_backup_file = cp.backup_file
 
-def _save_json(p: Path, obj: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
-    tmp.replace(p)
-
-def _backup_file(p: Path) -> None:
-    if p.exists():
-        backup = p.with_suffix(".bak")
-        shutil.copy2(p, backup)
-
-def _first_existing(paths: List[Path]) -> Optional[Path]:
-    for p in paths:
-        if p.exists():
-            return p
-    return None
-
-def detect_latest_season() -> Optional[str]:
-    # Prefer seasons present under data/plans/<season> or data/predictions/*/<season>
-    season_pat = re.compile(r"^\d{4}-\d{4}$")
-    candidates: set[str] = set()
-    # from plans
-    if PLANS_ROOT.exists():
-        for d in PLANS_ROOT.iterdir():
-            if d.is_dir():
-                # single/<season> or <season>/multi
-                if d.name == "single":
-                    for sd in d.iterdir():
-                        if sd.is_dir() and season_pat.match(sd.name):
-                            candidates.add(sd.name)
-                elif season_pat.match(d.name):
-                    candidates.add(d.name)
-    # from predictions
-    if PRED_ROOT.exists():
-        for sub in PRED_ROOT.iterdir():
-            if sub.is_dir():
-                for d in sub.iterdir():
-                    if d.is_dir() and season_pat.match(d.name):
-                        candidates.add(d.name)
-    if not candidates:
-        return None
-    return sorted(candidates)[-1]
+detect_latest_season = cp.detect_latest_season
 
 @st.cache_data(show_spinner=False)
-def read_table(path_csv_or_parquet: Path) -> pd.DataFrame:
-    if not path_csv_or_parquet or not path_csv_or_parquet.exists():
-        return pd.DataFrame()
-    if path_csv_or_parquet.suffix.lower() == ".parquet":
-        return pd.read_parquet(path_csv_or_parquet)
-    return pd.read_csv(path_csv_or_parquet)
+def read_table(path_csv_or_parquet):
+    return cp.read_table(path_csv_or_parquet)
 
-def find_latest_pred_path(season: str, subdir: str, stem: str) -> Optional[Path]:
-    cand = []
-    season_dir = PRED_ROOT / subdir / season
-    if season_dir.exists():
-        for ext in (".parquet", ".csv"):
-            cand.append(season_dir / f"{stem}{ext}")
-        gw_files = sorted(season_dir.glob("GW*.parquet")) + sorted(season_dir.glob("GW*.csv"))
-        if gw_files:
-            cand.insert(0, gw_files[-1])
-    for ext in (".parquet", ".csv"):
-        cand.append(PRED_ROOT / subdir / f"{stem}{ext}")
-    return _first_existing(cand)
+find_latest_pred_path = cp.find_latest_pred_path
 
-def find_latest_plan(season: str, mode: str) -> Optional[Path]:
-    if mode == "Single-GW":
-        base = PLANS_ROOT / "single" / season
-        if not base.exists(): return None
-        gws = sorted([d for d in base.iterdir() if d.is_dir() and d.name.isdigit()], key=lambda p: int(p.name))
-        for gw_dir in reversed(gws):
-            p = gw_dir / "plan.json"
-            if p.exists(): return p
-            chips_dir = gw_dir / "chips"
-            if chips_dir.exists():
-                for chip_dir in sorted(chips_dir.iterdir(), reverse=True):
-                    p = chip_dir / "plan.json"
-                    if p.exists(): return p
-        return None
-    else:
-        base = PLANS_ROOT / season / "multi" / "hold"
-        if not base.exists(): return None
-        windows = sorted([d for d in base.iterdir() if d.is_dir() and "gw" in d.name], key=lambda p: p.name)
-        for w in reversed(windows):
-            chips_root = w / "chips"
-            if chips_root.exists():
-                for chip_dir in sorted(chips_root.iterdir(), reverse=True):
-                    for k_dir in sorted(chip_dir.iterdir(), reverse=True):
-                        p = k_dir / "plan.json"
-                        if p.exists(): return p
-            base_root = w / "base"
-            if base_root.exists():
-                for k_dir in sorted(base_root.iterdir(), reverse=True):
-                    p = k_dir / "plan.json"
-                    if p.exists(): return p
-        return None
+find_latest_plan = cp.find_latest_plan
 
-def pretty_money(x: float | int | None) -> str:
-    if x is None: return "-"
-    return f"{x:.1f}"
+pretty_money = cp.pretty_money
 
-def run_cli_stream(argv: List[str], live_area, spinner_label="Running...") -> int:
-    """
-    Stream subprocess stdout+stderr live into a Streamlit area.
-    Returns return code.
-    """
-    live_area.expander("Live logs (click to expand)", expanded=True).write(" ".join(argv))
-    exp = live_area.expander("Output", expanded=True)
-    buf = []
-    try:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    except Exception as e:
-        exp.error(f"[launcher-error] {e}")
-        return 1
-    with st.spinner(spinner_label):
-        for line in iter(proc.stdout.readline, ''):
-            buf.append(line.rstrip("\n"))
-            # Keep last ~400 lines to avoid huge DOM
-            if len(buf) > 400:
-                buf = buf[-400:]
-            exp.code("\n".join(buf))
-        proc.stdout.close()
-        rc = proc.wait()
-    if rc == 0:
-        exp.success("Completed.")
-    else:
-        exp.error(f"Process exited with code {rc}")
-    return rc
+run_cli_stream = cp.run_cli_stream
 
 # ---------- Registry helpers for validation (best-effort; optional files) -----
 @st.cache_data(show_spinner=False)
-def load_teams_map() -> dict[str, str]:
-    """
-    Return map of team_id -> team short name if available.
-    """
-    teams = _load_json(TEAMS_JSON, {})
-    # Accept either {team_id:{...,"short":"ARS"}} or {"ARS":{"id":...}}
-    if isinstance(teams, dict):
-        # try to build reverse maps
-        if "teams" in teams and isinstance(teams["teams"], list):
-            out = {}
-            for t in teams["teams"]:
-                tid = str(t.get("team_id") or t.get("id") or t.get("code") or t.get("hex_id") or "")
-                short = t.get("short") or t.get("short_name") or t.get("name") or ""
-                if tid: out[tid] = short
-            return out
-        else:
-            # maybe flat dict keyed by id
-            out = {}
-            for k,v in teams.items():
-                if isinstance(v, dict):
-                    short = v.get("short") or v.get("short_name") or v.get("name") or ""
-                    out[str(k)] = short
-            if out: return out
-    return {}
+def load_teams_map():
+    return cp.load_teams_map()
 
 def _norm_pos(p: str|None) -> Optional[str]:
     if not p: return None

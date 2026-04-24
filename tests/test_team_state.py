@@ -2,7 +2,8 @@ import os
 import csv
 import tempfile
 import pytest
-from scripts.optimizers import team_state as ts
+
+from fpl_assistant.domain import team_state as ts
 
 SEASON_LONG = "2025-2026"
 SEASON_SHORT = "2025-26"
@@ -82,7 +83,7 @@ def test_swap_bank_non_negative():
     state = _empty_state(gw=4, budget=10.0)
     # Seed one MID (Bowen @7.9 at gw4) and set bank small so swap fails
     state.squad.append(ts.SquadEntry(
-        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="WHU",
+        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="team_whu", team="WHU",
         buy_price=7.8, sell_price=7.9, purchase_gw=3
     ))
     state.bank = 0.0  # no cash
@@ -98,11 +99,11 @@ def test_swap_composition_enforced():
     # Build valid 15-man squad at gw3
     # 2 GK
     state.squad.append(ts.SquadEntry(
-    player_id="gk1", name="gk1", pos="GK", team_id="AAA",
+    player_id="gk1", name="gk1", pos="GK", team_id="team_aaa", team="AAA",
     buy_price=4.5, sell_price=4.5, purchase_gw=3
     ))
     state.squad.append(ts.SquadEntry(
-        player_id="gk2", name="gk2", pos="GK", team_id="BBB",
+        player_id="gk2", name="gk2", pos="GK", team_id="team_bbb", team="BBB",
         buy_price=4.0, sell_price=4.0, purchase_gw=3
     ))
     # 5 DEF
@@ -110,21 +111,21 @@ def test_swap_composition_enforced():
     for i in range(1, 6):
         p = 4.0 if i == 1 else 4.5 if i == 2 else 5.0 if i in (3, 4) else 5.5
         state.squad.append(ts.SquadEntry(
-            player_id=f"def{i}", name=f"def{i}", pos="DEF", team_id="DEF",
+            player_id=f"def{i}", name=f"def{i}", pos="DEF", team_id="team_def", team="DEF",
             buy_price=p, sell_price=p, purchase_gw=3
         ))
 
     # 5 MID
     for i, p in enumerate([6.0, 6.5, 7.0, 7.5, 8.0], start=1):
         state.squad.append(ts.SquadEntry(
-            player_id=f"mid{i}", name=f"mid{i}", pos="MID", team_id="MID",
+            player_id=f"mid{i}", name=f"mid{i}", pos="MID", team_id="team_mid", team="MID",
             buy_price=p, sell_price=p, purchase_gw=3
         ))
 
     # 3 FWD
     for i, p in enumerate([6.5, 7.0, 7.5], start=1):
         state.squad.append(ts.SquadEntry(
-            player_id=f"fwd{i}", name=f"fwd{i}", pos="FWD", team_id="FWD",
+            player_id=f"fwd{i}", name=f"fwd{i}", pos="FWD", team_id="team_fwd", team="FWD",
             buy_price=p, sell_price=p, purchase_gw=3
         ))
 
@@ -144,10 +145,11 @@ def test_swap_composition_enforced():
 
 def test_fh_restore_bank_and_squad():
     master = _master_basic()
+    teams_map = {"ARS": "team_ars"}
     state = _empty_state(gw=3, budget=100.0)
     # Seed Bowen at gw3
     state.squad.append(ts.SquadEntry(
-        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="WHU",
+        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="team_whu", team="WHU",
         buy_price=7.8, sell_price=7.8, purchase_gw=3
     ))
     state.bank = 92.2
@@ -156,7 +158,15 @@ def test_fh_restore_bank_and_squad():
     ts.fh_begin(state, gw=4, chips_log=True)
     assert state.fh_active
     # Buy DEF at gw3 price 5.1
-    ts.buy_player_from_master(state, master, player_id="aaaa1111", season_long=SEASON_LONG, asof_gw=3, log=False)
+    ts.buy_player_from_master(
+        state,
+        master,
+        player_id="aaaa1111",
+        teams_map=teams_map,
+        season_long=SEASON_LONG,
+        asof_gw=3,
+        log=False,
+    )
     assert any(p.player_id=="aaaa1111" for p in state.squad)
     # Restore FH
     ts.fh_restore(state)
@@ -169,7 +179,7 @@ def test_prices_snapshot_lock_to_last_concluded():
     state = _empty_state(gw=3)
     # Put Bowen only
     state.squad.append(ts.SquadEntry(
-        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="WHU",
+        player_id="7b865b65", name="Jarrod Bowen", pos="MID", team_id="team_whu", team="WHU",
         buy_price=7.8, sell_price=7.8, purchase_gw=3
     ))
     # No gw given => lock to max known (4)
