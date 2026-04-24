@@ -54,11 +54,15 @@ from typing import Optional, Callable, Any, Dict, Tuple, List, Set
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import soccerdata as sd
 from lxml import html
 from requests.exceptions import HTTPError  # precise import
 from soccerdata._common import standardize_colnames
-from soccerdata.fbref import BIG_FIVE_DICT, _parse_table
+from scripts.fbref_pipeline.scrape.fbref_adapter import (
+    BIG_FIVE_DICT,
+    PatchedFBref,
+    _parse_table,
+    build_fbref_reader,
+)
 
 from scripts.fbref_pipeline.utils.fbref_utils import (
     STAT_MAP,          # expects keys: "team_match", "player_match"
@@ -162,7 +166,7 @@ def _is_comps_forbidden(exc: Exception) -> bool:
     return False
 
 
-def _read_leagues_from_cache(fb: sd.FBref, split_up_big5: bool = False) -> pd.DataFrame:
+def _read_leagues_from_cache(fb: PatchedFBref, split_up_big5: bool = False) -> pd.DataFrame:
     filepath = fb.data_dir / "leagues.html"
     if not filepath.is_file():
         raise FileNotFoundError(f"No cached leagues file at {filepath}")
@@ -199,7 +203,7 @@ def _read_leagues_from_cache(fb: sd.FBref, split_up_big5: bool = False) -> pd.Da
 
 
 def _ensure_leagues_html_in_data_dir(
-    fb: sd.FBref,
+    fb: PatchedFBref,
     leagues_html_path: Optional[str],
 ) -> bool:
     """
@@ -229,7 +233,7 @@ def _ensure_leagues_html_in_data_dir(
 
 
 
-def _enable_cached_leagues_fallback(fb: sd.FBref) -> bool:
+def _enable_cached_leagues_fallback(fb: PatchedFBref) -> bool:
     if not (fb.data_dir / "leagues.html").is_file():
         return False
 
@@ -250,7 +254,7 @@ def _enable_cached_leagues_fallback(fb: sd.FBref) -> bool:
     return True
 
 
-def _refresh_comps_cache_with_tls(fb: sd.FBref, headers: Dict[str, str]) -> bool:
+def _refresh_comps_cache_with_tls(fb: PatchedFBref, headers: Dict[str, str]) -> bool:
     try:
         import tls_requests  # type: ignore
     except Exception:
@@ -279,7 +283,7 @@ def _refresh_comps_cache_with_tls(fb: sd.FBref, headers: Dict[str, str]) -> bool
         return False
 
 
-def _install_session_headers(fb: sd.FBref, headers: Dict[str, str]) -> None:
+def _install_session_headers(fb: Any, headers: Dict[str, str]) -> None:
     if not headers:
         return
 
@@ -428,7 +432,7 @@ def _with_backoff(
 
 
 def _schema_only_from_previous(
-    fb_prev: Optional[sd.FBref],
+    fb_prev: Optional[PatchedFBref],
     level: str,      # "team_match" | "player_match" | "schedule"
     stat: str | None = None,
 ) -> pd.DataFrame:
@@ -478,7 +482,7 @@ def _schema_only_from_previous(
 
 
 def _try_team_aggregate(
-    fb: sd.FBref,
+    fb: PatchedFBref,
     stat: str,
     league: str,
     season_str: str,
@@ -693,6 +697,8 @@ def scrape_one(
     team_mode: str = "aggregate",  # 'aggregate' | 'auto' | 'direct'
     proxy: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
+    browser_path: Optional[str] = None,
+    headless: bool = False,
     levels: str = "both",
     player_stats: Optional[List[str]] = None,
     team_stats: Optional[List[str]] = None,
@@ -725,11 +731,17 @@ def scrape_one(
         cutoff_date_str,
     )
 
-    fb_kwargs = dict(leagues=league, seasons=season_str, no_cache=no_cache)
+    fb_kwargs = dict(
+        leagues=league,
+        seasons=season_str,
+        no_cache=no_cache,
+        browser_path=browser_path,
+        headless=headless,
+        headers=headers or {},
+    )
     if proxy:
         fb_kwargs["proxy"] = proxy
-    fb = sd.FBref(**fb_kwargs)
-    _install_session_headers(fb, headers or {})
+    fb = build_fbref_reader(**fb_kwargs)
 
     # IMPORTANT: patch read_leagues() early so schedule/read_seasons can't die on /en/comps/ 403
     _enable_cached_leagues_fallback(fb)
@@ -738,13 +750,15 @@ def scrape_one(
 
 
     try:
-        fb_prev = sd.FBref(
+        fb_prev = build_fbref_reader(
             leagues=league,
             seasons=_prev_season_str(season_str),
             no_cache=no_cache,
             proxy=proxy,
+            browser_path=browser_path,
+            headless=headless,
+            headers=headers or {},
         )
-        _install_session_headers(fb_prev, headers or {})
     except Exception:
         fb_prev = None
 
@@ -1114,7 +1128,7 @@ def scrape_one(
         _GLOBAL["net_calls"],
     )
 
-    return {
+    result = {
         "last_match_date": last_match_date_str,
         "latest_fixture": latest_fixture_meta,
         "cutoff_date": cutoff_date_str,
@@ -1123,6 +1137,10 @@ def scrape_one(
             "team_match": team_stats_summary,
         },
     }
+    if fb_prev is not None:
+        fb_prev.close()
+    fb.close()
+    return result
 
 
 # ───────────────────────── CLI ─────────────────────────
@@ -1237,6 +1255,17 @@ def main() -> None:
         type=str,
         default=None,
         help='Optional proxy passed to soccerdata (e.g., "tor" or "http://user:pass@host:port").',
+    )
+    p.add_argument(
+        "--browser-path",
+        type=str,
+        default=None,
+        help="Optional path to the Chrome or Edge executable used for FBref browser transport.",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the FBref browser transport in headless mode. Default is visible browser mode.",
     )
     p.add_argument(
         "--user-agent",
@@ -1355,7 +1384,13 @@ def main() -> None:
     meta_path = Path(args.meta_path)
 
     for league in leagues:
-        seasons = args.seasons or seasons_from_league(league)
+        seasons = args.seasons or seasons_from_league(
+            league,
+            proxy=args.proxy,
+            browser_path=args.browser_path,
+            headless=args.headless,
+            headers=headers,
+        )
         log.info("Resolved seasons for %s: %s", league, seasons)
 
         for s in seasons:
@@ -1407,6 +1442,8 @@ def main() -> None:
                 team_mode=args.team_mode,
                 proxy=args.proxy,
                 headers=headers,
+                browser_path=args.browser_path,
+                headless=args.headless,
                 levels=args.levels,
                 player_stats=args.player_stats,
                 team_stats=args.team_stats,

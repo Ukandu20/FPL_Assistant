@@ -1,0 +1,50 @@
+{
+  "ENG-Premier League": {
+    "WhoScored": "England - Premier League"
+  },
+  "ESP-La Liga": {
+    "WhoScored": "Spain - LaLiga"
+  },
+  "FRA-Ligue 1": {
+    "WhoScored": "France - Ligue 1"
+  },
+  "GER-Bundesliga": {
+    "WhoScored": "Germany - Bundesliga"
+  },
+  "INT-Africa Cup of Nations": {
+    "WhoScored": "INT-Africa Cup of Nations"
+  },
+  "INT-Copa America": {
+    "WhoScored": "INT-Copa America"
+  },
+  "INT-European Championship": {
+    "WhoScored": "International - European Championship"
+  },
+  "INT-European Championship qualification": {
+    "WhoScored": "INT-European Championship qualification"
+  },
+  "INT-UEFA Champions League": {
+    "WhoScored": "INT-UEFA Champions League"
+  },
+  "INT-UEFA Europa Conference League": {
+    "WhoScored": "INT-UEFA Europa Conference League"
+  },
+  "INT-UEFA Europa League": {
+    "WhoScored": "INT-UEFA Europa League"
+  },
+  "INT-UEFA Nations League": {
+    "WhoScored": "INT-UEFA Nations League"
+  },
+  "INT-UEFA Super Cup": {
+    "WhoScored": "INT-UEFA Super Cup"
+  },
+  "INT-World Cup": {
+    "WhoScored": "International - FIFA World Cup"
+  },
+  "INT-World Cup qualification": {
+    "WhoScored": "INT-World Cup qualification"
+  },
+  "ITA-Serie A": {
+    "WhoScored": "Italy - Serie A"
+  }
+}

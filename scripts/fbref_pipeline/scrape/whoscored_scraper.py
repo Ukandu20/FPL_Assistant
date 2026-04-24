@@ -5,10 +5,14 @@ import logging
 import warnings
 import re, os
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import pandas as pd
-import soccerdata as sd
+
+try:
+    import soccerdata as sd
+except ImportError:  # pragma: no cover - compatibility module
+    sd = None  # type: ignore[assignment]
 
 os.environ.setdefault("SOCCERDATA_LOGLEVEL", "ERROR")
 os.environ.setdefault("SOCCERDATA_DIR", str(Path("data/_soccerdata_cache").absolute()))
@@ -19,6 +23,7 @@ from scripts.fbref_pipeline.utils.fbref_utils import (
     init_logger,         # your logger config
     polite_sleep,        # rate limiter between requests
 )
+from scripts.fbref_pipeline.scrape.whoscored_match_stats_scraper import main as whoscored_main
 
 # ───────────────────────── Warning hygiene ─────────────────────────
 
@@ -255,7 +260,7 @@ def scrape_one(
 
 # ───────────────────────── CLI ─────────────────────────
 
-def main():
+def main(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         "Scrape WhoScored schedule and missing players (injuries/suspensions)"
     )
@@ -270,26 +275,35 @@ def main():
     parser.add_argument("--headless", dest="headless", action="store_true", default=True)
     parser.add_argument("--headed", dest="headless", action="store_false", help="Run Chrome with a visible window")
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(list(argv) if argv is not None else None)
 
-    init_logger(args.verbose)
-
-    # If seasons not provided, derive from league (likely "YYYY-YYYY"); we'll normalize to integers.
-    seasons = args.seasons or seasons_from_league(args.league)
-
-    out_base = Path(args.out_dir)
-    for s in seasons:
-        scrape_one(
-            league=args.league,
-            season=s,
-            out_base=out_base,
-            delay=args.delay,
-            proxy=args.proxy,
-            no_cache=args.no_cache,
-            no_store=args.no_store,
-            path_to_browser=args.path_to_browser,
-            headless=args.headless,
-        )
+    forwarded: List[str] = [
+        "--league",
+        args.league,
+        "--out-dir",
+        args.out_dir,
+        "--tables",
+        "schedule",
+        "missing_players",
+        "--no-derived-tables",
+        "--no-archive-raw-events",
+        "--delay",
+        str(args.delay),
+    ]
+    if args.seasons:
+        forwarded.extend(["--seasons", *args.seasons])
+    if args.proxy:
+        forwarded.extend(["--proxy", args.proxy])
+    if args.no_cache:
+        forwarded.append("--no-cache")
+    if args.no_store:
+        forwarded.append("--no-store")
+    if args.path_to_browser:
+        forwarded.extend(["--browser", args.path_to_browser])
+    forwarded.append("--headless" if args.headless else "--headed")
+    if args.verbose:
+        forwarded.append("--verbose")
+    whoscored_main(forwarded)
 
 if __name__ == "__main__":
     main()

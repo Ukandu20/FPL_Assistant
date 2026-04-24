@@ -1,0 +1,114 @@
+{
+  "ENG-Premier League": {
+    "source_name": "England - Premier League",
+    "region_id": 252,
+    "tournament_id": 2,
+    "competition_type": "club",
+    "season_mode": "split-year"
+  },
+  "ESP-La Liga": {
+    "source_name": "Spain - LaLiga",
+    "region_id": 206,
+    "tournament_id": 4,
+    "competition_type": "club",
+    "season_mode": "split-year"
+  },
+  "ITA-Serie A": {
+    "source_name": "Italy - Serie A",
+    "region_id": 108,
+    "tournament_id": 5,
+    "competition_type": "club",
+    "season_mode": "split-year"
+  },
+  "GER-Bundesliga": {
+    "source_name": "Germany - Bundesliga",
+    "region_id": 81,
+    "tournament_id": 3,
+    "competition_type": "club",
+    "season_mode": "split-year"
+  },
+  "FRA-Ligue 1": {
+    "source_name": "France - Ligue 1",
+    "region_id": 74,
+    "tournament_id": 22,
+    "competition_type": "club",
+    "season_mode": "split-year"
+  },
+  "INT-UEFA Champions League": {
+    "source_name": "Europe - Champions League",
+    "region_id": 250,
+    "tournament_id": 12,
+    "competition_type": "international",
+    "season_mode": "split-year"
+  },
+  "INT-UEFA Europa League": {
+    "source_name": "Europe - Europa League",
+    "region_id": 250,
+    "tournament_id": 30,
+    "competition_type": "international",
+    "season_mode": "split-year"
+  },
+  "INT-UEFA Europa Conference League": {
+    "source_name": "Europe - Conference League",
+    "region_id": 250,
+    "tournament_id": 715,
+    "competition_type": "international",
+    "season_mode": "split-year"
+  },
+  "INT-UEFA Super Cup": {
+    "source_name": "Europe - UEFA Super Cup",
+    "region_id": 250,
+    "tournament_id": 62,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-World Cup": {
+    "source_name": "International - FIFA World Cup",
+    "region_id": 247,
+    "tournament_id": 36,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-European Championship": {
+    "source_name": "International - European Championship",
+    "region_id": 247,
+    "tournament_id": 124,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-UEFA Nations League": {
+    "source_name": "International - UEFA Nations League A",
+    "region_id": 247,
+    "tournament_id": 683,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-Copa America": {
+    "source_name": "International - Copa America",
+    "region_id": 247,
+    "tournament_id": 94,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-Africa Cup of Nations": {
+    "source_name": "International - Africa Cup of Nations",
+    "region_id": 247,
+    "tournament_id": 104,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-World Cup qualification": {
+    "source_name": "International - World Cup Qualification UEFA",
+    "region_id": 247,
+    "tournament_id": 721,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  },
+  "INT-European Championship qualification": {
+    "source_name": "Europe - European Championship Qualification",
+    "region_id": 250,
+    "tournament_id": 751,
+    "competition_type": "international",
+    "season_mode": "single-year"
+  }
+}

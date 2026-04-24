@@ -1,0 +1,26 @@
+{
+  "major-international": [
+    "INT-World Cup",
+    "INT-European Championship",
+    "INT-UEFA Nations League",
+    "INT-Copa America",
+    "INT-Africa Cup of Nations"
+  ],
+  "major-international-qualifiers": [
+    "INT-World Cup qualification",
+    "INT-European Championship qualification"
+  ],
+  "top5-domestic": [
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "ITA-Serie A",
+    "GER-Bundesliga",
+    "FRA-Ligue 1"
+  ],
+  "uefa-club": [
+    "INT-UEFA Champions League",
+    "INT-UEFA Europa League",
+    "INT-UEFA Europa Conference League",
+    "INT-UEFA Super Cup"
+  ]
+}

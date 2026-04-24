@@ -1,0 +1,184 @@
+{
+  "matchId": 123456,
+  "startDate": "2025-08-15T19:00:00Z",
+  "startTime": "2025-08-15T19:00:00Z",
+  "matchStatus": "FT",
+  "venueName": "Example Stadium",
+  "refereeName": "Jane Ref",
+  "attendance": 60123,
+  "score": "2-1",
+  "homeScore": 2,
+  "awayScore": 1,
+  "home": {
+    "teamId": 10,
+    "name": "Home FC",
+    "formation": "4-3-3",
+    "stats": {
+      "possession": 57,
+      "shots": {
+        "total": 14,
+        "onTarget": 6
+      }
+    },
+    "players": [
+      {
+        "playerId": 101,
+        "name": "Home Starter",
+        "position": "FW",
+        "shirtNo": 9,
+        "isFirstEleven": true,
+        "stats": {
+          "shots": 4,
+          "keyPasses": 2
+        }
+      },
+      {
+        "playerId": 102,
+        "name": "Home Bench",
+        "position": "Sub",
+        "shirtNo": 18,
+        "isFirstEleven": false,
+        "stats": {
+          "touches": 8
+        }
+      }
+    ]
+  },
+  "away": {
+    "teamId": 20,
+    "name": "Away FC",
+    "formation": "4-2-3-1",
+    "stats": {
+      "possession": 43,
+      "shots": {
+        "total": 9,
+        "onTarget": 3
+      }
+    },
+    "players": [
+      {
+        "playerId": 201,
+        "name": "Away Starter",
+        "position": "MF",
+        "shirtNo": 8,
+        "isFirstEleven": true,
+        "stats": {
+          "passes": 41
+        }
+      },
+      {
+        "playerId": 202,
+        "name": "Away Bench",
+        "position": "Sub",
+        "shirtNo": 17,
+        "isFirstEleven": false,
+        "stats": {
+          "touches": 5
+        }
+      }
+    ]
+  },
+  "playerIdNameDictionary": {
+    "101": "Home Starter",
+    "102": "Home Bench",
+    "201": "Away Starter",
+    "202": "Away Bench"
+  },
+  "incidents": [
+    {
+      "minute": 11,
+      "type": {
+        "displayName": "Goal"
+      },
+      "subType": {
+        "displayName": "RightFoot"
+      },
+      "teamId": 10,
+      "playerId": 101,
+      "playerName": "Home Starter",
+      "text": "Opened the scoring"
+    }
+  ],
+  "facts": {
+    "attendance": 60123,
+    "corners": {
+      "home": 7,
+      "away": 2
+    }
+  },
+  "events": [
+    {
+      "id": 1,
+      "eventId": 1,
+      "expandedMinute": 0,
+      "minute": 0,
+      "second": 0,
+      "isTouch": false,
+      "outcomeType": {
+        "displayName": "Successful"
+      },
+      "period": {
+        "displayName": "PreMatch"
+      },
+      "qualifiers": [
+        {
+          "type": {
+            "displayName": "TeamPlayerFormation"
+          },
+          "value": "4-3-3"
+        }
+      ],
+      "teamId": 10,
+      "type": {
+        "displayName": "FormationSet"
+      },
+      "x": 0,
+      "y": 0
+    },
+    {
+      "id": 2,
+      "eventId": 2,
+      "expandedMinute": 0,
+      "minute": 0,
+      "second": 0,
+      "isTouch": false,
+      "outcomeType": {
+        "displayName": "Successful"
+      },
+      "period": {
+        "displayName": "FirstHalf"
+      },
+      "qualifiers": [],
+      "teamId": 20,
+      "type": {
+        "displayName": "Start"
+      },
+      "x": 0,
+      "y": 0
+    },
+    {
+      "id": 3,
+      "eventId": 3,
+      "expandedMinute": 12,
+      "minute": 12,
+      "second": 30,
+      "isTouch": true,
+      "outcomeType": {
+        "displayName": "Successful"
+      },
+      "period": {
+        "displayName": "FirstHalf"
+      },
+      "qualifiers": [],
+      "teamId": 10,
+      "playerId": 101,
+      "type": {
+        "displayName": "Pass"
+      },
+      "x": 50.0,
+      "y": 40.0,
+      "endX": 62.0,
+      "endY": 45.0
+    }
+  ]
+}

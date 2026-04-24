@@ -31,8 +31,8 @@ from pathlib import Path
 from typing import Optional, Callable, Any, Dict, Tuple, Sequence, List, Set
 
 import pandas as pd
-import soccerdata as sd
 from requests.exceptions import HTTPError
+from scripts.fbref_pipeline.scrape.fbref_adapter import PatchedFBref, build_fbref_reader
 
 from scripts.fbref_pipeline.utils.fbref_utils import (
     STAT_MAP,
@@ -181,7 +181,7 @@ def _with_backoff(
     raise last_exc if last_exc else RuntimeError("Transient error: retries exhausted without a captured exception.")
 
 def _schema_only_from_previous(
-    fb_prev: sd.FBref | None,
+    fb_prev: PatchedFBref | None,
     level: str,      # "team_season" | "player_season"
     stat: str,
 ) -> pd.DataFrame:
@@ -299,7 +299,7 @@ def _aggregate_team_from_player(p_df: pd.DataFrame, league: str, season: str) ->
     return grouped
 
 def _try_team_aggregate(
-    fb: sd.FBref,
+    fb: PatchedFBref,
     stat: str,
     league: str,
     season_str: str,
@@ -378,6 +378,8 @@ def scrape_one(
     periodic_secs: float = 15.0,
     team_mode: str = "aggregate",  # 'aggregate' | 'auto' | 'direct'
     proxy: Optional[str] = None,
+    browser_path: Optional[str] = None,
+    headless: bool = False,
     levels: str = "both",          # 'player' | 'team' | 'both'
     layout: str = "flat",          # 'flat' | 'folders'
     echo_config: bool = False,
@@ -400,13 +402,26 @@ def scrape_one(
         league, season_str, levels, team_mode, no_cache, force_cache, skip_existing_player, skip_existing_team, layout,
     )
 
-    fb_kwargs = dict(leagues=league, seasons=season_str, no_cache=no_cache)
+    fb_kwargs = dict(
+        leagues=league,
+        seasons=season_str,
+        no_cache=no_cache,
+        browser_path=browser_path,
+        headless=headless,
+    )
     if proxy:
         fb_kwargs["proxy"] = proxy
-    fb = sd.FBref(**fb_kwargs)
+    fb = build_fbref_reader(**fb_kwargs)
 
     try:
-        fb_prev = sd.FBref(leagues=league, seasons=_prev_season_str(season_str), no_cache=no_cache, proxy=proxy)
+        fb_prev = build_fbref_reader(
+            leagues=league,
+            seasons=_prev_season_str(season_str),
+            no_cache=no_cache,
+            proxy=proxy,
+            browser_path=browser_path,
+            headless=headless,
+        )
     except Exception:
         fb_prev = None
 
@@ -615,13 +630,17 @@ def scrape_one(
         league, season_str, levels, _GLOBAL["net_calls"]
     )
 
-    return {
+    result = {
         "cutoff_date": None,  # season tables don't use the match-style cutoff_date logic
         "stats_summary": {
             "player_season": player_summary,
             "team_season": team_summary,
         },
     }
+    if fb_prev is not None:
+        fb_prev.close()
+    fb.close()
+    return result
 
 # ───────────────────────── CLI ─────────────────────────
 
@@ -669,6 +688,17 @@ def main() -> None:
     p.add_argument("--levels", choices=["player", "team", "both"], default="both", help="Which levels to scrape.")
     p.add_argument("--layout", choices=["flat", "folders"], default="flat", help="Output naming layout.")
     p.add_argument("--proxy", type=str, default=None, help='Optional proxy for soccerdata (e.g., "tor" or URL).')
+    p.add_argument(
+        "--browser-path",
+        type=str,
+        default=None,
+        help="Optional path to the Chrome or Edge executable used for FBref browser transport.",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the FBref browser transport in headless mode. Default is visible browser mode.",
+    )
 
     p.add_argument(
         "--player-stats",
@@ -786,7 +816,12 @@ def main() -> None:
     out_base = Path(args.out_dir)
 
     for league in leagues:
-        seasons = args.seasons or seasons_from_league(league)
+        seasons = args.seasons or seasons_from_league(
+            league,
+            proxy=args.proxy,
+            browser_path=args.browser_path,
+            headless=args.headless,
+        )
         log.info("Resolved seasons for %s: %s", league, seasons)
 
         for s in seasons:
@@ -837,6 +872,8 @@ def main() -> None:
                 periodic_secs=args.periodic_secs,
                 team_mode=args.team_mode,
                 proxy=args.proxy,
+                browser_path=args.browser_path,
+                headless=args.headless,
                 levels=args.levels,
                 layout=args.layout,
                 echo_config=args.echo_config,

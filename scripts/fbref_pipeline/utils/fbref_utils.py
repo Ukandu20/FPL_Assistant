@@ -2,10 +2,11 @@
 from __future__ import annotations
 import logging, time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
-import soccerdata as sd
+
+from scripts.fbref_pipeline.scrape.fbref_adapter import build_fbref_reader
 
 STAT_MAP: Dict[str, List[str]] = {
     "team_season": [
@@ -32,9 +33,25 @@ def safe_write(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path.with_suffix(".csv"), index=True)
     logging.getLogger("fbref").debug("saved %s", path.with_suffix("").name)
 
-def seasons_from_league(league: str) -> list[str]:
-    fb = sd.FBref(leagues=league)
-    return fb.read_seasons().index.get_level_values("season").unique().tolist()
+def seasons_from_league(
+    league: str,
+    *,
+    proxy: Optional[str] = None,
+    browser_path: Optional[str] = None,
+    headless: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+) -> list[str]:
+    fb = build_fbref_reader(
+        leagues=league,
+        proxy=proxy,
+        browser_path=browser_path,
+        headless=headless,
+        headers=headers,
+    )
+    try:
+        return fb.read_seasons().index.get_level_values("season").unique().tolist()
+    finally:
+        fb.close()
 
 def init_logger(verbose: bool) -> None:
     logging.basicConfig(
