@@ -35,7 +35,7 @@ def test_resolve_browser_path_prefers_first_available(monkeypatch):
     edge.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(
-        "scripts.fbref_pipeline.scrape.fbref_adapter.DEFAULT_BROWSER_CANDIDATES",
+        "fpl_assistant.providers.fbref.scrape.fbref_adapter.DEFAULT_BROWSER_CANDIDATES",
         (chrome, edge),
     )
 
