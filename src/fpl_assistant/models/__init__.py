@@ -1,4 +1,4 @@
-from scripts.models import (
+from . import (
     defense_forecast,
     goals_assists_forecast,
     minutes_forecast,
@@ -13,4 +13,3 @@ __all__ = [
     "points_forecast",
     "saves_forecast",
 ]
-
