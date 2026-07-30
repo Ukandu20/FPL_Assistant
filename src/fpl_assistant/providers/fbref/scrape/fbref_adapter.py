@@ -18,7 +18,8 @@ from soccerdata._config import DATA_DIR, NOCACHE, NOSTORE, TEAMNAME_REPLACEMENTS
 
 FBREF_DATADIR = DATA_DIR / "FBref"
 FBREF_HEADERS = {
-    "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="138", "Not=A?Brand";v="24"',
 }
 
 BIG_FIVE_DICT = {
@@ -161,6 +162,60 @@ class PatchedFBref(sd.FBref):
             except Exception:
                 pass
             self._driver = None
+
+    def supports(self, level: str, stat_type: str) -> bool:
+        from fpl_assistant.providers.fbref.capabilities import (
+            normalize_stat_type,
+            supported_stats,
+        )
+
+        return normalize_stat_type(level, stat_type) in supported_stats(level)
+
+    @staticmethod
+    def _accepted_stat(level: str, stat_type: str) -> str:
+        from fpl_assistant.providers.fbref.capabilities import validate_requested_stats
+
+        return validate_requested_stats(level, [stat_type])[0]
+
+    def read_team_season_stats(
+        self, stat_type: str = "standard", *args: Any, **kwargs: Any
+    ) -> pd.DataFrame:
+        stat_type = self._accepted_stat("team_season", stat_type)
+        return super().read_team_season_stats(
+            *args, stat_type=stat_type, **kwargs
+        )
+
+    def read_team_match_stats(
+        self, stat_type: str = "schedule", *args: Any, **kwargs: Any
+    ) -> pd.DataFrame:
+        stat_type = self._accepted_stat("team_match", stat_type)
+        return super().read_team_match_stats(
+            *args, stat_type=stat_type, **kwargs
+        )
+
+    def read_player_season_stats(
+        self, stat_type: str = "standard", *args: Any, **kwargs: Any
+    ) -> pd.DataFrame:
+        stat_type = self._accepted_stat("player_season", stat_type)
+        return super().read_player_season_stats(
+            *args, stat_type=stat_type, **kwargs
+        )
+
+    def read_player_match_stats(
+        self, stat_type: str = "summary", *args: Any, **kwargs: Any
+    ) -> pd.DataFrame:
+        stat_type = self._accepted_stat("player_match", stat_type)
+        return super().read_player_match_stats(
+            *args, stat_type=stat_type, **kwargs
+        )
+
+    def read_lineups(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        """Stable provider-facing alias for soccerdata's singular method."""
+        return self.read_lineup(*args, **kwargs)
+
+    def read_match_events(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        """Stable provider-facing alias for the match event method."""
+        return self.read_events(*args, **kwargs)
 
     def __del__(self) -> None:
         self.close()

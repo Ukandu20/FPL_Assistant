@@ -6,25 +6,12 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from scripts.fbref_pipeline.scrape.fbref_adapter import build_fbref_reader
+from src.fpl_assistant.providers.fbref.capabilities import FBREF_CAPABILITIES
 
 STAT_MAP: Dict[str, List[str]] = {
-    "team_season": [
-        "standard", "keeper", "keeper_adv", "shooting", "passing", "passing_types",
-        "goal_shot_creation", "defense", "possession", "playing_time", "misc",
-    ],
-    "team_match": [
-        "schedule", "keeper", "shooting", "passing", "passing_types",
-        "goal_shot_creation", "defense", "possession", "misc",
-    ],
-    "player_season": [
-        "standard", "shooting", "passing", "passing_types", "goal_shot_creation",
-        "defense", "possession", "playing_time", "misc", "keeper", "keeper_adv",
-    ],
-    "player_match": [
-        "summary", "keepers", "passing", "passing_types", "defense",
-        "possession", "misc",
-    ],
+    level: list(stats)
+    for level, stats in FBREF_CAPABILITIES.items()
+    if level != "supplementary"
 }
 
 def safe_write(df: pd.DataFrame, path: Path) -> None:
@@ -41,6 +28,8 @@ def seasons_from_league(
     headless: bool = False,
     headers: Optional[Dict[str, str]] = None,
 ) -> list[str]:
+    from scripts.fbref_pipeline.scrape.fbref_adapter import build_fbref_reader
+
     fb = build_fbref_reader(
         leagues=league,
         proxy=proxy,

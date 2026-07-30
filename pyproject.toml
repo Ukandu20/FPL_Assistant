@@ -8,9 +8,29 @@ version = "0.1.0"
 description = "Fantasy Premier League data, forecasting, and planning toolkit."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+]
+
+[project.scripts]
+fpl-canonical = "fpl_assistant.canonical.cli:main"
 
 [project.optional-dependencies]
+scraping = [
+  "beautifulsoup4>=4.12",
+  "lxml>=5.0",
+  "requests>=2.31",
+  "selenium>=4.20",
+  "soccerdata>=1.8",
+  "undetected-chromedriver>=3.5",
+]
+modeling = [
+  "joblib>=1.3",
+  "lightgbm>=4.0",
+  "pulp>=2.8",
+  "scikit-learn>=1.4",
+]
 dev = [
   "pytest>=8.0",
 ]
@@ -20,4 +40,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

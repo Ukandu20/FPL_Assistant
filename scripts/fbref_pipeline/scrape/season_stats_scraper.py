@@ -44,16 +44,19 @@ from scripts.fbref_pipeline.utils.fbref_utils import (
 
 # Keep meta import consistent with match scraper
 from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId, record_last_run
+from src.fpl_assistant.providers.fbref.capabilities import (
+    coverage_from_outputs,
+    write_capability_document,
+    write_coverage_manifest,
+)
 
 # ───────────────────────── config & defaults ─────────────────────────
 
 PLAYER_SEASON_DEFAULTS: Sequence[str] = (
-    "standard", "shooting", "passing", "passing_types",
-    "defense", "possession", "misc", "gca", "xg", "keepers", "keepersadv",
+    "standard", "keeper", "shooting", "playing_time", "misc",
 )
 TEAM_SEASON_DEFAULTS: Sequence[str] = (
-    "standard", "shooting", "passing", "passing_types",
-    "defense", "possession", "misc", "gca", "xg", "keepers", "keepersadv",
+    "standard", "keeper", "shooting", "playing_time", "misc",
 )
 
 ALL_KNOWN_LEAGUES: List[str] = [
@@ -637,6 +640,19 @@ def scrape_one(
             "team_season": team_summary,
         },
     }
+    write_capability_document(out_dir / "_meta" / "fbref_capabilities.json")
+    coverage_records = coverage_from_outputs(
+        output_dir=out_dir,
+        statuses=result["stats_summary"],
+        layout=layout,
+    )
+    write_coverage_manifest(
+        out_dir / "_meta" / "coverage_manifest.json",
+        league=league,
+        season=season_str,
+        records=coverage_records,
+        extras={"layout": layout, "team_mode": team_mode},
+    )
     if fb_prev is not None:
         fb_prev.close()
     fb.close()

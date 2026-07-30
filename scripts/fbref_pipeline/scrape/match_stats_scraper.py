@@ -77,6 +77,13 @@ from scripts.fbref_pipeline.scrape.fbref_robust import (
 )
 
 from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId, record_last_run
+from src.fpl_assistant.providers.fbref.capabilities import (
+    LEVEL_SUPPLEMENTARY,
+    coverage_from_outputs,
+    validate_requested_stats,
+    write_capability_document,
+    write_coverage_manifest,
+)
 
 # ───────────────────────── known leagues ─────────────────────────
 
@@ -702,6 +709,7 @@ def scrape_one(
     levels: str = "both",
     player_stats: Optional[List[str]] = None,
     team_stats: Optional[List[str]] = None,
+    supplementary_stats: Optional[List[str]] = None,
     skip_existing: bool = False,
     skip_schedule: bool = False,
     leagues_html_path: Optional[str] = None,
@@ -764,6 +772,16 @@ def scrape_one(
 
     out_dir = out_base / league / season_str
     out_dir.mkdir(parents=True, exist_ok=True)
+    supplementary_to_run = validate_requested_stats(
+        LEVEL_SUPPLEMENTARY,
+        ["lineups"] if supplementary_stats is None else supplementary_stats,
+    )
+    supplementary_summary: Dict[str, List[str]] = {
+        "skipped_up_to_date": [],
+        "scraped_ok": [],
+        "incomplete_existing": [],
+        "schema_only": [],
+    }
 
     player_stats_summary: Dict[str, List[str]] = {
         "skipped_up_to_date": [],
@@ -900,6 +918,45 @@ def scrape_one(
 
     if latest_fixture_meta is not None:
         last_match_date_str = str(latest_fixture_meta.get("date"))
+
+    for stat in supplementary_to_run:
+        out_path_base = out_dir / "supplementary" / stat
+        if skip_existing and _csv_exists(out_path_base):
+            supplementary_summary["skipped_up_to_date"].append(stat)
+            continue
+        try:
+            if stat == "lineups":
+                read_fn = getattr(fb, "read_lineups", None) or getattr(fb, "read_lineup")
+            else:
+                read_fn = getattr(fb, "read_match_events", None) or getattr(fb, "read_events")
+            frame = _with_backoff(
+                read_fn,
+                max_retries=max_retries,
+                base_delay=backoff_base,
+                optional_kw={"force_cache": force_cache},
+                periodic_every=periodic_every,
+                periodic_secs=periodic_secs,
+            )
+            frame = _normalize(frame, league, season_str)
+            safe_write(frame, out_path_base)
+            supplementary_summary["scraped_ok"].append(stat)
+        except Exception as exc:
+            log.warning(
+                "FBref supplementary capability %s failed for %s %s: %s",
+                stat,
+                league,
+                season_str,
+                exc,
+            )
+            empty = pd.DataFrame(
+                columns=(
+                    ["league", "season", "game", "team", "player", "is_starter"]
+                    if stat == "lineups"
+                    else ["league", "season", "game", "team", "player", "minute", "event_type"]
+                )
+            )
+            safe_write(empty, out_path_base)
+            supplementary_summary["schema_only"].append(stat)
 
     # 2) Player-match stats
     if levels in ("player", "both"):
@@ -1135,8 +1192,25 @@ def scrape_one(
         "stats_summary": {
             "player_match": player_stats_summary,
             "team_match": team_stats_summary,
+            "supplementary": supplementary_summary,
         },
     }
+    write_capability_document(out_dir / "_meta" / "fbref_capabilities.json")
+    coverage_records = coverage_from_outputs(
+        output_dir=out_dir,
+        statuses=result["stats_summary"],
+        layout="folders",
+    )
+    write_coverage_manifest(
+        out_dir / "_meta" / "coverage_manifest.json",
+        league=league,
+        season=season_str,
+        records=coverage_records,
+        extras={
+            "cutoff_date": cutoff_date_str,
+            "latest_fixture": latest_fixture_meta,
+        },
+    )
     if fb_prev is not None:
         fb_prev.close()
     fb.close()
@@ -1300,6 +1374,15 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--supplementary-stats",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional subset of reduced supplementary FBref capabilities. "
+            "Supported values are lineups and events. Defaults to lineups."
+        ),
+    )
+    p.add_argument(
         "--skip-existing",
         action="store_true",
         help=(
@@ -1447,6 +1530,7 @@ def main() -> None:
                 levels=args.levels,
                 player_stats=args.player_stats,
                 team_stats=args.team_stats,
+                supplementary_stats=args.supplementary_stats,
                 skip_existing=args.skip_existing,
                 skip_schedule=args.skip_schedule,
                 leagues_html_path=args.leagues_html, 
