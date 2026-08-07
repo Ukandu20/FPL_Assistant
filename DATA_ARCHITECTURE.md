@@ -37,9 +37,16 @@ Metric selection is deterministic and stored in field-level provenance.
 Defensive match metrics use WhoScored because the current FBref player-match
 surface no longer provides the historical defensive tables.
 
+WhoScored normalization publishes provider-owned table families beneath
+`data/processed/whoscored`. These resemble the useful FBref layout but retain
+WhoScored definitions and provenance. They must not be written into the FBref
+tree. Additive metrics are derived from normalized events; the scraped display
+statistics are retained for ratings/metadata and used in reconciliation audits.
+Unsupported concepts such as FBref xG, xAG, and PSxG remain null or absent.
+
 ## Current FBref contract
 
-The legacy scraper is retained, but the network boundary accepts only:
+The legacy scraper is retained, but its network adapter recognizes only:
 
 - team season: `standard`, `keeper`, `shooting`, `playing_time`, `misc`
 - team match: `schedule`, `keeper`, `shooting`, `misc`
@@ -51,6 +58,18 @@ Unsupported historical categories fail before scraping. Every scrape writes
 `_meta/fbref_capabilities.json` and `_meta/coverage_manifest.json`. Empty
 fallback files are marked `schema_only`; they are not silently treated as
 successful data.
+
+Adapter recognition is not a guarantee that FBref still publishes a table for
+every season. For 2025-2026, FBref removed the advanced match-report surface.
+The accepted active subset is `standard` and `keeper` at player-season level,
+`standard`, `keeper`, `shooting`, `playing_time`, and `misc` at team-season
+level, and `schedule`, `summary`, and `keepers` at player-match level.
+Incomplete 2025-2026 team-match outputs are kept under `data/quarantine/fbref`
+and must not be consumed as facts or zero-valued observations.
+
+The complete operational sequence, exact league-scoped paths, cache recovery,
+quarantine policy, and QA checks are documented in the
+[FBref pipeline runbook](docs/FBREF_PIPELINE.md).
 
 ## Canonical tables
 

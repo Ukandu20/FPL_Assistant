@@ -358,7 +358,7 @@ def random_sampling_probe(pmc_all: list[pd.DataFrame], seasons: list[str]):
 # ---------- Runner ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
+    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"))
     ap.add_argument("--fbref-league-dir", type=Path, default=Path("data/processed/fbref/ENG-Premier League"))
     ap.add_argument("--teams-lookup", type=Path, default=Path("data/processed/_id_lookup_teams.json"))
     ap.add_argument("--players-lookup", type=Path, default=Path("data/processed/_id_lookup_players.json"))

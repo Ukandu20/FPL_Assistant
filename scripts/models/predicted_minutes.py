@@ -114,7 +114,7 @@ def main():
         default="2020-2021,2021-2022,2022-2023,2023-2024,2024-2025"
     )
     parser.add_argument("--first-test-gw", type=int, default=26)
-    parser.add_argument("--fix-root", default="data/processed/fixtures")
+    parser.add_argument("--fix-root", default="data/processed/registry/fixtures")
     parser.add_argument("--model-out", default="data/models/expected_minutes")
     parser.add_argument("--log-level",default="INFO")
     args = parser.parse_args()

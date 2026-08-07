@@ -61,3 +61,67 @@ This project aims to:
 ```bash
 git clone https://github.com/your-username/FPL_Assistant.git
 cd FPL_Assistant
+```
+
+## Provider processing safety
+
+- Files under `data/raw` are immutable provider inputs. Cleaning and enrichment
+  outputs belong under `data/processed`.
+- Understat normalizes `YYYY-YYYY` CLI input to the provider's starting year.
+  Equivalent season folders cannot both supply data, and schema-only inputs
+  cannot replace populated outputs.
+- FBref schedules must contain dates inside the requested season. Invalid or
+  wholly schema-only seasons cannot update identity or relegation registries.
+- ClubElo enrichment writes copies below `data/processed/clubelo`; it never
+  modifies its ClubElo or Understat inputs.
+- WhoScored defensive processing requires complete schedule coverage, canonical
+  player/team/match bridges, and official FPL totals unless a diagnostic bypass
+  is explicitly selected.
+- The native WhoScored cleaner publishes provider-owned `player_match`,
+  `player_season`, `team_match`, and `team_season` table families with registry
+  IDs and retained `provider_*_id` columns. Event-derived counts take precedence
+  over the scraper's display-stat counters; disagreements are written to audits.
+- WhoScored match roles remain provider-observed in `provider_position_match` and
+  `position_detail_match`. Season primary roles are minutes-weighted, while
+  `fpl_pos` is resolved independently from the season registry, the observed
+  WhoScored role, the WhoScored season primary, then the latest prior registry
+  position. Substitute rows therefore retain an unobserved match role but still
+  receive the determined FPL classification and a provenance-labelled imputation.
+- FotMob and Transfermarkt are not canonical feature sources. Before promoting
+  either one, add a staging contract, identity bridges, a coverage audit, and a
+  provider-to-canonical metric map.
+
+### Clean and integrate FBref data
+
+Use the [FBref pipeline runbook](docs/FBREF_PIPELINE.md) for the complete
+PowerShell sequence: raw coverage checks, the league/season-scoped cleaner,
+quarantine of source-deprecated 2025-2026 advanced outputs, canonical fixture
+and match-ID integration, feature publication, and final assurance.
+
+### Clean native WhoScored data
+
+The production-safe default rejects incomplete coverage and unresolved
+identities:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.clean.whoscored_cleaner `
+  --league "ENG-Premier League" `
+  --season 2025-2026
+```
+
+For an explicitly partial historical or diagnostic publication:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.clean.whoscored_cleaner `
+  --league "ENG-Premier League" `
+  --season 2025-2026 `
+  --allow-partial `
+  --no-strict-identities `
+  --force
+```
+
+Outputs are written below
+`data/processed/whoscored/<league>/<YYYY-YYYY>/`. Persistent WhoScored player,
+team, and match bridges are stored below `data/processed/registry/bridges/`.
+Use `--rebuild-provider-bridges` when deliberately re-evaluating WhoScored
+matches after changing identity rules; rows for other providers are preserved.
