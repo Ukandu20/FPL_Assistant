@@ -314,6 +314,44 @@ def attach_game_ids(merged_keys: pd.DataFrame, fbref_games: pd.DataFrame) -> pd.
 
     return df
 
+
+def attach_fixture_calendar_game_ids(
+    frame: pd.DataFrame,
+    fixture_calendar_path: Path,
+) -> pd.DataFrame:
+    """Fill canonical game IDs from the registry's official FPL fixture bridge."""
+    out = frame.copy()
+    if "game_id" not in out:
+        out["game_id"] = pd.NA
+    if not fixture_calendar_path.is_file() or "fixture" not in out:
+        return out
+
+    calendar = read_csv(fixture_calendar_path)
+    required = {"fpl_id", "fbref_id"}
+    if not required.issubset(calendar.columns):
+        logging.warning(
+            "Fixture calendar %s lacks required columns %s",
+            fixture_calendar_path,
+            sorted(required - set(calendar.columns)),
+        )
+        return out
+
+    bridge = calendar.loc[:, ["fpl_id", "fbref_id"]].dropna().copy()
+    bridge["_fixture_key"] = pd.to_numeric(bridge["fpl_id"], errors="coerce").astype("Int64")
+    conflicts = bridge.groupby("_fixture_key")["fbref_id"].nunique()
+    if (conflicts > 1).any():
+        bad = conflicts[conflicts > 1].index.astype(str).tolist()
+        raise ValueError(f"FPL fixture IDs map to multiple canonical game IDs: {bad}")
+    fixture_map = (
+        bridge.dropna(subset=["_fixture_key"])
+        .drop_duplicates("_fixture_key")
+        .set_index("_fixture_key")["fbref_id"]
+    )
+    fixture_keys = pd.to_numeric(out["fixture"], errors="coerce").astype("Int64")
+    out["game_id"] = out["game_id"].fillna(fixture_keys.map(fixture_map))
+    return out
+
+
 def build_matches_from_fpl(merged_with_gid: pd.DataFrame, season_short_str: str) -> pd.DataFrame:
     """
     Build matches.csv using FPL rounds (authoritative), after game_id has been attached.
@@ -349,6 +387,7 @@ def build_matches_from_fpl(merged_with_gid: pd.DataFrame, season_short_str: str)
 
 def process_season(proc_season_dir: Path,
                    fbref_root: Path,
+                   fixture_calendar_root: Path,
                    league: str,
                    summary_name: str,
                    tz_name: str) -> None:
@@ -373,6 +412,10 @@ def process_season(proc_season_dir: Path,
     # FPL merged with derived keys
     merged = read_csv(merged_csv)
     merged_keys = derive_fpl_keys(merged, tz_name=tz_name)
+    merged_keys = attach_fixture_calendar_game_ids(
+        merged_keys,
+        fixture_calendar_root / longf / "fixture_calendar.csv",
+    )
 
     # Attach game_id to merged
     merged_with_gid = attach_game_ids(merged_keys, fb_games)
@@ -425,6 +468,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Assign FBref game_id to FPL GW rows using summary.csv; matches.csv uses FPL round.")
     ap.add_argument("--proc-root",  required=True, type=Path, help="data/processed/fpl")
     ap.add_argument("--fbref-root", required=True, type=Path, help="data/processed/fbref")
+    ap.add_argument(
+        "--fixture-calendar-root",
+        type=Path,
+        default=Path("data/processed/registry/fixtures"),
+        help="Registry fixture calendars used to map official FPL fixture IDs.",
+    )
     ap.add_argument("--league",     default="ENG-Premier League", help="League folder under fbref-root")
     ap.add_argument("--summary-name", default="summary.csv", help="If your file isn’t named summary.csv")
     ap.add_argument("--season", help="Only process one season (e.g., '2025-26' or '2025-2026').")
@@ -451,6 +500,7 @@ def main() -> None:
         process_season(
             proc_season_dir=sdir,
             fbref_root=Path(args.fbref_root),
+            fixture_calendar_root=args.fixture_calendar_root,
             league=args.league,
             summary_name=args.summary_name,
             tz_name=args.tz

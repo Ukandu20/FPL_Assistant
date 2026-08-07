@@ -49,6 +49,19 @@ def season_key(s: str) -> int:
         end = start[:2] + end
     return int(end)
 
+
+def normalize_fpl_position(value) -> Optional[str]:
+    """Return the four official FPL position buckets from common encodings."""
+    if value is None or pd.isna(value):
+        return None
+    aliases = {
+        "1": "GK", "GK": "GK", "GKP": "GK", "GOALKEEPER": "GK",
+        "2": "DEF", "DEF": "DEF", "DEFENDER": "DEF",
+        "3": "MID", "MID": "MID", "MIDFIELDER": "MID",
+        "4": "FWD", "FWD": "FWD", "FW": "FWD", "FORWARD": "FWD",
+    }
+    return aliases.get(str(value).strip().upper())
+
 def normalize_name(s: str) -> str:
     """HTML-unescape; strip accents; lowercase; collapse; keep '|' as a token barrier."""
     if s is None:
@@ -367,6 +380,14 @@ def clean_gw_df(df: pd.DataFrame,
     Returns: (cleaned_df, unmatched_json_list, unmatched_rows_list)
     Works with 'team' as string (all seasons), and 'opponent_team' as numeric or string.
     """
+    # Historical community snapshots occasionally contain the same player-fixture
+    # record more than once.  Only remove rows that are identical in every source
+    # column; fixture-level or double-gameweek rows with any differing value remain.
+    duplicate_count = int(df.duplicated().sum())
+    if duplicate_count:
+        logging.warning("GW %s: removed %d exact duplicate source rows", gw, duplicate_count)
+        df = df.drop_duplicates().reset_index(drop=True)
+
     # --- build name columns if missing
     if "name" in df.columns:
         df["name"] = df["name"].astype(str)
@@ -465,8 +486,9 @@ def clean_gw_df(df: pd.DataFrame,
             fb_names.append(rec.get("name") or f"{first.iat[idx]} {second.iat[idx]}".strip())
             career = rec.get("career") or {}
             if career:
-                latest = max(career.keys(), key=season_key)
-                srec = career.get(latest) or {}
+                target_key = season_key(season)
+                matching_seasons = [key for key in career if season_key(key) == target_key]
+                srec = career.get(matching_seasons[0], {}) if matching_seasons else {}
                 positions.append(srec.get("position"))
                 fpl_pos.append(srec.get("fpl_position") or srec.get("fpl_pos"))
             else:
@@ -486,8 +508,17 @@ def clean_gw_df(df: pd.DataFrame,
 
     if "position" not in df.columns:
         df["position"] = positions
-    if "fpl_pos" not in df.columns:
-        df["fpl_pos"] = fpl_pos
+    # The position recorded by FPL for this player-GW is authoritative. Registry
+    # metadata is only a fallback and must come from the season being processed.
+    source_fpl_pos = (
+        df["position"].map(normalize_fpl_position)
+        if "position" in df.columns
+        else pd.Series([None] * len(df), index=df.index, dtype="object")
+    )
+    registry_fpl_pos = pd.Series(fpl_pos, index=df.index, dtype="object").map(
+        normalize_fpl_position
+    )
+    df["fpl_pos"] = source_fpl_pos.fillna(registry_fpl_pos)
 
     # make exported 'team' the 3-letter code (consistent with your other outputs)
     df["team"] = df["team_code"]

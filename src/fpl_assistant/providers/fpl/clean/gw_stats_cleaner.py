@@ -49,6 +49,19 @@ def season_key(s: str) -> int:
         end = start[:2] + end
     return int(end)
 
+
+def normalize_fpl_position(value) -> Optional[str]:
+    """Return the four official FPL position buckets from common encodings."""
+    if value is None or pd.isna(value):
+        return None
+    aliases = {
+        "1": "GKP", "GK": "GKP", "GKP": "GKP", "GOALKEEPER": "GKP",
+        "2": "DEF", "DEF": "DEF", "DEFENDER": "DEF",
+        "3": "MID", "MID": "MID", "MIDFIELDER": "MID",
+        "4": "FWD", "FWD": "FWD", "FW": "FWD", "FORWARD": "FWD",
+    }
+    return aliases.get(str(value).strip().upper())
+
 def normalize_name(s: str) -> str:
     """HTML-unescape; strip accents; lowercase; collapse; keep '|' as a token barrier."""
     if s is None:
@@ -356,17 +369,51 @@ def valid_frames(frames: List[Optional[pd.DataFrame]]) -> List[pd.DataFrame]:
                 good.append(fr)
     return good
 
+
+def load_element_roster(path: Path) -> Dict[int, dict]:
+    """Load the official FPL element -> canonical player mapping for one season."""
+    if not path.is_file():
+        logging.warning("Official FPL roster not found: %s; falling back to names", path)
+        return {}
+    roster = pd.read_csv(path)
+    element_col = next(
+        (col for col in ("fpl_element_id", "element", "id") if col in roster.columns),
+        None,
+    )
+    if not element_col or "player_id" not in roster.columns:
+        logging.warning("Official FPL roster lacks an element/player_id pair: %s", path)
+        return {}
+    roster["_element"] = pd.to_numeric(roster[element_col], errors="coerce").astype("Int64")
+    usable = roster.dropna(subset=["_element", "player_id"]).copy()
+    conflicts = usable.groupby("_element")["player_id"].nunique()
+    if (conflicts > 1).any():
+        bad = conflicts[conflicts > 1].index.astype(str).tolist()
+        raise ValueError(f"FPL elements map to multiple player IDs in {path}: {bad}")
+    return {
+        int(row["_element"]): row.to_dict()
+        for _, row in usable.drop_duplicates("_element").iterrows()
+    }
+
 # ---------- core cleaning ----------
 def clean_gw_df(df: pd.DataFrame,
                 season: str,
                 pid2rec: Dict[str, dict], key2pid: Dict[str, str], overrides: Dict[str, str],
                 id2name: Dict[int, str], id2code3: Dict[int, Optional[str]], id2hex: Dict[int, Optional[str]],
                 name2code: Dict[str, str], name2hex: Dict[str, str], code2hex: Dict[str, str],
-                gw: int) -> Tuple[pd.DataFrame, List[dict], List[dict]]:
+                gw: int,
+                element_roster: Optional[Dict[int, dict]] = None) -> Tuple[pd.DataFrame, List[dict], List[dict]]:
     """
     Returns: (cleaned_df, unmatched_json_list, unmatched_rows_list)
     Works with 'team' as string (all seasons), and 'opponent_team' as numeric or string.
     """
+    # Historical community snapshots occasionally contain the same player-fixture
+    # record more than once.  Only remove rows that are identical in every source
+    # column; fixture-level or double-gameweek rows with any differing value remain.
+    duplicate_count = int(df.duplicated().sum())
+    if duplicate_count:
+        logging.warning("GW %s: removed %d exact duplicate source rows", gw, duplicate_count)
+        df = df.drop_duplicates().reset_index(drop=True)
+
     # --- build name columns if missing
     if "name" in df.columns:
         df["name"] = df["name"].astype(str)
@@ -458,19 +505,36 @@ def clean_gw_df(df: pd.DataFrame,
     fpl_pos: List[Optional[str]] = []
 
     for idx in df.index:
-        pid = resolve_player_id(first.iat[idx], second.iat[idx], display.iat[idx], key2pid, overrides)
+        roster_rec: dict = {}
+        if element_roster and "element" in df.columns:
+            element_value = pd.to_numeric(pd.Series([df.at[idx, "element"]]), errors="coerce").iloc[0]
+            if pd.notna(element_value):
+                roster_rec = element_roster.get(int(element_value), {})
+        roster_pid = roster_rec.get("player_id")
+        pid = str(roster_pid) if pd.notna(roster_pid) else resolve_player_id(
+            first.iat[idx], second.iat[idx], display.iat[idx], key2pid, overrides
+        )
         if pid:
             rec = pid2rec.get(pid, {})
             pids.append(pid)
-            fb_names.append(rec.get("name") or f"{first.iat[idx]} {second.iat[idx]}".strip())
+            roster_name = roster_rec.get("name")
+            fb_names.append(
+                rec.get("name")
+                or (str(roster_name) if pd.notna(roster_name) else None)
+                or f"{first.iat[idx]} {second.iat[idx]}".strip()
+            )
             career = rec.get("career") or {}
             if career:
-                latest = max(career.keys(), key=season_key)
-                srec = career.get(latest) or {}
+                target_key = season_key(season)
+                matching_seasons = [key for key in career if season_key(key) == target_key]
+                srec = career.get(matching_seasons[0], {}) if matching_seasons else {}
                 positions.append(srec.get("position"))
                 fpl_pos.append(srec.get("fpl_position") or srec.get("fpl_pos"))
             else:
-                positions.append(None); fpl_pos.append(None)
+                roster_position = roster_rec.get("position")
+                roster_fpl_pos = roster_rec.get("fpl_pos")
+                positions.append(roster_position if pd.notna(roster_position) else None)
+                fpl_pos.append(roster_fpl_pos if pd.notna(roster_fpl_pos) else None)
         else:
             pids.append(None); fb_names.append(None); positions.append(None); fpl_pos.append(None)
             unmatched_json.append({
@@ -486,8 +550,17 @@ def clean_gw_df(df: pd.DataFrame,
 
     if "position" not in df.columns:
         df["position"] = positions
-    if "fpl_pos" not in df.columns:
-        df["fpl_pos"] = fpl_pos
+    # The position recorded by FPL for this player-GW is authoritative. Registry
+    # metadata is only a fallback and must come from the season being processed.
+    source_fpl_pos = (
+        df["position"].map(normalize_fpl_position)
+        if "position" in df.columns
+        else pd.Series([None] * len(df), index=df.index, dtype="object")
+    )
+    registry_fpl_pos = pd.Series(fpl_pos, index=df.index, dtype="object").map(
+        normalize_fpl_position
+    )
+    df["fpl_pos"] = source_fpl_pos.fillna(registry_fpl_pos)
 
     # make exported 'team' the 3-letter code (consistent with your other outputs)
     df["team"] = df["team_code"]
@@ -505,14 +578,15 @@ def process_gw_file(fp: Path, out_dir: Path,
                     pid2rec: Dict[str, dict], key2pid: Dict[str, str], overrides: Dict[str, str],
                     id2name: Dict[int, str], id2code3: Dict[int, Optional[str]], id2hex: Dict[int, Optional[str]],
                     name2code: Dict[str, str], name2hex: Dict[str, str], code2hex: Dict[str, str],
-                    on_unmatched: str) -> Tuple[pd.DataFrame, List[dict], List[dict]]:
+                    on_unmatched: str,
+                    element_roster: Optional[Dict[int, dict]] = None) -> Tuple[pd.DataFrame, List[dict], List[dict]]:
     gw = int(GW_FILE_RE.match(fp.name).group(1)) if GW_FILE_RE.match(fp.name) else -1
     df = pd.read_csv(fp)
     cleaned, uj, ur = clean_gw_df(
         df, season, pid2rec, key2pid, overrides,
         id2name, id2code3, id2hex,
         name2code, name2hex, code2hex,
-        gw
+        gw, element_roster
     )
 
     if on_unmatched == "fail" and (uj or ur):
@@ -654,6 +728,8 @@ def main():
 
         logging.info("Season %s …", seas_dir.name)
         out_root = args.proc_root / seas_dir.name
+        element_roster = load_element_roster(out_root / "season" / "cleaned_players.csv")
+        logging.info("Official FPL element mappings: %d", len(element_roster))
         all_clean, all_uj, all_ur = [], [], []
 
         for fp in sorted(gws_dir.glob("gw*.csv")):
@@ -664,7 +740,7 @@ def main():
                 pid2rec, key2pid, overrides,
                 id2name, id2code3, id2hex,
                 name2code, name2hex, code2hex,
-                args.on_unmatched
+                args.on_unmatched, element_roster
             )
             all_clean.append(cl); all_uj.extend(uj); all_ur.extend(ur)
 
@@ -675,7 +751,7 @@ def main():
                 pid2rec, key2pid, overrides,
                 id2name, id2code3, id2hex,
                 name2code, name2hex, code2hex,
-                args.on_unmatched
+                args.on_unmatched, element_roster
             )
             all_clean.append(cl); all_uj.extend(uj); all_ur.extend(ur)
 

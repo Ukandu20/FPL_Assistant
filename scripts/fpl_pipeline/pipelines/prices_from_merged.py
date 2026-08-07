@@ -169,10 +169,24 @@ def build_registry_json(frame: pd.DataFrame) -> dict:
 def process_season(season_dir: Path, out_json_dir: Path, out_parquet_dir: Path) -> None:
     season = season_dir.name
     merged = season_dir / "gws" / "merged_gws.csv"
-    if not merged.is_file():
-        logging.warning("[%s] missing %s", season, merged)
+    roster = season_dir / "season" / "cleaned_players.csv"
+    if merged.is_file() and merged.stat().st_size > 0:
+        df = read_csv(merged)
+        source = merged
+    elif roster.is_file():
+        df = read_csv(roster)
+        df["round"] = 1
+        for column in ("team_id", "fpl_pos"):
+            if column not in df.columns:
+                df[column] = pd.NA
+        source = roster
+        logging.info(
+            "[%s] no gameweek data; using roster prices as GW1 opening prices",
+            season,
+        )
+    else:
+        logging.warning("[%s] missing both %s and %s", season, merged, roster)
         return
-    df = read_csv(merged)
     try:
         ep = earliest_price_per_gw(df)
     except Exception as e:
