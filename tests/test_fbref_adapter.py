@@ -13,6 +13,7 @@ from fpl_assistant.providers.fbref import (
     resolve_browser_path,
     season_stats_scraper,
 )
+from fpl_assistant.providers.fbref.scrape import fbref_adapter
 from fpl_assistant.testing.paths import get_test_run_dir, get_test_soccerdata_dir
 
 
@@ -70,6 +71,60 @@ def test_build_fbref_reader_preserves_factory_args():
         assert reader.no_cache is True
         assert reader.headers["User-Agent"] == "pytest-agent"
         assert "sec-ch-ua" in reader.headers
+    finally:
+        reader.close()
+
+
+def test_reader_does_not_preinitialize_driver_before_soccerdata(monkeypatch):
+    class _Driver:
+        def __init__(self):
+            self.headers = None
+
+        def execute_cdp_cmd(self, command, payload):
+            if command == "Network.setExtraHTTPHeaders":
+                self.headers = payload["headers"]
+
+        def quit(self):
+            pass
+
+    driver = _Driver()
+    received = {}
+
+    def _soccerdata_init(
+        self,
+        *,
+        leagues=None,
+        seasons=None,
+        proxy=None,
+        no_cache=False,
+        no_store=False,
+        data_dir=None,
+        path_to_browser=None,
+        headless=False,
+    ):
+        assert not hasattr(self, "_driver")
+        received.update(
+            path_to_browser=path_to_browser,
+            headless=headless,
+        )
+        self._driver = driver
+        self.no_cache = no_cache
+
+    monkeypatch.setattr(fbref_adapter.sd.FBref, "__init__", _soccerdata_init)
+    monkeypatch.setattr(fbref_adapter, "resolve_browser_path", lambda path: Path(path))
+
+    reader = PatchedFBref(
+        browser_path="test-browser.exe",
+        headless=True,
+        headers={"X-Test": "present"},
+    )
+    try:
+        assert received == {
+            "path_to_browser": str(Path("test-browser.exe")),
+            "headless": True,
+        }
+        assert reader.headers["X-Test"] == "present"
+        assert driver.headers["X-Test"] == "present"
     finally:
         reader.close()
 

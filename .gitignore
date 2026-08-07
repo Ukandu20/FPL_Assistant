@@ -138,4 +138,6 @@ dmypy.json
 cython_debug/
 
 # documentation
-docs
+docs/*
+!docs/FBREF_PIPELINE.md
+archived_files/

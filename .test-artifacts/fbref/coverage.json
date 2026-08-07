@@ -1,0 +1,39 @@
+{
+  "capabilities": {
+    "player_match": [
+      "summary",
+      "keepers"
+    ],
+    "player_season": [
+      "standard",
+      "keeper",
+      "shooting",
+      "playing_time",
+      "misc"
+    ],
+    "supplementary": [
+      "lineups",
+      "events"
+    ],
+    "team_match": [
+      "schedule",
+      "keeper",
+      "shooting",
+      "misc"
+    ],
+    "team_season": [
+      "standard",
+      "keeper",
+      "shooting",
+      "playing_time",
+      "misc"
+    ]
+  },
+  "contract_version": 1,
+  "extras": {},
+  "generated_at": "2026-08-07T07:22:26.442602+00:00",
+  "league": "ENG-Premier League",
+  "provider": "fbref",
+  "records": [],
+  "season": "2026-2027"
+}

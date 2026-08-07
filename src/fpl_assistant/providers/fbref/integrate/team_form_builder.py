@@ -4,7 +4,7 @@ r"""team_form_builder.py – schema v2.10
  home-adv correction, early-GW shrinkage, EWMA, FDR audits)
 
 Inputs (per season):
-  data/processed/fixtures/<SEASON>/fixture_calendar.csv
+  data/processed/registry/fixtures/<SEASON>/fixture_calendar.csv
   Required (base) columns (values may contain NaNs for future fixtures):
     fpl_id, fbref_id, team_id, team, gw_orig, date_played, date_sched,
     gf, ga, xg, xga, poss, result, home_id, away_id
@@ -30,7 +30,7 @@ Outputs (per season):
 """
 
 from __future__ import annotations
-import argparse, json, logging, datetime as dt, hashlib, os, re, shutil
+import argparse, json, logging, datetime as dt, hashlib, re, shutil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from functools import reduce
@@ -75,12 +75,15 @@ FDR_COLS = FDR_BUCKET_COLS + FDR_CONT_COLS
 # ───────────────────────── version helpers ─────────────────────────
 
 def _resolve_version(features_root: Path, requested: Optional[str], auto: bool) -> str:
-    if auto or (not requested) or (requested.lower() == "auto"):
+    if auto or (requested and requested.lower() == "auto"):
         existing = [p.name for p in features_root.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)]
         nxt = (max(int(p[1:]) for p in existing) + 1) if existing else 1
         ver = f"v{nxt}"
         logging.info("Auto-version resolved to %s", ver)
         return ver
+    if not requested or requested.lower() == "latest":
+        logging.info("Routine publication target resolved to latest")
+        return "latest"
     if not re.fullmatch(r"v\d+", requested):
         if requested and requested.isdigit():
             return f"v{requested}"
@@ -88,23 +91,16 @@ def _resolve_version(features_root: Path, requested: Optional[str], auto: bool) 
     return requested
 
 def _write_latest_pointer(features_root: Path, version: str) -> None:
-    latest = features_root / "latest"
-    target = features_root / version
-    try:
-        if latest.exists() or latest.is_symlink():
-            try:
-                latest.unlink()
-            except Exception:
-                pass
-        os.symlink(target.name, latest, target_is_directory=True)
-        logging.info("Updated 'latest' symlink -> %s", version)
-    except (OSError, NotImplementedError):
-        (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
-        logging.info("Wrote LATEST_VERSION.txt -> %s", version)
+    # ``latest`` is a real composite publication directory containing both
+    # team and player artifacts. Do not try to replace it with a symlink.
+    (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
+    logging.info("Wrote LATEST_VERSION.txt -> %s", version)
 
 def _copy_to_latest_dir(features_root: Path, version: str, season: str) -> None:
     src = features_root / version / season
     dst = features_root / "latest" / season
+    if src.resolve() == dst.resolve():
+        return
     dst.mkdir(parents=True, exist_ok=True)
     for fname in (OUTPUT_FILE, META_FILE):
         fp = src / fname
@@ -960,21 +956,25 @@ def run_batch(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", help="e.g. 2025-2026; omit for batch")
-    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/fixtures"))
-    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"))
+    ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"))
+    ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"),
+                    help="Feature publication root containing latest/ and optional vN snapshots.")
 
     # Versioning controls
-    ap.add_argument("--version", default=None, help="Version folder (e.g., v9). Use with --auto-version to pick next.")
-    ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
+    ap.add_argument("--version", default=None, help="Publication folder (default: latest; or specify v9).")
+    ap.add_argument("--auto-version", action="store_true", help="Explicitly create the next immutable vN snapshot.")
     ap.add_argument("--reuse-version", action="store_true",
                     help="Overwrite in-place for minor/non-logic edits; increments build_no in meta.")
-    ap.add_argument("--write-latest", action="store_true",
-                    help="Update 'latest' pointer and copy outputs to features/latest/<SEASON>/")
+    ap.add_argument("--write-latest", dest="write_latest", action="store_true",
+                    help="Publish the component to features/latest/<SEASON>/ (default).")
+    ap.add_argument("--no-write-latest", dest="write_latest", action="store_false",
+                    help="For a versioned run, do not copy it into latest.")
+    ap.set_defaults(write_latest=True)
 
     # Rolling params
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only) for classic mode")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
-    ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
+    ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior toward 0")
     ap.add_argument("--ewma", action="store_true", help="use EWMA past-only rolling instead of hard window")
     ap.add_argument("--halflife", type=float, default=3.0, help="EWMA halflife in matches (if --ewma)")
 
@@ -1012,6 +1012,8 @@ def main() -> None:
     features_root = args.out_dir
     features_root.mkdir(parents=True, exist_ok=True)
     version = _resolve_version(features_root, args.version, args.auto_version)
+    if version == "latest" and not args.write_latest:
+        ap.error("--no-write-latest requires --version <vN> or --auto-version")
 
     logging.info("Processing seasons: %s", ", ".join(seasons))
     logging.info("Writing to version dir: %s", version)

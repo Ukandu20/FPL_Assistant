@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import inspect
 import logging
 import time
 import warnings
@@ -143,16 +144,46 @@ class PatchedFBref(sd.FBref):
     ) -> None:
         self.browser_path = resolve_browser_path(browser_path)
         self.headless = headless
-        self.headers = {**FBREF_HEADERS, **(headers or {})}
-        self._driver: Any = None
+        super_kwargs: dict[str, Any] = {
+            "leagues": leagues,
+            "seasons": seasons,
+            "proxy": proxy,
+            "no_cache": no_cache,
+            "no_store": no_store,
+            "data_dir": data_dir,
+        }
+        fbref_init_params = inspect.signature(sd.FBref.__init__).parameters
+        if "path_to_browser" in fbref_init_params:
+            super_kwargs["path_to_browser"] = (
+                str(self.browser_path) if self.browser_path is not None else None
+            )
+        if "headless" in fbref_init_params:
+            super_kwargs["headless"] = self.headless
+
+        # soccerdata >=1.9 initializes Selenium eagerly and checks for an
+        # existing _driver attribute before doing so. Do not create _driver
+        # here: a value of None makes soccerdata call None.quit().
         super().__init__(
-            leagues=leagues,
-            seasons=seasons,
-            proxy=proxy,
-            no_cache=no_cache,
-            no_store=no_store,
-            data_dir=data_dir,
+            **super_kwargs,
         )
+        self.headers = {**FBREF_HEADERS, **(headers or {})}
+        if not hasattr(self, "_driver"):
+            self._driver = None
+        elif self._driver is not None:
+            self._install_network_headers(self._driver)
+
+    def _init_webdriver(self):
+        """Initialize Selenium without soccerdata's None.quit compatibility bug."""
+        if getattr(self, "_driver", object()) is None:
+            del self._driver
+        try:
+            return super()._init_webdriver()
+        except Exception as exc:
+            logging.getLogger("fbref").warning(
+                "FBref browser initialization failed; cached/local reads remain available: %s",
+                exc,
+            )
+            return None
 
     def close(self) -> None:
         driver = getattr(self, "_driver", None)

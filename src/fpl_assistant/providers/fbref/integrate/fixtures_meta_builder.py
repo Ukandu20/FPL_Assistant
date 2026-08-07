@@ -21,8 +21,7 @@ days_since_last_game,
 team, team_id, opponent_id,
 home, away, home_id, away_id,
 status, sched_missing,
-venue, gf, ga, xga, xg, result, poss,
-is_promoted, is_relegated
+venue, gf, ga, xga, xg, result, is_promoted, is_relegated
 """
 from __future__ import annotations
 import argparse, json, logging
@@ -46,6 +45,13 @@ def build_maps(long2hex: Dict[str, str], long2code: Dict[str, str]):
     name2hex = {canon(k): str(v).lower() for k, v in long2hex.items()}
     name2code = {canon(k): str(v).upper() for k, v in long2code.items()}
     code2hex = {name2code[k]: v for k, v in name2hex.items() if k in name2code}
+    # Alias keys can legitimately point at an obsolete duplicate registry ID.
+    # When the lookup contains the short code itself (e.g. ``nfo``), that is
+    # the canonical identity and must win over aliases such as ``nottingham``.
+    for code in set(name2code.values()):
+        direct = name2hex.get(canon(code))
+        if direct:
+            code2hex[code] = direct
     return name2hex, name2code, code2hex
 
 def normalise_date(series: pd.Series) -> pd.Series:
@@ -71,8 +77,8 @@ def _venue_to_is_home_int8(venue: pd.Series) -> pd.Series:
     """Map FBref venue → is_home:Int8 (1=home, 0=away, <NA>=neutral/unknown)."""
     v = venue.astype(str).str.strip().str.lower()
     out = pd.Series(pd.NA, index=venue.index, dtype="Int8")
-    out[v.isin({"home","h"})] = 1
-    out[v.isin({"away","a"})] = 0
+    out[v.isin({"home", "h"})] = 1
+    out[v.isin({"away", "a"})] = 0
     return out
 
 def _naeq(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -146,6 +152,7 @@ def maybe_write_fdr_view(
     team_version: str,
     views_subdir: str = "views"
 ) -> None:
+    calendar_df = calendar_df.copy()
     tf_dir = Path(features_root) / team_version
     tf_path = tf_dir / season / "team_form.csv"
     if not tf_path.exists():
@@ -157,6 +164,13 @@ def maybe_write_fdr_view(
 
     if "game_date" in tf.columns and "date_played" not in tf.columns:
         tf = tf.rename(columns={"game_date": "date_played"})
+
+    # Both sides must use the same date dtype.  CSV-loaded team_form dates are
+    # strings, while the in-memory fixture calendar carries datetime64.
+    if "date_played" in tf.columns:
+        tf["date_played"] = normalise_date(tf["date_played"])
+    if "date_played" in calendar_df.columns:
+        calendar_df["date_played"] = normalise_date(calendar_df["date_played"])
 
     for c in ("home_id", "away_id", "team_id"):
         if c in tf.columns:
@@ -173,7 +187,7 @@ def maybe_write_fdr_view(
         key = ["date_played", "home_id", "away_id"]
         subset = tf[key + ["fdr_home", "fdr_away"]].drop_duplicates(key)
         try:
-            merged = calendar_df.merge(subset, on=key, how="left", validate="one_to_one")
+            merged = calendar_df.merge(subset, on=key, how="left", validate="many_to_one")
             logging.info("%s • FDR view join (A: date+ids) OK; null FDR rows=%d",
                          season, int(merged["fdr_home"].isna().sum()))
         except Exception:
@@ -182,13 +196,18 @@ def maybe_write_fdr_view(
     if merged is None and need_B.issubset(set(tf.columns)) and "fpl_id" in calendar_df.columns:
         tf_b = tf[["fpl_id", "team_id", "fdr_home", "fdr_away"]].copy()
         tf_b["team_id"] = tf_b["team_id"].astype("string").str.lower()
+        if tf_b.duplicated(["fpl_id", "team_id"]).any():
+            raise ValueError(
+                f"{tf_path} has duplicate (fpl_id, team_id) rows; refusing an "
+                "FDR merge that could multiply fixture rows"
+            )
         left = calendar_df.merge(
             tf_b[["fpl_id", "team_id", "fdr_home"]].rename(columns={"team_id": "home_id"}),
-            on=["fpl_id", "home_id"], how="left", validate="one_to_one"
+            on=["fpl_id", "home_id"], how="left", validate="many_to_one"
         )
         merged = left.merge(
             tf_b[["fpl_id", "team_id", "fdr_away"]].rename(columns={"team_id": "away_id"}),
-            on=["fpl_id", "away_id"], how="left", validate="one_to_one"
+            on=["fpl_id", "away_id"], how="left", validate="many_to_one"
         )
         logging.info("%s • FDR view join (B: fpl_id+team_id) OK; null FDR rows=%d",
                      season, int(merged["fdr_home"].isna().sum()))
@@ -199,6 +218,12 @@ def maybe_write_fdr_view(
             season, sorted(need_A), sorted(need_B)
         )
         return
+
+    if len(merged) != len(calendar_df):
+        raise ValueError(
+            f"FDR merge changed fixture-calendar row count from "
+            f"{len(calendar_df)} to {len(merged)}"
+        )
 
     out_dir = Path(features_root) / views_subdir / season
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,6 +238,8 @@ def build_fixture_calendar(
     season: str,
     fpl_csv: Path,
     fb_csv: Path,
+    ws_csv: Path,
+    und_csv: Path,
     team_map_fp: Path,
     short_map_fp: Path,
     out_dir: Path,
@@ -232,7 +259,7 @@ def build_fixture_calendar(
             cal = read_fixture_calendar(out_dir, season)
             maybe_write_fdr_view(cal, season, features_root, attach_fdr, views_subdir)
         return False
-    if not (fpl_csv.is_file() and fb_csv.is_file()):
+    if not (fpl_csv.is_file() and ws_csv.is_file() and und_csv.is_file()):
         logging.warning("%s • missing fixture or schedule csv – skipped", season)
         return False
 
@@ -264,15 +291,117 @@ def build_fixture_calendar(
         fpl[f"{side}_long"] = fpl[f"{side}_id_fpl"].map(id2name)
         fpl[side] = fpl[f"{side}_long"].map(name2code)
 
-    # -- FBref schedule (actual played)
-    fb = pd.read_csv(fb_csv, parse_dates=["game_date"])
-    fb["date_played"] = normalise_date(fb["game_date"])
+    # WhoScored supplies fixture identity, team perspectives, home/away and
+    # stadium. Understat supplies the observed goals and xG metrics. Both are
+    # team-perspective datasets, so each match correctly appears twice.
+    ws = pd.read_csv(ws_csv, low_memory=False)
+    und = pd.read_csv(und_csv, low_memory=False)
+
+    required_ws = {
+        "match_id", "team_id", "opponent_id", "team", "home", "away",
+        "game_date", "venue", "is_home",
+    }
+    required_und = {
+        "match_id", "team_id", "opp_id", "team_goals", "opp_goals",
+        "team_xg", "opp_xg", "result", "game_date",
+    }
+    missing_ws = sorted(required_ws - set(ws.columns))
+    missing_und = sorted(required_und - set(und.columns))
+    if missing_ws:
+        raise ValueError(f"{ws_csv} lacks required columns: {missing_ws}")
+    if missing_und:
+        raise ValueError(f"{und_csv} lacks required columns: {missing_und}")
+
+    for frame in (ws, und):
+        for column in ("match_id", "team_id"):
+            frame[column] = frame[column].astype("string").str.strip().str.lower()
+    ws["opponent_id"] = ws["opponent_id"].astype("string").str.strip().str.lower()
+    und["opp_id"] = und["opp_id"].astype("string").str.strip().str.lower()
+
+    join_key = ["match_id", "team_id"]
+    if ws.duplicated(join_key).any():
+        raise ValueError(f"{ws_csv} has duplicate (match_id, team_id) rows")
+    if und.duplicated(join_key).any():
+        raise ValueError(f"{und_csv} has duplicate (match_id, team_id) rows")
+
+    # FBref's surviving player-match schedule remains the canonical match-ID
+    # registry even though its team-match schedule was deprecated. Validate
+    # provider IDs against it when that artifact is available.
+    fbref_schedule_path = fb_csv.parent.parent / "player_match" / "schedule.csv"
+    if fbref_schedule_path.is_file():
+        fbref_schedule = pd.read_csv(fbref_schedule_path, low_memory=False)
+        id_column = "match_id" if "match_id" in fbref_schedule.columns else "game_id"
+        if id_column in fbref_schedule.columns:
+            canonical_ids = set(
+                fbref_schedule[id_column].dropna().astype("string").str.lower()
+            )
+            provider_ids = set(ws["match_id"].dropna())
+            unknown_ids = sorted(provider_ids - canonical_ids)
+            if unknown_ids:
+                raise ValueError(
+                    f"{ws_csv} contains {len(unknown_ids)} match IDs absent from "
+                    f"FBref canonical schedule {fbref_schedule_path}"
+                )
+            logging.info(
+                "%s • FBref canonical match-ID validation: %d matches",
+                season,
+                len(provider_ids),
+            )
+
+    metrics = und[
+        join_key + [
+            "opp_id", "team_goals", "opp_goals", "team_xg", "opp_xg",
+            "result", "game_date",
+        ]
+    ].rename(columns={"game_date": "_understat_game_date"})
+    fb = ws.merge(metrics, on=join_key, how="left", validate="one_to_one")
+
+    missing_metrics = fb["opp_id"].isna()
+    if missing_metrics.any():
+        raise ValueError(
+            f"{und_csv} is missing {int(missing_metrics.sum())} WhoScored "
+            "(match_id, team_id) rows"
+        )
+    opponent_conflicts = fb["opponent_id"].ne(fb["opp_id"])
+    if opponent_conflicts.any():
+        raise ValueError(
+            "WhoScored/Understat opponent IDs conflict on "
+            f"{int(opponent_conflicts.sum())} rows"
+        )
+
+    ws_dates = normalise_date(fb["game_date"])
+    und_dates = normalise_date(fb["_understat_game_date"])
+    date_conflicts = ws_dates.notna() & und_dates.notna() & ws_dates.ne(und_dates)
+    if date_conflicts.any():
+        raise ValueError(
+            "WhoScored/Understat game dates conflict on "
+            f"{int(date_conflicts.sum())} rows"
+        )
+    fb["date_played"] = ws_dates.fillna(und_dates)
+    fb["is_away"] = (~_to_bool_mask(fb["is_home"])).astype("Int8")
+
+    # Publish the schema consumed by team_form_builder. The current WhoScored
+    # schedule does not expose possession, so preserve it as unknown; the team
+    # form builder applies its documented neutral fallback.
+    fb["gf"] = pd.to_numeric(fb["team_goals"], errors="coerce")
+    fb["ga"] = pd.to_numeric(fb["opp_goals"], errors="coerce")
+    fb["xg"] = pd.to_numeric(fb["team_xg"], errors="coerce")
+    fb["xga"] = pd.to_numeric(fb["opp_xg"], errors="coerce")
+    fb["poss"] = pd.NA
+    fb["is_promoted"] = pd.NA
+    fb["is_relegated"] = pd.NA
+
     fb_match = fb[[
-        "game_id", "team", "team_id", "opponent_id",
-        "home", "away", "date_played",
-        "venue", "ga", "gf", "xga", "xg", "result", "poss",
-        "is_promoted", "is_relegated", "is_home", "is_away"
+        "match_id", "team", "team_id", "opponent_id",
+        "home", "away", "date_played", "venue", "gf", "ga", "xg", "xga",
+        "poss", "result", "is_promoted", "is_relegated", "is_home", "is_away",
     ]].copy()
+    logging.info(
+        "%s • provider reconciliation: %d WhoScored rows joined one-to-one "
+        "to Understat",
+        season,
+        len(fb_match),
+    )
 
     # -- First pass: strict date match (home, away, date_sched == date_played)
     cal = fpl.merge(
@@ -282,11 +411,11 @@ def build_fixture_calendar(
         how="left",
         validate="one_to_many",  # one FPL row -> two FB rows (one per team)
     )
-    strict_matched = cal["game_id"].notna().sum()
+    strict_matched = cal["match_id"].notna().sum()
     logging.info("%s • strict matches: %d", season, strict_matched)
 
     # -- Second pass: nearest-date recovery for reschedules within tolerance
-    missing_mask = cal["game_id"].isna()
+    missing_mask = cal["match_id"].isna()
     if missing_mask.any():
         miss = cal.loc[missing_mask, ["_fpl_row", "home", "away", "date_sched"]].drop_duplicates("_fpl_row")
         fb_dates = fb_match[["home", "away", "date_played"]].drop_duplicates()
@@ -320,7 +449,7 @@ def build_fixture_calendar(
         cal = pd.concat([cal.loc[~missing_mask], repair, still_unresolved], ignore_index=True)
 
         logging.info("%s • recovered via nearest-date: %d; unresolved: %d",
-                     season, int(repair["game_id"].notna().sum()),
+                     season, int(repair["match_id"].notna().sum()),
                      int(still_unresolved.shape[0]))
 
     # Ensure team/opponent ids are lowercase strings
@@ -382,18 +511,17 @@ def build_fixture_calendar(
 
     # final flags
     cal["gw_played"] = cal.get("gw_played", cal.get("gw_orig"))
-    cal["sched_missing"] = cal["game_id"].isna().astype("Int8")
+    cal["sched_missing"] = cal["match_id"].isna().astype("Int8")
 
     # ── select & order for output (PURE schedule; no FDR here) ──
     out = cal[[
-        "fpl_id", "game_id", "gw_orig", "gw_played",
+        "fpl_id", "match_id", "gw_orig", "gw_played",
         "date_sched", "date_played", "days_since_last_game",
         "team", "team_id", "opponent_id", "is_home",
         "home", "away", "home_id", "away_id",
         "status", "sched_missing", "venue",
-        "gf", "ga", "xga", "xg", "result", "poss",
-        "is_promoted", "is_relegated",
-    ]].rename(columns={"game_id": "fbref_id"}).copy()
+        "gf", "ga", "xga", "xg", "poss", "result", "is_promoted", "is_relegated",
+    ]].rename(columns={"match_id": "fbref_id"}).copy()
 
     # ── NEW: apply sticky schedule lock from previous calendar ──
     out = _lock_sched_fields(out, out_dir, season)
@@ -418,20 +546,26 @@ def build_fixture_calendar(
 
     # Diagnostics
     missing = out[out["fbref_id"].isna()]
+    missing_audit_path = dst_dir / "_manual_fbref_match.csv"
     if not missing.empty:
-        missing.to_csv(dst_dir / "_manual_fbref_match.csv", index=False)
+        missing.to_csv(missing_audit_path, index=False)
         logging.warning("%s • %d rows lack fbref_id (see _manual_fbref_match.csv)", season, len(missing))
+    else:
+        missing_audit_path.unlink(missing_ok=True)
     null_ids = out[out["home_id"].isna() | out["away_id"].isna()]
+    null_ids_audit_path = dst_dir / "_missing_home_away_ids.csv"
     if not null_ids.empty:
-        null_ids.to_csv(dst_dir / "_missing_home_away_ids.csv", index=False)
+        null_ids.to_csv(null_ids_audit_path, index=False)
         logging.warning("%s • %d rows lack home_id/away_id (see _missing_home_away_ids.csv)",
                         season, len(null_ids))
+    else:
+        null_ids_audit_path.unlink(missing_ok=True)
     # NA-safe alignment audit (only on rows with all IDs present)
     cal_ids_ok = cal[["team_id","opponent_id","home_id","away_id","is_home"]].dropna().copy()
     bad_align = cal_ids_ok[
-        ((cal_ids_ok["is_home"]==1) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["team_id"]) |
+        ((cal_ids_ok["is_home"]==True) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["team_id"]) |
                                       ~_naeq(cal_ids_ok["away_id"], cal_ids_ok["opponent_id"]))) |
-        ((cal_ids_ok["is_home"]==0) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["opponent_id"]) |
+        ((cal_ids_ok["is_home"]==False) & (~_naeq(cal_ids_ok["home_id"], cal_ids_ok["opponent_id"]) |
                                       ~_naeq(cal_ids_ok["away_id"], cal_ids_ok["team_id"])))
     ]
     if not bad_align.empty:
@@ -441,6 +575,9 @@ def build_fixture_calendar(
         logging.error("%s • %d rows fail home/away ID alignment (see _home_alignment_audit.csv)", season, len(bad_align))
 
     # ── reschedule audit (only where we *did* match) ──
+    if bad_align.empty:
+        (dst_dir / "_home_alignment_audit.csv").unlink(missing_ok=True)
+
     audit = out.loc[out["fbref_id"].notna() & out["date_sched"].notna() & out["date_played"].notna()].copy()
     audit = audit[audit["date_sched"] != audit["date_played"]]
     if not audit.empty:
@@ -455,6 +592,7 @@ def build_fixture_calendar(
         audit[audit_cols].to_csv(dst_dir / "_reschedule_audit.csv", index=False)
         logging.info("%s • reschedule audit: %d rows moved (see _reschedule_audit.csv)", season, len(audit))
     else:
+        (dst_dir / "_reschedule_audit.csv").unlink(missing_ok=True)
         logging.info("%s • no reschedules detected", season)
 
     # ── optionally write an FDR-attached view ──
@@ -470,6 +608,8 @@ def run_batch(
     seasons: List[str],
     fpl_root: Path,
     fbref_league: Path,
+    understat_league: Path,
+    whoscored_league: Path,
     team_map: Path,
     short_map: Path,
     out_dir: Path,
@@ -483,12 +623,16 @@ def run_batch(
     for season in seasons:
         fpl_csv = fpl_root / season / "season" / "fixtures.csv"
         fb_csv = fbref_league / season / "team_match" / "schedule.csv"
+        ws_csv = whoscored_league / season / "team_match" / "schedule.csv"
+        und_csv = understat_league / season / "schedule.csv"
         teams_csv = fpl_root / season / "teams.csv"
         try:
             build_fixture_calendar(
                 season=season,
                 fpl_csv=fpl_csv,
                 fb_csv=fb_csv,
+                ws_csv=ws_csv,
+                und_csv=und_csv,
                 team_map_fp=team_map,
                 short_map_fp=short_map,
                 out_dir=out_dir,
@@ -508,8 +652,10 @@ def run_batch(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season")
-    ap.add_argument("--fpl-root", type=Path, default=Path("data/raw/fpl"))
+    ap.add_argument("--fpl-root", type=Path, default=Path("data/raw/fpl/ENG-Premier League"))
     ap.add_argument("--fbref-league-dir", type=Path, default=Path("data/processed/fbref/ENG-Premier League"))
+    ap.add_argument("--whoscored-league-dir", type=Path, default=Path("data/processed/whoscored/ENG-Premier League"))
+    ap.add_argument("--understat-league-dir", type=Path, default=Path("data/processed/understat/ENG-Premier League"))
     ap.add_argument("--team-map", type=Path, default=Path("data/processed/registry/_id_lookup_teams.json"))
     ap.add_argument("--short-map", type=Path, default=Path("data/config/teams.json"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/fixtures"))
@@ -541,6 +687,8 @@ def main():
         seasons=seasons,
         fpl_root=args.fpl_root,
         fbref_league=args.fbref_league_dir,
+        understat_league=args.understat_league_dir,
+        whoscored_league=args.whoscored_league_dir,
         team_map=args.team_map,
         short_map=args.short_map,
         out_dir=args.out_dir,

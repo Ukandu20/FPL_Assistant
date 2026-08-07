@@ -35,7 +35,6 @@ import unicodedata
 import threading
 import secrets
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -140,6 +139,34 @@ def get_team_id(name: str, mt: dict, team_map: dict | None = None) -> str:
             mt[k] = new
     return mt[k]
 
+
+def canonicalize_team_season_ids(
+    df: pd.DataFrame,
+    mt_lookup: dict,
+    team_map: dict,
+) -> pd.DataFrame:
+    """Make registry team IDs authoritative while retaining FBref's native ID."""
+    if "team" not in df.columns:
+        raise ValueError("FBref team-season table has no team column")
+    out = df.copy()
+    native = (
+        out["fbref_team_id"].astype("string")
+        if "fbref_team_id" in out.columns
+        else out.get("team_id", pd.Series(pd.NA, index=out.index)).astype("string")
+    )
+    canonical = out["team"].map(
+        lambda team: get_team_id(team, mt_lookup, team_map) if pd.notna(team) else ""
+    ).astype("string")
+    if canonical.isna().any() or canonical.eq("").any():
+        missing = out.loc[canonical.isna() | canonical.eq(""), "team"].astype(str).tolist()
+        raise ValueError(f"Unresolved canonical team IDs in FBref team-season table: {missing}")
+    conflicts = pd.DataFrame({"team": out["team"], "team_id": canonical}).groupby("team")["team_id"].nunique()
+    if (conflicts > 1).any():
+        raise ValueError("An FBref team maps to multiple canonical team IDs")
+    out["fbref_team_id"] = native
+    out["team_id"] = canonical
+    return out
+
 def extract_team_slug(text: str | None) -> Optional[str]:
     if not isinstance(text, str):
         return None
@@ -158,6 +185,31 @@ def make_game_id(date_s: str, home: str, away: str) -> str:
 def season_key(s: str) -> int:
     return int(s.split("-")[0])
 
+def normalise_fpl_position(value: object) -> str:
+    code = str(value or "").strip().upper()
+    return {
+        "GK": "GKP", "GKP": "GKP", "1": "GKP",
+        "DEF": "DEF", "2": "DEF",
+        "MID": "MID", "3": "MID",
+        "FWD": "FWD", "FW": "FWD", "4": "FWD",
+    }.get(code, "UNK")
+
+def load_official_fpl_positions(fpl_root: Path, season: str) -> dict[str, str]:
+    path = fpl_root / season / "season" / "cleaned_players.csv"
+    if not path.is_file():
+        logging.warning("[%s] official FPL roster not found: %s", season, path)
+        return {}
+    frame = pd.read_csv(path, low_memory=False)
+    if not {"player_id", "fpl_pos"} <= set(frame.columns):
+        raise ValueError(f"Official FPL roster lacks player_id/fpl_pos: {path}")
+    frame = frame.loc[frame["player_id"].notna(), ["player_id", "fpl_pos"]].copy()
+    frame["player_id"] = frame["player_id"].astype(str)
+    frame["fpl_pos"] = frame["fpl_pos"].map(normalise_fpl_position)
+    conflicts = frame.groupby("player_id")["fpl_pos"].nunique()
+    if (conflicts > 1).any():
+        raise ValueError(f"Conflicting official FPL positions in {path}")
+    return dict(zip(frame["player_id"], frame["fpl_pos"]))
+
 def last_fpl_pos(pid: str, mp_global: dict, curr_season: str) -> Optional[str]:
     rec = mp_global.get(pid)
     if not rec:
@@ -166,7 +218,11 @@ def last_fpl_pos(pid: str, mp_global: dict, curr_season: str) -> Optional[str]:
     if not past:
         return None
     latest = max(past, key=season_key)
-    return rec["career"][latest]["position"]
+    season_record = rec["career"][latest]
+    position = normalise_fpl_position(
+        season_record.get("fpl_position", season_record.get("fpl_pos", season_record.get("position")))
+    )
+    return position if position != "UNK" else None
 
 def ensure_front_columns(df: pd.DataFrame, front: tuple[str, ...] = ("league", "season")) -> pd.DataFrame:
     cols = list(df.columns)
@@ -525,6 +581,103 @@ def split_game_cols(df: pd.DataFrame, team_map: dict):
     return good
 
 
+def _missing_text_mask(series: pd.Series) -> pd.Series:
+    """Return a mask for null or serialization-style missing text values."""
+    text = series.astype("string").str.strip().str.lower()
+    return series.isna() | text.isin({"", "nan", "none", "<na>"})
+
+
+def _normalise_team_value(value, team_map: dict):
+    """Canonicalise one team value without assuming pandas returns ``str``."""
+    if pd.isna(value):
+        return pd.NA
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"nan", "none", "<na>"}:
+        return pd.NA
+    mapped = team_map.get(raw.lower(), team_map.get(raw.upper(), raw))
+    return str(mapped).strip().upper()
+
+
+def repair_team_match_identity(
+    df: pd.DataFrame,
+    source_path: Path,
+) -> pd.DataFrame:
+    """Recover missing team/game labels from the season schedule.
+
+    Some soccerdata/FBref team-match responses retain the match-report URL,
+    venue and opponent but emit a null team index.  The match-report slug is a
+    stable one-to-one key into ``schedule.csv``, so use it to restore the two
+    participating teams and select the row's team from its venue.
+    """
+    if "team" not in df.columns:
+        return df
+
+    missing_team = _missing_text_mask(df["team"])
+    if not missing_team.any():
+        return df
+
+    # Pandas 3 refuses assigning text into an all-null column inferred as
+    # float64, so establish a nullable string column before restoration.
+    df["team"] = df["team"].astype("string")
+
+    schedule_path = source_path.parent.parent / "schedule.csv"
+    if not schedule_path.is_file() or "match_report" not in df.columns:
+        raise ValueError(
+            f"{source_path} has {int(missing_team.sum())} missing team value(s) "
+            "and cannot be repaired from schedule.csv"
+        )
+
+    schedule = pd.read_csv(schedule_path, low_memory=False)
+    required = {"date", "home_team", "away_team", "match_report"}
+    if not required.issubset(schedule.columns):
+        raise ValueError(
+            f"{schedule_path} lacks columns needed to repair team-match identity: "
+            f"{sorted(required - set(schedule.columns))}"
+        )
+
+    schedule = schedule.copy()
+    schedule["_match_slug"] = schedule["match_report"].map(extract_game_slug)
+    schedule = schedule.dropna(subset=["_match_slug"]).drop_duplicates()
+    schedule = schedule.set_index("_match_slug")
+
+    slugs = df["match_report"].map(extract_game_slug)
+    home = slugs.map(schedule["home_team"])
+    away = slugs.map(schedule["away_team"])
+    dates = slugs.map(schedule["date"])
+    venue = df.get("venue", pd.Series(index=df.index, dtype="string"))
+    venue = venue.astype("string").str.strip().str.lower()
+
+    home_rows = missing_team & venue.eq("home") & home.notna()
+    away_rows = missing_team & venue.eq("away") & away.notna()
+    df.loc[home_rows, "team"] = home.loc[home_rows]
+    df.loc[away_rows, "team"] = away.loc[away_rows]
+
+    matched = dates.notna() & home.notna() & away.notna()
+    if "game" not in df.columns:
+        df["game"] = pd.NA
+    df.loc[matched, "game"] = (
+        dates.loc[matched].astype(str)
+        + " "
+        + home.loc[matched].astype(str)
+        + "-"
+        + away.loc[matched].astype(str)
+    )
+
+    remaining = _missing_text_mask(df["team"])
+    if remaining.any():
+        raise ValueError(
+            f"{source_path} still has {int(remaining.sum())} missing team value(s) "
+            "after schedule-based repair"
+        )
+
+    logging.warning(
+        "Repaired %d missing team value(s) in %s from schedule match IDs",
+        int(missing_team.sum()),
+        source_path,
+    )
+    return df
+
+
 def _safe_read_fbref_csv(path: Path, is_schedule: bool) -> pd.DataFrame:
     try:
         if is_schedule:
@@ -539,6 +692,53 @@ def _safe_read_fbref_csv(path: Path, is_schedule: bool) -> pd.DataFrame:
     except Exception as e:
         logging.warning("Failed reading CSV (skipping): %s (%s)", path, e)
         return pd.DataFrame()
+
+
+def validate_raw_season_dir(season_dir: Path, season: str) -> None:
+    """Fail closed on wrong-season schedules and wholly schema-only scrapes."""
+    season_match = re.fullmatch(r"(\d{4})-(\d{4})", season)
+    schedule_candidates = [
+        season_dir / "schedule.csv",
+        season_dir / "team_match" / "schedule.csv",
+    ]
+    schedule_path = next((path for path in schedule_candidates if path.is_file()), None)
+    if schedule_path is not None and season_match:
+        schedule = pd.read_csv(schedule_path, low_memory=False)
+        if not schedule.empty:
+            date_col = next(
+                (column for column in ("date", "game_date") if column in schedule.columns),
+                None,
+            )
+            if date_col is None:
+                raise ValueError(f"{schedule_path} has no schedule date column")
+            dates = pd.to_datetime(schedule[date_col], errors="coerce").dropna()
+            if dates.empty:
+                raise ValueError(f"{schedule_path} has no parseable schedule dates")
+            start = pd.Timestamp(f"{season_match.group(1)}-07-01")
+            end = pd.Timestamp(f"{season_match.group(2)}-06-30")
+            invalid = dates.loc[(dates < start) | (dates > end)]
+            if not invalid.empty:
+                raise ValueError(
+                    f"{schedule_path} contains dates outside {season}: "
+                    f"{invalid.min().date()}..{invalid.max().date()}"
+                )
+
+    manifest_path = season_dir / "_meta" / "coverage_manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        requested = [
+            record
+            for record in manifest.get("records", [])
+            if record.get("stat_type") != "schedule"
+        ]
+        if requested and all(
+            int(record.get("rows") or 0) == 0
+            or record.get("status") == "schema_only"
+            for record in requested
+        ):
+            raise ValueError(
+                f"{manifest_path} reports every requested statistical table as schema-only"
+            )
 
 
 # ────────── audits ──────────
@@ -930,13 +1130,14 @@ def clean_csv(
         if df.empty:
             return
 
+    if sub == "team_match":
+        df = repair_team_match_identity(df, path)
+
     # team mapping (team-like + opponent)
     for col in df.columns:
         col_l = col.lower()
         if (col_l in TEAMLIKE) or (col_l in OPP_LIKE):
-            df[col] = df[col].astype(str).apply(
-                lambda s: team_map.get(s.strip().lower(), team_map.get(s.strip().upper(), s.strip()))
-            ).str.upper()
+            df[col] = df[col].map(lambda value: _normalise_team_value(value, team_map))
 
     # split game + game_id
     if sub in {"team_match", "player_match"} and "game" in df.columns:
@@ -953,6 +1154,11 @@ def clean_csv(
                 )
                 return slug or make_game_id(row["game_date"], row["home"], row["away"])
             df.loc[good, "game_id"] = df.loc[good].apply(gid, axis=1)
+
+    # FBref is the canonical match-identity provider.  Keep game_id for
+    # backward compatibility and expose the provider-neutral join key.
+    if sub in {"team_match", "player_match"} and "game_id" in df.columns:
+        df["match_id"] = df["game_id"]
 
     # numeric coercion
     for col in df.columns:
@@ -1049,6 +1255,9 @@ def clean_csv(
             )
 
         df["team_id"] = df.apply(row_tid, axis=1)
+
+    if sub == "team_season":
+        df = canonicalize_team_season_ids(df, mt_lookup, team_map)
 
     # ✅ APPLY PLAYER ID OVERRIDES (league, season, team_id, player, pos) across ALL matches
     if sub == "player_match":
@@ -1243,7 +1452,13 @@ def main():
     ap.add_argument("--rules", type=Path)
     ap.add_argument("--pos-map", type=Path, default=Path("data/config/positions.json"))
     ap.add_argument("--team-map", type=Path, default=Path("data/config/teams.json"))
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--fpl-root", type=Path, default=Path("data/processed/fpl"))
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; registry-mutating cleaning is sequential.",
+    )
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
 
@@ -1313,6 +1528,11 @@ def main():
             season = season_dir.name
             if args.season and season != args.season:
                 continue
+            try:
+                validate_raw_season_dir(season_dir, season)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                logging.error("[%s %s] refusing unsafe raw season: %s", league, season, exc)
+                continue
 
             processed_seasons.add(season)
             processed_seasons_by_league[league].add(season)
@@ -1337,8 +1557,14 @@ def main():
                 continue
 
             season_players, season_teams = {}, {}
+            official_fpl_positions = load_official_fpl_positions(args.fpl_root, season)
 
-            mapper = ThreadPoolExecutor(args.workers).map if args.workers > 1 else map
+            if args.workers > 1:
+                logging.warning(
+                    "--workers=%d ignored: shared identity registries require deterministic sequential cleaning",
+                    args.workers,
+                )
+            mapper = map
             prev_codes_for_clean = prev_team_codes if prev_team_codes is not None else None
 
             list(mapper(
@@ -1367,13 +1593,31 @@ def main():
                 other_files,
             ))
 
+            if not season_players or not season_teams:
+                logging.error(
+                    "[%s %s] no valid season player/team identities produced; "
+                    "skipping registry, relegation, and season JSON updates",
+                    league,
+                    season,
+                )
+                continue
+
             # finalize positions + season-level position_detail (mode by appearances)
             for pid, rec in season_players.items():
                 raw = pos_counts[pid].most_common(1)[0][0] if pos_counts[pid] else rec["pri_position"]
                 rec["pri_position"] = raw
                 rec["position"] = pos_map.get(raw, "UNK")
-                if last_fpl_pos(pid, mp_global, season) is None:
-                    rec["fpl_pos"] = rec["position"]
+                official_position = official_fpl_positions.get(str(pid))
+                prior_fpl_position = last_fpl_pos(pid, mp_global, season)
+                if official_position:
+                    rec["fpl_pos"] = official_position
+                    rec["fpl_position_source"] = "fpl.cleaned_players.fpl_pos"
+                elif prior_fpl_position:
+                    rec["fpl_pos"] = prior_fpl_position
+                    rec["fpl_position_source"] = "registry.latest_prior.fpl_position"
+                else:
+                    rec["fpl_pos"] = normalise_fpl_position(rec["position"])
+                    rec["fpl_position_source"] = "fbref.season_primary_fallback"
 
                 rec["position_detail"] = (
                     pos_detail_counts[pid].most_common(1)[0][0]
@@ -1388,6 +1632,7 @@ def main():
 
             pid2pos = {pid: r["position"] for pid, r in season_players.items()}
             pid2fpl = {pid: r["fpl_pos"] for pid, r in season_players.items()}
+            pid2fplsource = {pid: r["fpl_position_source"] for pid, r in season_players.items()}
             pid2detail = {pid: r.get("position_detail", "UNK") for pid, r in season_players.items()}
 
             # sync player_match: position / fpl_pos / season position_detail
@@ -1396,6 +1641,7 @@ def main():
                 if "player_id" in df_sync.columns:
                     df_sync["position"] = df_sync["player_id"].map(pid2pos).fillna(df_sync.get("position", "UNK"))
                     df_sync["fpl_pos"]  = df_sync["player_id"].map(pid2fpl)
+                    df_sync["fpl_position_source"] = df_sync["player_id"].map(pid2fplsource).fillna("unresolved")
                     df_sync["position_detail"] = df_sync["player_id"].map(pid2detail).fillna("UNK")
 
                 if {"team", "home", "away"} <= set(df_sync.columns):
@@ -1416,6 +1662,8 @@ def main():
                 df_ps = pd.read_csv(fp, low_memory=False)
                 if "player_id" in df_ps.columns:
                     df_ps["position_detail"] = df_ps["player_id"].map(pid2detail).fillna("UNK")
+                    df_ps["fpl_pos"] = df_ps["player_id"].map(pid2fpl).fillna("UNK")
+                    df_ps["fpl_position_source"] = df_ps["player_id"].map(pid2fplsource).fillna("unresolved")
                 df_ps.to_csv(fp, index=False, na_rep="")
 
             # update season_players with transfer windows

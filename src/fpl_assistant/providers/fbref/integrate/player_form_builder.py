@@ -4,9 +4,9 @@ r"""player_form_builder.py – schema v1.8
 position-weighted composite form scores)
 
 Versioning:
-• Writes under data/processed/registry/features/<version>/<SEASON>/players_form.csv
-• --auto-version chooses next vN if not specified, e.g., v7
-• --write-latest adds a 'latest' pointer (symlink if supported; else LATEST_VERSION.txt)
+• Routine runs write directly under features/latest/<SEASON>/players_form.csv.
+• --auto-version explicitly creates the next immutable vN snapshot.
+• A versioned run also copies its player artifacts into the composite latest directory.
 
 Outputs (per season):
   players_form.csv
@@ -23,7 +23,7 @@ What's new vs v1.7:
 """
 
 from __future__ import annotations
-import argparse, json, logging, datetime as dt, os, re
+import argparse, json, logging, datetime as dt, re, shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -48,7 +48,8 @@ ALIASES: Dict[str, List[str]] = {
     "team": ["team", "team_name", "squad", "club"],
     "gw_orig": ["gw_orig", "gw", "gameweek", "round", "event"],
     "date_played": ["date_played", "kickoff_time", "match_date", "date"],
-    "venue": ["venue", "was_home", "is_home", "home"],
+    "venue": ["venue", "stadium", "ground"],
+    "was_home": ["was_home", "is_home"],
     "minutes": ["minutes", "mins", "time_played"],
     "days_since_last": ["days_since_last", "days_rest", "rest_days"],
     "is_active": ["is_active", "active", "in_squad", "appearance", "played"],
@@ -97,7 +98,7 @@ ALIASES: Dict[str, List[str]] = {
 
 # Numeric canonicals we’ll coerce (and often fill). Enrichments handled separately.
 NUMERIC_BASE = [
-    "minutes","days_since_last","is_active","yellow_crd","red_crd",
+    "minutes","days_since_last","is_active","was_home","yellow_crd","red_crd",
     "gf","ga","shots","sot","fdr_home","fdr_away",
     "gls","ast","blocks","tkl","int","clr","xg","npxg","xag",
     "pkatt","pk_scored","pk_won",
@@ -115,8 +116,8 @@ METRICS = {
     "ast": {"raw": ("ast", "xag"), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {}},
     "def": {"raw": ("blocks", "tkl", "int", "own_goals", "recoveries", "clr"),
              "applies_to": "OUT", "flip_sign": True, "bayes_alpha": {"own_goals": 6}},
-    "gk" : {"raw": ("saves", "sot_against"),
-             "applies_to": "GK", "flip_sign": True, "bayes_alpha": {}},
+    "GKP" : {"raw": ("saves", "sot_against"),
+             "applies_to": "GKP", "flip_sign": True, "bayes_alpha": {}},
     "pens":{"raw": ("pk_won",), "applies_to": "OUT", "flip_sign": False, "bayes_alpha": {"pk_won": 6}},
 }
 
@@ -127,12 +128,12 @@ GROUP_DEFINITION: Dict[str, List[Tuple[str, str]]] = {
     "ATT": [("gls","gls"), ("gls","npxg"), ("gls","sot")],
     "CRE": [("ast","ast"), ("ast","xag")],
     "DEF": [("def","tkl"), ("def","int"), ("def","blocks"), ("def","recoveries")],  # own_goals already sign-flipped, excluded here
-    "GK":  [("gk","gk_save_pct_p90")],  # special case naming; see below
+    "GKP":  [("GKP","gk_save_pct_p90")],  # special case naming; see below
 }
 
 # Default position → group weights (sum to 1 per position). CLI can override.
 DEFAULT_POS_WEIGHTS = {
-    "GK":  {"GK": 1.00},
+    "GKP":  {"GKP": 1.00},
     "DEF": {"DEF": 0.60, "ATT": 0.20, "CRE": 0.20},
     "MID": {"ATT": 0.30, "CRE": 0.40, "DEF": 0.30},
     "FWD": {"ATT": 0.60, "CRE": 0.30, "DEF": 0.10},
@@ -141,29 +142,74 @@ DEFAULT_POS_WEIGHTS = {
 # ───────────────────────── Helpers ─────────────────────────
 
 def _resolve_version(base_dir: Path, requested: Optional[str], auto: bool) -> str:
-    if auto or (not requested) or (requested.lower() == "auto"):
+    if auto or (requested and requested.lower() == "auto"):
         existing = [p.name for p in base_dir.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)]
         nxt = (max(int(s[1:]) for s in existing) + 1) if existing else 1
         ver = f"v{nxt}"
         logging.info("Auto-version resolved to %s", ver)
         return ver
+    if not requested or requested.lower() == "latest":
+        logging.info("Routine publication target resolved to latest")
+        return "latest"
     if not re.fullmatch(r"v\d+", requested):
         if requested.isdigit(): return f"v{requested}"
         raise ValueError(f"--version must be like v3 or a number; got {requested}")
     return requested
 
 def _write_latest_pointer(features_root: Path, version: str) -> None:
-    latest = features_root / "latest"
-    target = features_root / version
-    try:
-        if latest.exists() or latest.is_symlink():
-            try: latest.unlink()
-            except Exception: pass
-        os.symlink(target.name, latest, target_is_directory=True)
-        logging.info("Updated 'latest' symlink -> %s", version)
-    except (OSError, NotImplementedError):
-        (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
-        logging.info("Wrote LATEST_VERSION.txt -> %s", version)
+    # ``latest`` is a real composite publication directory containing both
+    # team and player artifacts. Do not try to replace it with a symlink.
+    (features_root / "LATEST_VERSION.txt").write_text(version, encoding="utf-8")
+    logging.info("Wrote LATEST_VERSION.txt -> %s", version)
+
+def _copy_to_latest_dir(features_root: Path, version: str, season: str) -> None:
+    src = features_root / version / season
+    dst = features_root / "latest" / season
+    if src.resolve() == dst.resolve():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for filename in (OUTPUT_FILE, "player_form.meta.json"):
+        source = src / filename
+        if source.is_file():
+            shutil.copy2(source, dst / filename)
+
+def resolve_season_selection(
+    fixtures_root: Path,
+    *,
+    season: str,
+    seasons_csv: str = "",
+) -> List[str]:
+    available = sorted(
+        path.name
+        for path in fixtures_root.iterdir()
+        if path.is_dir() and re.fullmatch(r"\d{4}-\d{4}", path.name)
+    )
+    if not available:
+        return []
+
+    def normalize(value: str) -> str:
+        text = value.strip()
+        short = re.fullmatch(r"(\d{4})-(\d{2})", text)
+        if short:
+            return f"{short.group(1)}-{int(short.group(1)) + 1}"
+        if not re.fullmatch(r"\d{4}-\d{4}", text):
+            raise ValueError(f"Unsupported season selector: {value!r}")
+        return text
+
+    if seasons_csv.strip():
+        requested = [normalize(value) for value in seasons_csv.split(",") if value.strip()]
+    elif season.lower() == "all":
+        requested = available
+    elif season.lower() == "latest":
+        requested = [available[-1]]
+    else:
+        requested = [normalize(season)]
+    missing = sorted(set(requested) - set(available))
+    if missing:
+        raise FileNotFoundError(
+            f"Fixture season folder(s) not found under {fixtures_root}: {missing}"
+        )
+    return sorted(dict.fromkeys(requested))
 
 def _ensure_numeric(df: pd.DataFrame, cols: List[str]) -> None:
     for c in cols:
@@ -177,7 +223,8 @@ def _z_by_season_gw(df: pd.DataFrame, col: str) -> pd.Series:
     return ((df[col] - mu) / sd).fillna(0.0)
 
 def _z_by_season_gw_venue(df: pd.DataFrame, col: str, venue_value: str) -> pd.Series:
-    mask = df["venue"].eq(venue_value)
+    expected = 1 if venue_value == "Home" else 0
+    mask = pd.to_numeric(df["was_home"], errors="coerce").eq(expected)
     out = pd.Series(np.nan, index=df.index, dtype=float)
     grp = df.loc[mask].groupby(["season","gw_orig"]) [col]
     mu  = grp.transform("mean")
@@ -206,7 +253,7 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
         return cfg.get("applies_to", "OUT") if cfg else "OUT"
 
     pos_series = feat["pos"].astype(str).str.upper()
-    mask_gk  = pos_series.eq("GK")
+    mask_gk  = pos_series.eq("GKP")
     mask_out = ~mask_gk
 
     # Identify roll columns
@@ -214,12 +261,12 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
     home_cols    = [c for c in feat.columns if c.endswith("_home_roll")]
     away_cols    = [c for c in feat.columns if c.endswith("_away_roll")]
 
-    gk_overall  = [c for c in overall_cols if applies_to(c) == "GK"]
-    out_overall = [c for c in overall_cols if applies_to(c) != "GK"]
-    gk_home     = [c for c in home_cols if applies_to(c) == "GK"]
-    out_home    = [c for c in home_cols if applies_to(c) != "GK"]
-    gk_away     = [c for c in away_cols if applies_to(c) == "GK"]
-    out_away    = [c for c in away_cols if applies_to(c) != "GK"]
+    gk_overall  = [c for c in overall_cols if applies_to(c) == "GKP"]
+    out_overall = [c for c in overall_cols if applies_to(c) != "GKP"]
+    gk_home     = [c for c in home_cols if applies_to(c) == "GKP"]
+    out_home    = [c for c in home_cols if applies_to(c) != "GKP"]
+    gk_away     = [c for c in away_cols if applies_to(c) == "GKP"]
+    out_away    = [c for c in away_cols if applies_to(c) != "GKP"]
 
     newcols = {}
 
@@ -247,7 +294,7 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
         newcols[c + "_z"] = -s if flip_needed(c) else s
 
     # Home
-    mask_home = feat["venue"].astype(str).eq("Home")
+    mask_home = pd.to_numeric(feat["was_home"], errors="coerce").eq(1)
     z_gk_home  = compute_z(mask_gk & mask_home, gk_home)
     z_out_home = compute_z(mask_out & mask_home, out_home)
     for c in gk_home:
@@ -258,7 +305,7 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
         newcols[c + "_z"] = -s if flip_needed(c) else s
 
     # Away
-    mask_away = feat["venue"].astype(str).eq("Away")
+    mask_away = pd.to_numeric(feat["was_home"], errors="coerce").eq(0)
     z_gk_away  = compute_z(mask_gk & mask_away, gk_away)
     z_out_away = compute_z(mask_out & mask_away, out_away)
     for c in gk_away:
@@ -276,7 +323,7 @@ def _bulk_add_zscores_by_pos_gw(feat: pd.DataFrame, metrics_cfg=METRICS) -> pd.D
 
 
 def _applicable_mask(pos_series: pd.Series, applies_to: str) -> pd.Series:
-    return pos_series.str.upper().eq("GK") if applies_to == "GK" else ~pos_series.str.upper().eq("GK")
+    return pos_series.str.upper().eq("GKP") if applies_to == "GKP" else ~pos_series.str.upper().eq("GKP")
 
 # Rolling mean with venue shrinkage + prior blending (hard window)
 def _rolling_past_only_bayes_mean(
@@ -299,9 +346,10 @@ def _rolling_past_only_bayes_mean(
             base = (base * cnt + prior_val * bayes_alpha) / (cnt + bayes_alpha)
         roll[i] = base
         mask = (ven[lo:i] == "Home")
+        away_mask = (ven[lo:i] == "Away")
         rec = vals[lo:i]
         rec_h = rec[mask]; nh = int(np.sum(~np.isnan(rec_h)))
-        rec_a = rec[~mask]; na = int(np.sum(~np.isnan(rec_a)))
+        rec_a = rec[away_mask]; na = int(np.sum(~np.isnan(rec_a)))
         mean_h = np.nanmean(rec_h) if nh else base
         mean_a = np.nanmean(rec_a) if na else base
         if (bayes_alpha > 0) and (prior_val is not None):
@@ -336,7 +384,7 @@ def _ewma_past_only_bayes_mean(
         m_all = (1-alpha)*m_all + alpha*x; cnt_all += 1
         if ven[i] == "Home":
             m_h = (1-alpha)*m_h + alpha*x; cnt_h += 1
-        else:
+        elif ven[i] == "Away":
             m_a = (1-alpha)*m_a + alpha*x; cnt_a += 1
         if prior_val is not None and cnt_all <= prior_matches:
             w = 1.0 - (cnt_all / max(1, prior_matches))
@@ -362,11 +410,12 @@ def _rolling_past_only_binomial_savepct(
         post_overall = (S + a0) / (N + a0 + b0) if (N + a0 + b0) > 0 else prior_p
         post[i] = post_overall
         mask = (ven[lo:i] == "Home")
+        away_mask = (ven[lo:i] == "Away")
         S_h = np.nansum(saves[lo:i][mask]); N_h = np.nansum(shots[lo:i][mask])
-        S_a = np.nansum(saves[lo:i][~mask]); N_a = np.nansum(shots[lo:i][~mask])
+        S_a = np.nansum(saves[lo:i][away_mask]); N_a = np.nansum(shots[lo:i][away_mask])
         post_home = (S_h + a0) / (N_h + a0 + b0) if (N_h + a0 + b0) > 0 else post_overall
         post_away = (S_a + a0) / (N_a + a0 + b0) if (N_a + a0 + b0) > 0 else post_overall
-        nh = int(np.sum(~np.isnan(shots[lo:i][mask]))); na = int(np.sum(~np.isnan(shots[lo:i][~mask])))
+        nh = int(np.sum(~np.isnan(shots[lo:i][mask]))); na = int(np.sum(~np.isnan(shots[lo:i][away_mask])))
         lam_h = nh/(nh+tau) if (nh+tau)>0 else 0.0; lam_a = na/(na+tau) if (na+tau)>0 else 0.0
         post_h[i] = lam_h*post_home + (1-lam_h)*post_overall
         post_a[i] = lam_a*post_away + (1-lam_a)*post_overall
@@ -398,7 +447,7 @@ def _ewma_binomial_savepct(
         p_all = (1-alpha)*p_all + alpha*obs; cnt_all += 1
         if ven[i] == "Home":
             p_h = (1-alpha)*p_h + alpha*obs; cnt_h += 1
-        else:
+        elif ven[i] == "Away":
             p_a = (1-alpha)*p_a + alpha*obs; cnt_a += 1
         if cnt_all <= warmup_matches:
                     # reuse prior_shots as a soft warm-up horizon to blend prior strongly
@@ -421,19 +470,19 @@ def _compute_last_season_priors(all_players: pd.DataFrame, last_season: Optional
             col = f"{raw}_p90"
             prev[col] = np.where(prev["minutes"] > 0, prev[raw] * 90.0 / prev["minutes"], np.nan)
     # GK save% priors
-    gk_prev = prev[prev["pos"] == "GK"].copy()
+    gk_prev = prev[prev["pos"] == "GKP"].copy()
     gk_aggr = gk_prev.groupby("player_id").agg(saves_sum=("saves","sum"), sot_sum=("sot_against","sum"))
     gk_aggr["p0"] = np.where(gk_aggr["sot_sum"] > 0, gk_aggr["saves_sum"]/gk_aggr["sot_sum"], np.nan)
     gk_aggr["s0"] = gk_aggr["sot_sum"].clip(lower=20)
 
     # positional/global per-90 priors
-    is_gk_prev = prev["pos"].eq("GK")
-    pos_means: Dict[str, Dict[str, float]] = {"GK": {}, "OUT": {}}
+    is_gk_prev = prev["pos"].eq("GKP")
+    pos_means: Dict[str, Dict[str, float]] = {"GKP": {}, "OUT": {}}
     global_means: Dict[str, float] = {}
     for cfg in METRICS.values():
         for raw in cfg["raw"]:
             col = f"{raw}_p90"
-            pos_means["GK"][col]  = prev.loc[is_gk_prev, col].mean()
+            pos_means["GKP"][col]  = prev.loc[is_gk_prev, col].mean()
             pos_means["OUT"][col] = prev.loc[~is_gk_prev, col].mean()
             global_means[col]     = prev[col].mean()
 
@@ -451,7 +500,7 @@ def _compute_last_season_priors(all_players: pd.DataFrame, last_season: Optional
         d = priors.setdefault(str(pid), {})
         d["save_pct_p0"] = r["p0"]; d["save_pct_s0"] = r["s0"]
 
-    priors["_POS_GK_"]  = pos_means["GK"]
+    priors["_POS_GK_"]  = pos_means["GKP"]
     priors["_POS_OUT_"] = pos_means["OUT"]
     priors["_GLOBAL_"]  = global_means
     priors["_SAVE_PCT_"] = {"p0": p0_pos, "s0": s0_pos}
@@ -485,14 +534,14 @@ def _get_savepct_prior(priors: Dict[str, Dict[str, float]], pid: str) -> Tuple[f
 def _normalize_pos_label(s: pd.Series) -> pd.Series:
     # Map various forms to {GK, DEF, MID, FWD}
     m = {
-        "gk":"GK","goalkeeper":"GK",
+        "gk":"GKP","gkp":"GKP","goalkeeper":"GKP",
         "d":"DEF","def":"DEF","defender":"DEF",
         "m":"MID","mid":"MID","midfielder":"MID",
         "f":"FWD","fw":"FWD","fwd":"FWD","forward":"FWD","striker":"FWD",
     }
     x = s.astype(str).str.strip().str.lower().map(m).fillna(s.astype(str).str.upper())
     # fallback: any non-GK and not one of DEF/MID/FWD → treat as OUT but preserve original
-    x = x.where(x.isin(["GK","DEF","MID","FWD"]), s.astype(str).str.upper())
+    x = x.where(x.isin(["GKP","DEF","MID","FWD"]), s.astype(str).str.upper())
     return x
 
 
@@ -501,7 +550,7 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
     Map aliases → canonical, derive missing canonical fields, coerce types, and fill safe defaults.
     Returns the coerced DataFrame + a small stats dict for logging.
     """
-    stats = {"filled_days_since_last": 0, "derived_save_pct": 0, "venue_from_flag": 0, "filled_fdr": 0}
+    stats = {"filled_days_since_last": 0, "derived_save_pct": 0, "home_flag_from_venue": 0, "filled_fdr": 0}
 
     # 1) Rename aliases
     rename_map = {}
@@ -524,15 +573,30 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
     else:
         raise KeyError("Could not coerce a 'date_played' column from input (check aliases).")
 
-    # venue normalization
+    # Preserve venue as provider stadium metadata. Team perspective is carried
+    # separately in was_home and is what venue-aware features consume.
     if "venue" not in df.columns:
         df["venue"] = pd.NA
-    if df["venue"].dropna().isin([0,1,True,False]).any():
-        mask = df["venue"].notna()
-        home_like = df.loc[mask, "venue"].astype(str).isin(["1","True","true","TRUE"])
-        df.loc[mask, "venue"] = np.where(home_like, "Home", "Away")
-        stats["venue_from_flag"] += int(mask.sum())
-    df.loc[~df["venue"].isin(["Home","Away"]), "venue"] = pd.NA
+    if "was_home" not in df.columns:
+        df["was_home"] = pd.Series(pd.NA, index=df.index, dtype="Int8")
+    raw_home = df["was_home"]
+    numeric_home = pd.to_numeric(raw_home, errors="coerce")
+    text_home = raw_home.astype("string").str.strip().str.lower()
+    numeric_home = numeric_home.where(
+        numeric_home.isin([0, 1]),
+        text_home.map({"true": 1, "false": 0, "yes": 1, "no": 0, "home": 1, "away": 0, "h": 1, "a": 0}),
+    )
+    df["was_home"] = numeric_home.astype("Int8")
+
+    # Backward compatibility for historical calendars whose venue column was
+    # perspective rather than a stadium name.
+    missing_home = df["was_home"].isna()
+    legacy_venue = df["venue"].astype("string").str.strip().str.lower()
+    home = missing_home & legacy_venue.isin(["home", "h"])
+    away = missing_home & legacy_venue.isin(["away", "a"])
+    df.loc[home, "was_home"] = 1
+    df.loc[away, "was_home"] = 0
+    stats["home_flag_from_venue"] = int(home.sum() + away.sum())
 
     # gw
     if "gw_orig" not in df.columns:
@@ -613,7 +677,7 @@ def _parse_pos_weights(s: Optional[str]) -> Dict[str, Dict[str, float]]:
     if not s:
         return DEFAULT_POS_WEIGHTS
     # Format: "GK:gk=1;DEF:def=.6,att=.2,cre=.2;MID:att=.4,cre=.4,def=.2;FWD:att=.6,cre=.3,def=.1"
-    out: Dict[str, Dict[str, float]] = {"GK":{},"DEF":{},"MID":{},"FWD":{}}
+    out: Dict[str, Dict[str, float]] = {"GKP":{},"DEF":{},"MID":{},"FWD":{}}
     for block in s.split(";"):
         block = block.strip()
         if not block: continue
@@ -648,7 +712,7 @@ def _parse_halflife_by_pos(s: Optional[str], default_hl: float) -> Dict[str, flo
     Parse --halflife-by-pos like 'GK:4,DEF:3.5,MID:3,FWD:2.5'.
     Missing/invalid entries fall back to default_hl.
     """
-    out = {"GK": default_hl, "DEF": default_hl, "MID": default_hl, "FWD": default_hl}
+    out = {"GKP": default_hl, "DEF": default_hl, "MID": default_hl, "FWD": default_hl}
     if not s:
         return out
     for kv in s.split(","):
@@ -684,7 +748,7 @@ def _composite_from_groups(feat: pd.DataFrame, pos_weights: Dict[str, Dict[str, 
             cols = []
             for (mkey, raw) in members:
                 # special-case GK save%
-                if grp == "GK" and raw == "gk_save_pct_p90":
+                if grp == "GKP" and raw == "gk_save_pct_p90":
                     col = f"gk_save_pct_p90{suffix}_roll_z"  # produced by z-bulk on the rolled save% series
                 else:
                     col = zcol(mkey, raw, suffix)
@@ -748,15 +812,18 @@ def build_player_form(
     # Coerce schema & derive critical fields
     all_players, stats = _coerce_columns(raw_all, fill_missing_fdr=fill_missing_fdr)
 
-    unknown_venue = all_players["venue"].isna().sum()
-    if unknown_venue:
-        logging.warning("Rows with unknown venue: %d (venue-z unavailable for those rows)", unknown_venue)
+    unknown_perspective = all_players["was_home"].isna().sum()
+    if unknown_perspective:
+        logging.warning(
+            "Rows with unknown home/away perspective: %d (venue-z unavailable for those rows)",
+            unknown_perspective,
+        )
 
     # Enforce GK/outfield raw NaNs to avoid leakage
     gk_only_raw   = ["saves","sot_against","save_pct"]
     out_only_raw  = ["gls","ast","shots","sot","xg","npxg","xag","pkatt","pk_scored","pk_won",
                      "blocks","tkl","int","own_goals","recoveries","clr"]
-    is_gk_all = all_players["pos"].eq("GK")
+    is_gk_all = all_players["pos"].eq("GKP")
     all_players.loc[~is_gk_all, [c for c in gk_only_raw if c in all_players.columns]] = np.nan
     all_players.loc[ is_gk_all, [c for c in out_only_raw if c in all_players.columns]] = np.nan
 
@@ -785,7 +852,12 @@ def build_player_form(
         for pid, g in cur.groupby("player_id", sort=False):
             g = g.sort_values(["date_played","gw_orig"]).copy()
             pos_label = _normalize_pos_label(g["pos"]).mode().iat[0] if len(g) else "MID"
-            is_gk = (pos_label == "GK")
+            is_gk = (pos_label == "GKP")
+            perspective = np.where(
+                g["was_home"].eq(1),
+                "Home",
+                np.where(g["was_home"].eq(0), "Away", "Unknown"),
+            )
             # Halflife can vary by position; fallback to global --halflife
             hl = halflife_by_pos.get(pos_label, halflife)
 
@@ -797,12 +869,12 @@ def build_player_form(
                     alpha = float(cfg.get("bayes_alpha", {}).get(raw, 0.0))
                     if use_ewma:
                         roll, rh, ra = _ewma_past_only_bayes_mean(
-                            vals=arr, venues=g["venue"].astype(str).to_numpy(),
+                            vals=arr, venues=perspective,
                             halflife=hl, tau=tau, prior_val=prior_val, prior_matches=prior_matches, bayes_alpha=alpha
                         )
                     else:
                         roll, rh, ra = _rolling_past_only_bayes_mean(
-                            vals=arr, venues=g["venue"].astype(str).to_numpy(),
+                            vals=arr, venues=perspective,
                             window=window, tau=tau, prior_val=prior_val, prior_matches=prior_matches, bayes_alpha=alpha
                         )
                     base = f"{mkey}_{raw}_p90"
@@ -814,13 +886,13 @@ def build_player_form(
                 if use_ewma:
                     post, post_h, post_a = _ewma_binomial_savepct(
                         saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
-                        venues=g["venue"].astype(str).to_numpy(), halflife=hl, tau=tau,
+                        venues=perspective, halflife=hl, tau=tau,
                         prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
                     )
                 else:
                     post, post_h, post_a = _rolling_past_only_binomial_savepct(
                         saves=g["saves"].to_numpy(), shots=g["sot_against"].to_numpy(),
-                        venues=g["venue"].astype(str).to_numpy(), window=window, tau=tau,
+                        venues=perspective, window=window, tau=tau,
                         prior_p=p0 if not np.isnan(p0) else 0.70, prior_shots=s0 if (s0 and not np.isnan(s0)) else 80.0
                     )
                 g["gk_save_pct_p90_roll"] = post
@@ -893,17 +965,21 @@ def main() -> None:
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"),
                     help="Root containing <SEASON>/player_fixture_calendar.csv")
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/features"),
-                    help="Root for versioned features output")
+                    help="Feature publication root containing latest/ and optional vN snapshots.")
 
     # Versioning
-    ap.add_argument("--feat-version", default=None, help="Version folder (e.g., v3). If omitted with --auto-version, next vN is used.")
-    ap.add_argument("--auto-version", action="store_true", help="Pick the next vN under out-dir automatically.")
-    ap.add_argument("--write-latest", action="store_true", help="Update features/latest to point to the resolved version.")
+    ap.add_argument("--feat-version", default=None, help="Publication folder (default: latest; or specify v3).")
+    ap.add_argument("--auto-version", action="store_true", help="Explicitly create the next immutable vN snapshot.")
+    ap.add_argument("--write-latest", dest="write_latest", action="store_true",
+                    help="Publish the component to features/latest/<SEASON>/ (default).")
+    ap.add_argument("--no-write-latest", dest="write_latest", action="store_false",
+                    help="For a versioned run, do not copy it into latest.")
+    ap.set_defaults(write_latest=True)
 
     # Rolling params
     ap.add_argument("--window", type=int, default=5, help="rolling window (matches, past-only) for classic mode")
     ap.add_argument("--tau", type=float, default=2.0, help="venue shrinkage strength")
-    ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior → 0")
+    ap.add_argument("--prior-matches", type=int, default=6, help="first K matches blend prior toward 0")
     ap.add_argument("--ewma", action="store_true", help="use EWMA past-only rolling instead of hard window")
     ap.add_argument("--halflife", type=float, default=3.0, help="EWMA halflife in matches (global fallback)")
     ap.add_argument("--halflife-by-pos", type=str, default=None,
@@ -919,11 +995,11 @@ def main() -> None:
 
     logging.basicConfig(format="%(levelname)s: %(message)s", level=args.log_level.upper())
 
-    # seasons list
-    if args.season:
-        seasons = [args.season]
-    else:
-        seasons = sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
+    seasons = resolve_season_selection(
+        args.fixtures_root,
+        season=args.season,
+        seasons_csv=args.seasons,
+    )
     if not seasons:
         logging.error("No season folders in %s", args.fixtures_root); return
     seasons = sorted(seasons)
@@ -932,6 +1008,8 @@ def main() -> None:
     features_root = args.out_dir
     features_root.mkdir(parents=True, exist_ok=True)
     version = _resolve_version(features_root, args.feat_version, args.auto_version)
+    if version == "latest" and not args.write_latest:
+        ap.error("--no-write-latest requires --feat-version <vN> or --auto-version")
     version_dir = features_root / version
     version_dir.mkdir(parents=True, exist_ok=True)
 
@@ -958,6 +1036,8 @@ def main() -> None:
 
     if args.write_latest:
         _write_latest_pointer(features_root, version)
+        for season in seasons:
+            _copy_to_latest_dir(features_root, version, season)
 
 if __name__ == "__main__":
     main()

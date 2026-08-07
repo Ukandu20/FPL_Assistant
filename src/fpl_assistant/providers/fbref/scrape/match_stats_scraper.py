@@ -48,6 +48,7 @@ import warnings
 import time
 import random
 import json
+import re
 from pathlib import Path
 from typing import Optional, Callable, Any, Dict, Tuple, List, Set
 
@@ -79,6 +80,7 @@ from .fbref_robust import (
 from ..automation.auto_scrape import ScrapeJobId, record_last_run
 from fpl_assistant.providers.fbref.capabilities import (
     LEVEL_SUPPLEMENTARY,
+    coverage_record,
     coverage_from_outputs,
     validate_requested_stats,
     write_capability_document,
@@ -98,6 +100,32 @@ ALL_KNOWN_LEAGUES: List[str] = [
 # ───────────────────────── global throttle state ─────────────────────────
 
 _GLOBAL = {"net_calls": 0}
+
+
+def validate_schedule_season(frame: pd.DataFrame, season: str) -> None:
+    """Reject schedules whose dates do not belong to the requested split season."""
+    match = re.fullmatch(r"(\d{4})-(\d{4})", str(season).strip())
+    if frame.empty or not match:
+        return
+    if int(match.group(2)) != int(match.group(1)) + 1:
+        raise ValueError(f"Invalid split season: {season!r}")
+    date_column = next(
+        (column for column in ("date", "game_date") if column in frame.columns),
+        None,
+    )
+    if date_column is None:
+        raise ValueError("schedule_missing_date_column")
+    dates = pd.to_datetime(frame[date_column], errors="coerce").dropna()
+    if dates.empty:
+        raise ValueError("schedule_has_no_parseable_dates")
+    start = pd.Timestamp(f"{match.group(1)}-07-01")
+    end = pd.Timestamp(f"{match.group(2)}-06-30")
+    invalid = dates.loc[(dates < start) | (dates > end)]
+    if not invalid.empty:
+        raise ValueError(
+            f"schedule dates outside {season}: "
+            f"{invalid.min().date()}..{invalid.max().date()}"
+        )
 
 # ───────────────────────── helpers ─────────────────────────
 
@@ -803,6 +831,7 @@ def scrape_one(
     latest_fixture_meta: Optional[Dict[str, Any]] = None
 
     reused_schedule = False
+    schedule_status = "schema_only"
     if skip_schedule and _csv_exists(schedule_base):
         log.info(
             "Reusing existing schedule CSV for %s %s (--skip-schedule).",
@@ -812,7 +841,12 @@ def scrape_one(
         existing = _load_existing_csv(schedule_base)
         if existing is not None and not existing.empty:
             schedule_df = _normalize(existing, league, season_str)
-            reused_schedule = True
+            try:
+                validate_schedule_season(schedule_df, season_str)
+                reused_schedule = True
+                schedule_status = "skipped_up_to_date"
+            except ValueError as exc:
+                log.warning("Existing schedule rejected: %s", exc)
         else:
             log.warning(
                 "Existing schedule for %s %s is empty/unreadable; falling back to scrape.",
@@ -839,6 +873,8 @@ def scrape_one(
             if not isinstance(schedule_df, pd.DataFrame) or schedule_df.empty:
                 raise ValueError("empty_or_invalid")
             schedule_df = _normalize(schedule_df, league, season_str)
+            validate_schedule_season(schedule_df, season_str)
+            schedule_status = "scraped_ok"
         except Exception as e:
             recovered = False
 
@@ -869,7 +905,9 @@ def scrape_one(
                     if not isinstance(schedule_df, pd.DataFrame) or schedule_df.empty:
                         raise ValueError("empty_or_invalid")
                     schedule_df = _normalize(schedule_df, league, season_str)
+                    validate_schedule_season(schedule_df, season_str)
                     recovered = True
+                    schedule_status = "scraped_ok"
                 except Exception as e2:
                     log.warning(
                         "Cached leagues retry failed for %s %s: %s",
@@ -1053,7 +1091,9 @@ def scrape_one(
 
     # 3) Team-match stats
     if levels in ("team", "both"):
-        all_team_stats = STAT_MAP.get("team_match", [])
+        all_team_stats = [
+            stat for stat in STAT_MAP.get("team_match", []) if stat != "schedule"
+        ]
         all_team_stats_set = set(all_team_stats)
 
         if team_stats is not None:
@@ -1202,6 +1242,16 @@ def scrape_one(
         output_dir=out_dir,
         statuses=result["stats_summary"],
         layout="folders",
+    )
+    coverage_records.insert(
+        0,
+        coverage_record(
+            level="team_match",
+            stat_type="schedule",
+            status=schedule_status,
+            frame=schedule_df,
+            output_path=schedule_base.with_suffix(".csv"),
+        ),
     )
     write_coverage_manifest(
         out_dir / "_meta" / "coverage_manifest.json",

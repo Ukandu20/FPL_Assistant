@@ -217,6 +217,33 @@ def _coerce_bool(series: pd.Series) -> pd.Series:
 def _coerce_01(series: pd.Series) -> pd.Series:
     return _coerce_bool(series).astype("uint8")
 
+def _derive_was_home(df: pd.DataFrame) -> pd.Series:
+    """Derive team perspective without interpreting the physical venue name."""
+    out = pd.Series(pd.NA, index=df.index, dtype="Int8")
+
+    if {"team_id", "home_id"}.issubset(df.columns):
+        team_id = df["team_id"].astype("string").str.strip().str.lower()
+        home_id = df["home_id"].astype("string").str.strip().str.lower()
+        valid = team_id.notna() & home_id.notna()
+        out.loc[valid] = team_id.loc[valid].eq(home_id.loc[valid]).astype("Int8")
+
+    if "is_home" in df.columns:
+        missing = out.isna() & df["is_home"].notna()
+        if missing.any():
+            out.loc[missing] = _coerce_bool(df.loc[missing, "is_home"]).astype("Int8")
+
+    # Compatibility for historical calendars where venue meant team
+    # perspective. Stadium-valued venue strings intentionally remain untouched.
+    if "venue" in df.columns:
+        missing = out.isna()
+        venue = df["venue"].astype("string").str.strip().str.lower()
+        home = missing & venue.isin({"home", "h"})
+        away = missing & venue.isin({"away", "a"})
+        out.loc[home] = 1
+        out.loc[away] = 0
+
+    return out
+
 def _prep_fixture_keys(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if "kickoff_time" not in df.columns: return None
     df = df.copy()
@@ -527,8 +554,12 @@ def build_minutes_calendar(
     # Merge on both 'fbref_id' and 'team_id'
     merged = minutes.merge(cal, on=["fbref_id", "team_id"], how="left")
 
-    # Add was_home (canonicalized)
-    merged["was_home"] = (merged["venue"].astype(str).str.strip().str.title().eq("Home")).astype("Int8")
+    # Preserve provider venue as the physical stadium. Team perspective is a
+    # separate identity-derived flag and must not depend on venue semantics.
+    merged["was_home"] = _derive_was_home(merged)
+    unresolved_home = int(merged["was_home"].isna().sum())
+    if unresolved_home:
+        logging.warning("[%s] %d rows have unresolved was_home", season_key, unresolved_home)
 
     # Integrity check: remove rows without fixture match (if any)
     missing_fixtures = merged["date_played"].isna().sum()
