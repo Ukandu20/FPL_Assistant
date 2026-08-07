@@ -64,8 +64,6 @@ def build_player_bio(df):
         return pd.DataFrame()
     table = df.copy()
 
-    
-
 
 def main() :
     st.title("Fantasy Premier League Player Dashboard")

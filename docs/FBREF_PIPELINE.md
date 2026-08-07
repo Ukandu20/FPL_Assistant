@@ -225,15 +225,15 @@ identifier; FPL supplies fixture IDs, gameweeks, and the scheduled calendar.
 
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
-   --season "2025-2026" `                               
-   --fpl-root "data/raw/fpl/ENG-Premier League" `          
+  --season "2025-2026" `
+  --fpl-root "data/raw/fpl/ENG-Premier League" `
    --whoscored-league-dir "data/processed/whoscored/ENG-Premier League" `
    --team-map "data/processed/registry/_id_lookup_teams.json" `
-   --short-map "data/config/teams.json" `              
+  --short-map "data/config/teams.json" `
    --out-dir "data/processed/registry/fixtures" `
-   --features-root "data/processed/registry/features" `                                   
-   --force `             
-  --log-level INFO 
+  --features-root "data/processed/registry/features" `
+  --force `
+  --log-level INFO
 ```
 
 Expected output:
