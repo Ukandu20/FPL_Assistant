@@ -21,6 +21,8 @@ from .manifest import RunManifest, determine_run_mode
 from .staging import stage_match_facts
 from .whoscored_defense import aggregate_whoscored_defensive_events
 from .whoscored_defense import canonicalize_whoscored_event_ids
+from .whoscored_defense import validate_defensive_totals
+from .whoscored_defense import validate_whoscored_match_coverage
 
 
 def _read(path: Path | None) -> pd.DataFrame | None:
@@ -30,7 +32,7 @@ def _read(path: Path | None) -> pd.DataFrame | None:
         raise FileNotFoundError(path)
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
-    return pd.read_csv(path)
+    return pd.read_csv(path, low_memory=False)
 
 
 def _write(frame: pd.DataFrame, path: Path) -> None:
@@ -133,10 +135,18 @@ def _dnp(args: argparse.Namespace) -> None:
 
 def _whoscored_defense(args: argparse.Namespace) -> None:
     events = _read(args.events)
+    schedule = _read(args.schedule)
+    coverage_audit = validate_whoscored_match_coverage(
+        events,
+        schedule,
+        min_coverage=args.min_coverage,
+        allow_partial=args.allow_partial,
+    )
     bridges = [args.player_bridges, args.team_bridges, args.match_bridges]
-    if any(bridges) and not all(bridges):
+    if not args.allow_native_ids and not all(bridges):
         raise ValueError(
-            "WhoScored ID resolution requires player, team, and match bridges."
+            "WhoScored canonical output requires player, team, and match bridges. "
+            "Use --allow-native-ids only for explicitly non-canonical diagnostics."
         )
     if all(bridges):
         events = canonicalize_whoscored_event_ids(
@@ -147,8 +157,23 @@ def _whoscored_defense(args: argparse.Namespace) -> None:
             strict=not args.allow_unresolved,
         )
     result = aggregate_whoscored_defensive_events(events)
+    if args.official_totals:
+        official_audit = validate_defensive_totals(
+            result.player_match,
+            _read(args.official_totals),
+            official_total_column=args.official_total_column,
+            allow_mismatches=args.allow_total_mismatches,
+        )
+        _write(official_audit, args.out_dir / "official_totals_validation.csv")
+    elif not args.skip_official_validation:
+        raise ValueError(
+            "Official FPL totals are required before WhoScored-derived values can "
+            "be used as labels. Pass --official-totals or explicitly use "
+            "--skip-official-validation."
+        )
     _write(result.player_match, args.out_dir / "player_match_defensive_events.csv")
     _write(result.event_audit, args.out_dir / "event_coverage_audit.csv")
+    _write(coverage_audit, args.out_dir / "match_coverage_audit.csv")
 
 
 def _feature_snapshot(args: argparse.Namespace) -> None:
@@ -246,10 +271,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     defense = commands.add_parser("whoscored-defense")
     defense.add_argument("--events", type=Path, required=True)
+    defense.add_argument("--schedule", type=Path, required=True)
     defense.add_argument("--player-bridges", type=Path)
     defense.add_argument("--team-bridges", type=Path)
     defense.add_argument("--match-bridges", type=Path)
     defense.add_argument("--allow-unresolved", action="store_true")
+    defense.add_argument("--allow-native-ids", action="store_true")
+    defense.add_argument("--allow-partial", action="store_true")
+    defense.add_argument("--min-coverage", type=float, default=1.0)
+    defense.add_argument("--official-totals", type=Path)
+    defense.add_argument(
+        "--official-total-column",
+        default="defensive_contributions",
+    )
+    defense.add_argument("--allow-total-mismatches", action="store_true")
+    defense.add_argument("--skip-official-validation", action="store_true")
     defense.add_argument("--out-dir", type=Path, required=True)
     defense.set_defaults(handler=_whoscored_defense)
 

@@ -23,6 +23,9 @@ from fpl_assistant.canonical.matches import build_match_registry
 from fpl_assistant.canonical.staging import stage_match_facts
 from fpl_assistant.canonical.whoscored_defense import (
     aggregate_whoscored_defensive_events,
+    canonicalize_whoscored_event_ids,
+    validate_defensive_totals,
+    validate_whoscored_match_coverage,
 )
 from fpl_assistant.providers.fbref.capabilities import (
     LEVEL_PLAYER_MATCH,
@@ -320,6 +323,105 @@ def test_whoscored_events_generate_defensive_components_and_audit():
     assert p1["defensive_contributions_outfield"] == 5
     assert result.event_audit["event_count"].sum() == len(events)
     assert (~result.event_audit["recognized"]).any()
+
+
+def test_whoscored_native_game_ids_aggregate_without_bridges():
+    events = pd.DataFrame(
+        [
+            {
+                "game_id": 1903148,
+                "player_id": 123,
+                "team_id": 13,
+                "type": "Tackle",
+                "outcome_type": "Successful",
+            }
+        ]
+    )
+
+    result = aggregate_whoscored_defensive_events(events)
+
+    row = result.player_match.iloc[0]
+    assert row["match_id"] == 1903148
+    assert row["provider_match_id"] == 1903148
+    assert row["provider_player_id"] == 123
+    assert row["provider_team_id"] == 13
+
+
+def test_whoscored_canonicalization_preserves_native_ids():
+    events = pd.DataFrame(
+        [
+            {
+                "game_id": "ws-m1",
+                "player_id": "ws-p1",
+                "team_id": "ws-t1",
+                "type": "Tackle",
+            }
+        ]
+    )
+    player_bridges = pd.DataFrame(
+        [{"provider": "whoscored", "provider_id": "ws-p1", "canonical_id": "p1"}]
+    )
+    team_bridges = pd.DataFrame(
+        [{"provider": "whoscored", "provider_id": "ws-t1", "canonical_id": "t1"}]
+    )
+    match_bridges = pd.DataFrame(
+        [{"provider": "whoscored", "provider_match_id": "ws-m1", "match_id": "m1"}]
+    )
+
+    out = canonicalize_whoscored_event_ids(
+        events,
+        player_bridges=player_bridges,
+        team_bridges=team_bridges,
+        match_bridges=match_bridges,
+    )
+
+    assert out.loc[0, "match_id"] == "m1"
+    assert out.loc[0, "provider_match_id"] == "ws-m1"
+    assert out.loc[0, "provider_player_id"] == "ws-p1"
+    assert out.loc[0, "provider_team_id"] == "ws-t1"
+
+
+def test_whoscored_coverage_rejects_incomplete_round_robin_schedule():
+    schedule = pd.DataFrame(
+        [
+            {"game_id": "m1", "home_team_id": "a", "away_team_id": "b"},
+            {"game_id": "m2", "home_team_id": "b", "away_team_id": "a"},
+            {"game_id": "m3", "home_team_id": "a", "away_team_id": "c"},
+        ]
+    )
+    events = pd.DataFrame({"game_id": ["m1", "m2", "m3"]})
+
+    with pytest.raises(ValueError, match="schedule=3/6"):
+        validate_whoscored_match_coverage(events, schedule)
+
+
+def test_whoscored_official_total_validation_selects_position_formula():
+    provider = pd.DataFrame(
+        [
+            {
+                "match_id": "m1",
+                "player_id": "def",
+                "defensive_contributions_def": 4,
+                "defensive_contributions_outfield": 5,
+            },
+            {
+                "match_id": "m1",
+                "player_id": "mid",
+                "defensive_contributions_def": 4,
+                "defensive_contributions_outfield": 5,
+            },
+        ]
+    )
+    official = pd.DataFrame(
+        [
+            {"match_id": "m1", "player_id": "def", "position": "DEF", "defensive_contributions": 4},
+            {"match_id": "m1", "player_id": "mid", "position": "MID", "defensive_contributions": 5},
+        ]
+    )
+
+    audit = validate_defensive_totals(provider, official)
+
+    assert audit["matches_official"].all()
 
 
 def test_feature_contract_prevents_time_leakage_and_manifest_hashes():

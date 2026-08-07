@@ -14,6 +14,9 @@ DEFENSIVE_EVENT_COLUMNS = [
     "match_id",
     "player_id",
     "team_id",
+    "provider_match_id",
+    "provider_player_id",
+    "provider_team_id",
     "tackles",
     "tackles_won",
     "interceptions",
@@ -51,6 +54,13 @@ def canonicalize_whoscored_event_ids(
     missing = required - set(work.columns)
     if missing:
         raise KeyError(f"WhoScored events missing ID columns: {sorted(missing)}")
+    work["provider_match_id"] = work[source_match].astype("string")
+    work["provider_player_id"] = work["player_id"].astype("string")
+    work["provider_team_id"] = work["team_id"].astype("string")
+    if "related_player_id" in work:
+        work["provider_related_player_id"] = work["related_player_id"].astype(
+            "string"
+        )
     player_map = _bridge_map(player_bridges, provider="whoscored")
     team_map = _bridge_map(team_bridges, provider="whoscored")
     match_map = _bridge_map(
@@ -73,6 +83,114 @@ def canonicalize_whoscored_event_ids(
     return work.dropna(subset=["match_id", "player_id", "team_id"]).reset_index(
         drop=True
     )
+
+
+def validate_whoscored_match_coverage(
+    events: pd.DataFrame,
+    schedule: pd.DataFrame,
+    *,
+    min_coverage: float = 1.0,
+    allow_partial: bool = False,
+) -> pd.DataFrame:
+    """Validate schedule completeness and event coverage for a league season."""
+    if not 0 < min_coverage <= 1:
+        raise ValueError("min_coverage must be in (0, 1].")
+    event_id_col = next(
+        (column for column in ("provider_match_id", "match_id", "game_id") if column in events),
+        None,
+    )
+    schedule_id_col = next(
+        (column for column in ("provider_match_id", "match_id", "game_id") if column in schedule),
+        None,
+    )
+    if event_id_col is None or schedule_id_col is None:
+        raise KeyError("WhoScored events and schedule must contain a match_id or game_id.")
+
+    scheduled_ids = set(schedule[schedule_id_col].dropna().astype(str))
+    event_ids = set(events[event_id_col].dropna().astype(str))
+    covered = scheduled_ids & event_ids
+    missing = scheduled_ids - event_ids
+
+    team_pairs = [
+        ("home_team_id", "away_team_id"),
+        ("home_team", "away_team"),
+    ]
+    team_columns = next(
+        ((home, away) for home, away in team_pairs if {home, away} <= set(schedule.columns)),
+        None,
+    )
+    expected_matches = len(scheduled_ids)
+    if team_columns is not None:
+        home, away = team_columns
+        team_count = len(
+            set(schedule[home].dropna().astype(str))
+            | set(schedule[away].dropna().astype(str))
+        )
+        if team_count >= 2:
+            expected_matches = team_count * (team_count - 1)
+
+    schedule_complete = len(scheduled_ids) >= expected_matches
+    coverage = len(covered) / len(scheduled_ids) if scheduled_ids else 0.0
+    audit = pd.DataFrame(
+        [
+            {
+                "scheduled_matches": len(scheduled_ids),
+                "expected_matches": expected_matches,
+                "event_matches": len(event_ids),
+                "covered_schedule_matches": len(covered),
+                "missing_event_matches": len(missing),
+                "schedule_complete": schedule_complete,
+                "event_coverage": coverage,
+                "min_coverage": min_coverage,
+            }
+        ]
+    )
+    if not allow_partial and (not schedule_complete or coverage < min_coverage):
+        raise ValueError(
+            "Incomplete WhoScored coverage: "
+            f"schedule={len(scheduled_ids)}/{expected_matches}, "
+            f"events={len(covered)}/{len(scheduled_ids)} ({coverage:.1%})."
+        )
+    return audit
+
+
+def validate_defensive_totals(
+    player_match: pd.DataFrame,
+    official_totals: pd.DataFrame,
+    *,
+    official_total_column: str = "defensive_contributions",
+    allow_mismatches: bool = False,
+) -> pd.DataFrame:
+    """Compare provider-derived player-match totals with official FPL totals."""
+    keys = ["match_id", "player_id"]
+    required = set(keys + [official_total_column])
+    missing = required - set(official_totals.columns)
+    if missing:
+        raise KeyError(f"Official defensive totals missing columns: {sorted(missing)}")
+    official_columns = keys + [official_total_column]
+    if "position" in official_totals.columns:
+        official_columns.append("position")
+    official = official_totals[official_columns].copy()
+    merged = official.merge(player_match, on=keys, how="left", validate="one_to_one")
+    position = merged.get("position", pd.Series("MID", index=merged.index))
+    merged["provider_defensive_contributions"] = (
+        merged["defensive_contributions_def"].where(
+            position.astype(str).str.upper().eq("DEF"),
+            merged["defensive_contributions_outfield"],
+        )
+    )
+    merged[official_total_column] = pd.to_numeric(
+        merged[official_total_column], errors="coerce"
+    )
+    merged["matches_official"] = (
+        merged["provider_defensive_contributions"].eq(merged[official_total_column])
+    )
+    if not allow_mismatches and not merged["matches_official"].all():
+        mismatch_count = int((~merged["matches_official"]).sum())
+        raise ValueError(
+            f"{mismatch_count} player-match defensive totals differ from official FPL."
+        )
+    return merged
 
 
 def _norm(value: Any) -> str:
@@ -111,6 +229,10 @@ def aggregate_whoscored_defensive_events(
     FPL outcomes before becoming labels.
     """
 
+    if match_id_column == "match_id" and match_id_column not in events:
+        if "game_id" in events:
+            match_id_column = "game_id"
+
     required = {match_id_column, "player_id", "team_id", "type"}
     missing = required - set(events.columns)
     if missing:
@@ -142,6 +264,7 @@ def aggregate_whoscored_defensive_events(
         return alternatives[0] if len(alternatives) == 1 else pd.NA
 
     counters: dict[tuple[Any, Any, Any], dict[str, int]] = {}
+    provider_ids: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
 
     def increment(
         row: pd.Series,
@@ -168,6 +291,20 @@ def aggregate_whoscored_defensive_events(
                 "saves": 0,
                 "aerial_duels": 0,
                 "aerial_duels_won": 0,
+            },
+        )
+        provider_ids.setdefault(
+            key,
+            {
+                "provider_match_id": row.get(
+                    "provider_match_id", row[match_id_column]
+                ),
+                "provider_player_id": (
+                    row.get("provider_player_id", row["player_id"])
+                    if player_id is None
+                    else row.get("provider_related_player_id", player_id)
+                ),
+                "provider_team_id": row.get("provider_team_id", tid),
             },
         )
         counters[key][metric] += amount
@@ -254,6 +391,7 @@ def aggregate_whoscored_defensive_events(
                 "match_id": match_id,
                 "player_id": player_id,
                 "team_id": team_id,
+                **provider_ids.get((match_id, player_id, team_id), {}),
                 **values,
                 "defensive_contributions_def": defender_total,
                 "defensive_contributions_outfield": outfield_total,
