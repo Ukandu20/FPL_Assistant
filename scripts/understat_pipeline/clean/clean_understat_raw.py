@@ -104,6 +104,31 @@ def map_league_value(raw_league: str) -> str:
     return raw_league
 
 
+def resolve_league_folders(leagues: Optional[Iterable[str]] = None) -> List[str]:
+    """Resolve provider or canonical league selectors to raw folder names."""
+    if not leagues:
+        return list(MODERN_LEAGUE_FOLDERS)
+    resolved: List[str] = []
+    for value in leagues:
+        selector = str(value).strip().casefold()
+        match = next(
+            (
+                source
+                for source, canonical in LEAGUE_MAP.items()
+                if selector in {source.casefold(), canonical.casefold()}
+            ),
+            None,
+        )
+        if match is None:
+            choices = ", ".join(
+                f"{source} ({canonical})" for source, canonical in LEAGUE_MAP.items()
+            )
+            raise ValueError(f"Unsupported Understat league {value!r}; choose from: {choices}")
+        if match not in resolved:
+            resolved.append(match)
+    return resolved
+
+
 def normalize_player_key(value: Any) -> str:
     text = unescape(str(value))
     text = text.replace("\u2019", "'").replace("`", "'")
@@ -423,6 +448,33 @@ def annotate_missing_with_overrides(
 def map_player_match_pos(raw_position: Any) -> str:
     raw = _safe_str(raw_position).strip()
     return POS_MAP_PLAYER_MATCH.get(raw, "UNK")
+
+
+def normalize_fpl_position(value: Any) -> str:
+    text = _safe_str(value).upper()
+    return {
+        "GK": "GKP", "GKP": "GKP", "1": "GKP",
+        "DEF": "DEF", "2": "DEF",
+        "MID": "MID", "3": "MID",
+        "FWD": "FWD", "FW": "FWD", "4": "FWD",
+    }.get(text, "UNK")
+
+
+def load_official_fpl_positions(fpl_root: Path, season_long: str) -> Dict[str, str]:
+    path = fpl_root / season_long / "season" / "cleaned_players.csv"
+    if not path.is_file():
+        LOG.warning("Official FPL roster not found for %s: %s", season_long, path)
+        return {}
+    frame = pd.read_csv(path, low_memory=False)
+    if not {"player_id", "fpl_pos"} <= set(frame.columns):
+        raise ValueError(f"Official FPL roster lacks player_id/fpl_pos: {path}")
+    frame = frame.loc[frame["player_id"].notna(), ["player_id", "fpl_pos"]].copy()
+    frame["player_id"] = frame["player_id"].astype(str)
+    frame["fpl_pos"] = frame["fpl_pos"].map(normalize_fpl_position)
+    conflicts = frame.groupby("player_id")["fpl_pos"].nunique()
+    if (conflicts > 1).any():
+        raise ValueError(f"Conflicting official FPL positions in {path}")
+    return dict(zip(frame["player_id"], frame["fpl_pos"]))
 
 
 def apply_common_league_season(df: pd.DataFrame, league_std: str, season_long: str) -> pd.DataFrame:
@@ -874,13 +926,15 @@ def add_master_fpl_compare(
     *,
     master_fpl: Dict[str, Any],
     season_long: str,
+    official_fpl_positions: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     out = df.copy()
-    if "fpl_pos" not in out.columns:
-        return out
     if "player_id" not in out.columns:
         out["master_fpl_pos"] = pd.NA
+        out["fpl_pos"] = "UNK"
+        out["fpl_position_source"] = "unresolved"
         out["fpl_pos_master_match"] = pd.NA
+        out["fpl_pos_tactical_match"] = pd.NA
         return out
 
     season_short = season_long_to_short(season_long)
@@ -893,17 +947,25 @@ def add_master_fpl_compare(
             return None
         career = rec.get("career", {})
         season_blob = career.get(season_short, {})
-        pos = season_blob.get("fpl_position")
-        if pos in {"GK", "DEF", "MID", "FWD", "SUB"}:
-            return pos
-        return None
+        position = normalize_fpl_position(season_blob.get("fpl_position", season_blob.get("fpl_pos")))
+        return position if position != "UNK" else None
 
     out["master_fpl_pos"] = out["player_id"].apply(_master_pos)
+    official = official_fpl_positions or {}
+    official_values = out["player_id"].map(lambda value: official.get(str(value)) if pd.notna(value) else None)
+    out["fpl_pos"] = official_values.combine_first(out["master_fpl_pos"]).fillna("UNK")
+    out["fpl_position_source"] = "unresolved"
+    out.loc[out["master_fpl_pos"].notna(), "fpl_position_source"] = "fpl.master_fpl"
+    out.loc[official_values.notna(), "fpl_position_source"] = "fpl.cleaned_players.fpl_pos"
     both = out["fpl_pos"].notna() & out["master_fpl_pos"].notna()
     out["fpl_pos_master_match"] = pd.Series(pd.NA, index=out.index, dtype="object")
     out.loc[both, "fpl_pos_master_match"] = (
         out.loc[both, "fpl_pos"].astype(str) == out.loc[both, "master_fpl_pos"].astype(str)
     )
+    out["fpl_pos_tactical_match"] = pd.Series(pd.NA, index=out.index, dtype="object")
+    if "position_group_match" in out.columns:
+        comparable = out["fpl_pos"].ne("UNK") & out["position_group_match"].ne("UNK") & out["position_group_match"].ne("SUB")
+        out.loc[comparable, "fpl_pos_tactical_match"] = out.loc[comparable, "fpl_pos"].astype(str) == out.loc[comparable, "position_group_match"].replace({"GK": "GKP"}).astype(str)
     return out
 
 
@@ -965,6 +1027,7 @@ def process_player_match(
     override_lookup: Dict[str, set[str]],
     master_fpl: Dict[str, Any],
     teams_name_to_code: Dict[str, str],
+    official_fpl_positions: Optional[Dict[str, str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     out = apply_common_league_season(df, league_std=league_std, season_long=season_long)
     out = apply_player_id_cleaning(
@@ -983,9 +1046,11 @@ def process_player_match(
         )
     else:
         out["venue"] = pd.NA
-    out["fpl_pos"] = out.get("position", pd.Series(pd.NA, index=out.index)).apply(map_player_match_pos)
-    out["position_unmapped"] = out["fpl_pos"].eq("UNK")
-    out = add_master_fpl_compare(out, master_fpl=master_fpl, season_long=season_long)
+    provider_position = out.get("position", pd.Series(pd.NA, index=out.index))
+    out["position_group_match"] = provider_position.apply(map_player_match_pos)
+    out["is_starter"] = (~provider_position.astype("string").fillna("").str.strip().str.casefold().eq("sub")).astype("uint8")
+    out["position_unmapped"] = out["position_group_match"].eq("UNK")
+    out = add_master_fpl_compare(out, master_fpl=master_fpl, season_long=season_long, official_fpl_positions=official_fpl_positions)
     out = standardize_team_and_game_codes(out, teams_name_to_code=teams_name_to_code)
 
     ordered_cols = [
@@ -1001,9 +1066,13 @@ def process_player_match(
         "understat_player_id",
         "venue",
         "position",
+        "position_group_match",
+        "is_starter",
         "fpl_pos",
+        "fpl_position_source",
         "master_fpl_pos",
         "fpl_pos_master_match",
+        "fpl_pos_tactical_match",
         "minutes",
         "roster_id",
         "position_id",
@@ -1027,7 +1096,7 @@ def process_player_match(
     out = out[[c for c in ordered_cols if c in out.columns]]
 
     unknown_pos = out.loc[out["position_unmapped"], ["league", "season", "position"]].copy()
-    mism = out.loc[out["fpl_pos_master_match"] == False, ["league", "season", "player", "player_id", "fpl_pos", "master_fpl_pos"]].copy()  # noqa: E712
+    mism = out.loc[out["fpl_pos_tactical_match"] == False, ["league", "season", "player", "player_id", "position", "position_group_match", "fpl_pos", "fpl_position_source"]].copy()  # noqa: E712
     return out, unknown_pos, mism
 
 
@@ -1043,6 +1112,7 @@ def process_player_season(
     mode_by_id: Dict[Tuple[str, str, str], str],
     mode_by_name: Dict[Tuple[str, str, str], str],
     teams_name_to_code: Dict[str, str],
+    official_fpl_positions: Optional[Dict[str, str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out = apply_common_league_season(df, league_std=league_std, season_long=season_long)
     out = apply_player_id_cleaning(
@@ -1065,8 +1135,8 @@ def process_player_season(
             return mode_by_name.get((lg, ss, key))
         return None
 
-    out["fpl_pos"] = out.apply(_derive_fpl_pos, axis=1)
-    out = add_master_fpl_compare(out, master_fpl=master_fpl, season_long=season_long)
+    out["position_group_match"] = out.apply(_derive_fpl_pos, axis=1)
+    out = add_master_fpl_compare(out, master_fpl=master_fpl, season_long=season_long, official_fpl_positions=official_fpl_positions)
     out = standardize_team_and_game_codes(out, teams_name_to_code=teams_name_to_code)
 
     ordered_cols = [
@@ -1079,9 +1149,12 @@ def process_player_season(
         "player_id",
         "understat_player_id",
         "position",
+        "position_group_match",
         "fpl_pos",
+        "fpl_position_source",
         "master_fpl_pos",
         "fpl_pos_master_match",
+        "fpl_pos_tactical_match",
         "matches",
         "minutes",
         "goals",
@@ -1099,7 +1172,7 @@ def process_player_season(
         "player_id_missing",
     ]
     out = out[[c for c in ordered_cols if c in out.columns]]
-    mism = out.loc[out["fpl_pos_master_match"] == False, ["league", "season", "player", "player_id", "fpl_pos", "master_fpl_pos"]].copy()  # noqa: E712
+    mism = out.loc[out["fpl_pos_tactical_match"] == False, ["league", "season", "player", "player_id", "position", "position_group_match", "fpl_pos", "fpl_position_source"]].copy()  # noqa: E712
     return out, mism
 
 
@@ -1161,12 +1234,71 @@ def process_generic_player_file(
     return out
 
 
-def save_csv(df: pd.DataFrame, out_path: Path) -> None:
+def _csv_has_rows(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        sample = pd.read_csv(path, nrows=10)
+        if sample.empty:
+            return False
+        if len(sample.columns) == 1 and str(sample.columns[0]).startswith("Unnamed"):
+            legacy_index_names = {"league", "season", "game", "team", "player"}
+            values = set(sample.iloc[:, 0].dropna().astype(str))
+            if values and values <= legacy_index_names:
+                return False
+        return True
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return False
+
+
+def _season_sources(
+    league_dir: Path,
+    seasons: Optional[Iterable[str]] = None,
+) -> List[Tuple[str, Path, List[Path]]]:
+    """Resolve one safe source directory per normalized season."""
+    selected = {season_to_long(value) for value in seasons} if seasons else None
+    grouped: Dict[str, List[Path]] = defaultdict(list)
+    for path in sorted(p for p in league_dir.iterdir() if p.is_dir()):
+        season_long = season_to_long(path.name)
+        if selected is None or season_long in selected:
+            grouped[season_long].append(path)
+
+    resolved: List[Tuple[str, Path, List[Path]]] = []
+    for season_long, candidates in sorted(grouped.items()):
+        populated = [
+            path
+            for path in candidates
+            if any(_csv_has_rows(csv_path) for csv_path in path.glob("*.csv"))
+        ]
+        if len(populated) > 1:
+            names = ", ".join(str(path) for path in populated)
+            raise ValueError(
+                f"Multiple populated Understat source folders map to {season_long}: {names}"
+            )
+        preferred_name = season_long[:4]
+        chosen = (
+            populated[0]
+            if populated
+            else next(
+                (path for path in candidates if path.name == preferred_name),
+                candidates[0],
+            )
+        )
+        ignored = [path for path in candidates if path != chosen]
+        resolved.append((season_long, chosen, ignored))
+    return resolved
+
+
+def save_csv(df: pd.DataFrame, out_path: Path) -> bool:
+    if df.empty and _csv_has_rows(out_path):
+        LOG.warning("Preserving non-empty output; refusing empty overwrite: %s", out_path)
+        return False
     out_path.parent.mkdir(parents=True, exist_ok=True)
     drop_cols = [c for c in ["__player_key", "__override_player_id"] if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
     df.to_csv(out_path, index=False)
+    return True
 
 
 def _group_count(df: pd.DataFrame, by_cols: List[str], count_col_name: str = "count") -> pd.DataFrame:
@@ -1185,6 +1317,9 @@ def run_clean(
     player_lookup_path: Path,
     master_fpl_path: Path,
     overrides_path: Path,
+    fpl_root: Path = Path("data/processed/fpl"),
+    leagues: Optional[Iterable[str]] = None,
+    seasons: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     team_lookup_raw = json.loads(team_lookup_path.read_text(encoding="utf-8"))
     teams_config_raw: Dict[str, str] = {}
@@ -1204,6 +1339,8 @@ def run_clean(
     override_lookup = build_override_lookup(override_raw)
 
     files_written = 0
+    empty_files_skipped = 0
+    duplicate_season_dirs_ignored = 0
     total_rows_in = 0
     total_rows_out = 0
     season_count = 0
@@ -1213,16 +1350,28 @@ def run_clean(
     unknown_pos_all: List[pd.DataFrame] = []
     mismatch_all: List[pd.DataFrame] = []
 
-    for src_league in MODERN_LEAGUE_FOLDERS:
+    selected_leagues = resolve_league_folders(leagues)
+    selected_seasons = sorted({season_to_long(value) for value in seasons}) if seasons else None
+
+    for src_league in selected_leagues:
         league_dir = in_root / src_league
         if not league_dir.exists():
             LOG.info("Skipping missing league dir: %s", league_dir)
             continue
 
         league_std = map_league_value(src_league)
-        season_dirs = sorted([p for p in league_dir.iterdir() if p.is_dir()])
-        for season_dir in season_dirs:
-            season_long = season_to_long(season_dir.name)
+        for season_long, season_dir, ignored_dirs in _season_sources(
+            league_dir, selected_seasons
+        ):
+            official_fpl_positions = load_official_fpl_positions(fpl_root, season_long)
+            if ignored_dirs:
+                duplicate_season_dirs_ignored += len(ignored_dirs)
+                LOG.warning(
+                    "Using %s for %s; ignoring equivalent empty source folder(s): %s",
+                    season_dir,
+                    season_long,
+                    ", ".join(str(path) for path in ignored_dirs),
+                )
             season_count += 1
             out_season_dir = out_root / league_std / season_long
             out_season_dir.mkdir(parents=True, exist_ok=True)
@@ -1238,8 +1387,28 @@ def run_clean(
             for filename in ordered_files:
                 src_path = file_map[filename]
                 dst_path = out_season_dir / filename
+                if not _csv_has_rows(src_path):
+                    empty_files_skipped += 1
+                    if _csv_has_rows(dst_path):
+                        LOG.warning(
+                            "Skipping schema-only source and preserving non-empty output: %s",
+                            dst_path,
+                        )
+                    else:
+                        LOG.info("Skipping schema-only source: %s", src_path)
+                    continue
                 df = pd.read_csv(src_path)
                 total_rows_in += len(df)
+                if df.empty:
+                    empty_files_skipped += 1
+                    if _csv_has_rows(dst_path):
+                        LOG.warning(
+                            "Skipping empty source and preserving non-empty output: %s",
+                            dst_path,
+                        )
+                    else:
+                        LOG.info("Skipping schema-only source: %s", src_path)
+                    continue
 
                 if filename == "schedule.csv":
                     clean_df, team_missing = transform_schedule(
@@ -1261,6 +1430,7 @@ def run_clean(
                         override_lookup=override_lookup,
                         master_fpl=master_fpl,
                         teams_name_to_code=teams_name_to_code,
+                        official_fpl_positions=official_fpl_positions,
                     )
                     mode_by_id, mode_by_name = build_fpl_mode_maps(clean_df)
                     if not unknown_pos.empty:
@@ -1279,6 +1449,7 @@ def run_clean(
                         mode_by_id=mode_by_id,
                         mode_by_name=mode_by_name,
                         teams_name_to_code=teams_name_to_code,
+                        official_fpl_positions=official_fpl_positions,
                     )
                     if not mism.empty:
                         mismatch_all.append(mism.assign(file=filename))
@@ -1321,9 +1492,9 @@ def run_clean(
                     if not miss.empty:
                         player_missing_all.append(miss.assign(file=filename))
 
-                save_csv(clean_df, dst_path)
-                files_written += 1
-                total_rows_out += len(clean_df)
+                if save_csv(clean_df, dst_path):
+                    files_written += 1
+                    total_rows_out += len(clean_df)
 
     audit_dir = out_root / "_audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -1357,7 +1528,7 @@ def run_clean(
     mismatch_df = (
         pd.concat(mismatch_all, ignore_index=True)
         if mismatch_all
-        else pd.DataFrame(columns=["league", "season", "player", "player_id", "fpl_pos", "master_fpl_pos", "file"])
+        else pd.DataFrame(columns=["league", "season", "player", "player_id", "position", "position_group_match", "fpl_pos", "fpl_position_source", "file"])
     )
     mismatch_df.to_csv(audit_dir / "fpl_pos_compare_mismatch.csv", index=False)
 
@@ -1365,7 +1536,11 @@ def run_clean(
         "run_utc": datetime.now(timezone.utc).isoformat(),
         "in_root": str(in_root),
         "out_root": str(out_root),
+        "league_filter": selected_leagues,
+        "season_filter": selected_seasons,
         "files_written": files_written,
+        "empty_files_skipped": empty_files_skipped,
+        "duplicate_season_dirs_ignored": duplicate_season_dirs_ignored,
         "seasons_processed": season_count,
         "rows_in": int(total_rows_in),
         "rows_out": int(total_rows_out),
@@ -1394,12 +1569,28 @@ def run_clean(
 
 def main() -> None:
     parser = argparse.ArgumentParser("Clean raw Understat CSV files")
+    parser.add_argument(
+        "--league",
+        nargs="+",
+        default=None,
+        help="Provider or canonical league name(s), e.g. EPL or 'ENG-Premier League'. Default: all.",
+    )
+    parser.add_argument(
+        "--season",
+        "--seasons",
+        dest="seasons",
+        nargs="+",
+        type=season_to_long,
+        default=None,
+        help="Season(s) as YYYY, YYYY-YY, or YYYY-YYYY. Default: all discovered seasons.",
+    )
     parser.add_argument("--in-root", type=Path, default=Path("data/raw/understat"))
     parser.add_argument("--out-root", type=Path, default=Path("data/processed/understat"))
     parser.add_argument("--team-lookup", type=Path, default=Path("data/processed/registry/_id_lookup_teams.json"))
     parser.add_argument("--teams-config", type=Path, default=Path("data/config/teams.json"))
     parser.add_argument("--player-lookup", type=Path, default=Path("data/processed/registry/_id_lookup_players.json"))
     parser.add_argument("--master-fpl", type=Path, default=Path("data/processed/registry/master_fpl.json"))
+    parser.add_argument("--fpl-root", type=Path, default=Path("data/processed/fpl"))
     parser.add_argument("--overrides", type=Path, default=Path("data/processed/registry/overrides.json"))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -1413,6 +1604,9 @@ def main() -> None:
         player_lookup_path=args.player_lookup,
         master_fpl_path=args.master_fpl,
         overrides_path=args.overrides,
+        fpl_root=args.fpl_root,
+        leagues=args.league,
+        seasons=args.seasons,
     )
     LOG.info("Clean complete: %s", json.dumps(summary, indent=2))
 

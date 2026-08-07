@@ -73,6 +73,35 @@ TABLE_CHOICES = [
 ]
 
 
+def normalize_understat_season(value: Any) -> str:
+    """Return the starting year used by Understat's API and cache keys."""
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{4})", text)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"(\d{4})[-/](\d{2}|\d{4})", text)
+    if not match:
+        raise ValueError(
+            f"Unsupported Understat season {value!r}; use YYYY or YYYY-YYYY."
+        )
+    start = int(match.group(1))
+    end_text = match.group(2)
+    end = int(end_text) if len(end_text) == 4 else (start // 100) * 100 + int(end_text)
+    if end != start + 1:
+        raise ValueError(
+            f"Understat season must span consecutive years: {value!r}."
+        )
+    return str(start)
+
+
+def _empty_indexed_frame(index: str | Sequence[str]) -> pd.DataFrame:
+    """Build an empty frame with a correctly named Index or MultiIndex."""
+    if isinstance(index, str):
+        return pd.DataFrame(index=pd.Index([], name=index))
+    names = list(index)
+    return pd.DataFrame(index=pd.MultiIndex.from_arrays([[] for _ in names], names=names))
+
+
 def init_logger(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -358,7 +387,7 @@ class UnderstatApi:
 
         index = "league"
         if len(leagues) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         df = pd.DataFrame.from_records(list(leagues.values())).set_index(index).sort_index()
         if self.leagues:
@@ -390,7 +419,7 @@ class UnderstatApi:
 
         index = ["league", "season"]
         if len(seasons) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         df = pd.DataFrame.from_records(list(seasons.values())).set_index(index).sort_index()
 
@@ -513,7 +542,7 @@ class UnderstatApi:
 
         index = ["league", "season", "game"]
         if len(matches) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         df = (
             pd.DataFrame.from_records(matches)
@@ -622,7 +651,7 @@ class UnderstatApi:
 
         index = ["league", "season", "game"]
         if len(stats) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         return (
             pd.DataFrame.from_records(list(stats.values()))
@@ -637,7 +666,7 @@ class UnderstatApi:
         df_team_match = self.read_team_match_stats(force_cache=force_cache)
         index = ["league", "season", "team"]
         if len(df_team_match) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         tm = df_team_match.reset_index()
 
@@ -846,7 +875,7 @@ class UnderstatApi:
 
         index = ["league", "season", "team", "player"]
         if len(stats) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         return (
             pd.DataFrame.from_records(stats)
@@ -928,7 +957,7 @@ class UnderstatApi:
 
         index = ["league", "season", "game", "team", "player"]
         if len(stats) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         return (
             pd.DataFrame.from_records(stats)
@@ -1015,7 +1044,7 @@ class UnderstatApi:
 
         index = ["league", "season", "game", "team", "player"]
         if len(shots) == 0:
-            return pd.DataFrame(index=index)
+            return _empty_indexed_frame(index)
 
         return (
             pd.DataFrame.from_records(shots)
@@ -1308,6 +1337,15 @@ def main() -> None:
     )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
+
+    try:
+        args.seasons = (
+            [normalize_understat_season(value) for value in args.seasons]
+            if args.seasons
+            else None
+        )
+    except ValueError as exc:
+        p.error(str(exc))
 
     if args.force_cache and not args.seasons:
         raise SystemExit("In --force-cache mode, pass --seasons to avoid network lookups.")

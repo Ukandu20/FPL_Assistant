@@ -1,6 +1,10 @@
 import pandas as pd
+import pytest
+import uuid
+from pathlib import Path
 
 from scripts.understat_pipeline.clean.clean_understat_raw import (
+    _season_sources,
     build_fpl_mode_maps,
     build_teams_config_maps,
     map_league_value,
@@ -8,8 +12,10 @@ from scripts.understat_pipeline.clean.clean_understat_raw import (
     normalize_player_key,
     process_player_match,
     process_player_season,
+    resolve_league_folders,
     season_long_to_short,
     season_to_long,
+    save_csv,
     transform_schedule,
 )
 
@@ -20,6 +26,86 @@ def test_league_and_season_mapping_helpers():
     assert season_to_long("2025") == "2025-2026"
     assert season_to_long("2025-26") == "2025-2026"
     assert season_long_to_short("2025-2026") == "2025-26"
+    assert resolve_league_folders(["EPL"]) == ["EPL"]
+    assert resolve_league_folders(["ENG-Premier League"]) == ["EPL"]
+
+
+def test_league_selector_rejects_unknown_league():
+    with pytest.raises(ValueError, match="Unsupported Understat league"):
+        resolve_league_folders(["Championship"])
+
+
+def _case_dir(name: str) -> Path:
+    return Path(".tmp") / f"{name}_{uuid.uuid4().hex}"
+
+
+def test_season_sources_prefers_populated_start_year_and_ignores_empty_alias():
+    league_dir = _case_dir("understat_sources") / "EPL"
+    canonical = league_dir / "2025"
+    duplicate = league_dir / "2025-2026"
+    canonical.mkdir(parents=True)
+    duplicate.mkdir()
+    pd.DataFrame([{"game_id": 1}]).to_csv(canonical / "schedule.csv", index=False)
+    pd.DataFrame(columns=["game_id"]).to_csv(duplicate / "schedule.csv", index=False)
+
+    resolved = _season_sources(league_dir)
+
+    assert resolved == [("2025-2026", canonical, [duplicate])]
+
+
+def test_season_sources_treats_legacy_named_index_rows_as_schema_only():
+    league_dir = _case_dir("understat_legacy_empty") / "EPL"
+    canonical = league_dir / "2025"
+    duplicate = league_dir / "2025-2026"
+    canonical.mkdir(parents=True)
+    duplicate.mkdir()
+    pd.DataFrame([{"game_id": 1}]).to_csv(canonical / "schedule.csv", index=False)
+    (duplicate / "schedule.csv").write_text(
+        '""\nleague\nseason\ngame\n',
+        encoding="utf-8",
+    )
+
+    resolved = _season_sources(league_dir)
+
+    assert resolved == [("2025-2026", canonical, [duplicate])]
+
+
+def test_season_sources_rejects_two_populated_equivalent_folders():
+    league_dir = _case_dir("understat_duplicate") / "EPL"
+    for name in ("2025", "2025-2026"):
+        path = league_dir / name
+        path.mkdir(parents=True)
+        pd.DataFrame([{"game_id": name}]).to_csv(path / "schedule.csv", index=False)
+
+    with pytest.raises(ValueError, match="Multiple populated Understat source folders"):
+        _season_sources(league_dir)
+
+
+def test_season_sources_filters_before_resolving_other_seasons():
+    league_dir = _case_dir("understat_season_filter") / "EPL"
+    selected = league_dir / "2025"
+    selected.mkdir(parents=True)
+    pd.DataFrame([{"game_id": 1}]).to_csv(selected / "schedule.csv", index=False)
+    for name in ("2024", "2024-2025"):
+        path = league_dir / name
+        path.mkdir()
+        pd.DataFrame([{"game_id": name}]).to_csv(path / "schedule.csv", index=False)
+
+    resolved = _season_sources(league_dir, ["2025-2026"])
+
+    assert resolved == [("2025-2026", selected, [])]
+
+
+def test_save_csv_refuses_to_replace_nonempty_output_with_empty_frame():
+    output = _case_dir("understat_save") / "schedule.csv"
+    output.parent.mkdir(parents=True)
+    original = pd.DataFrame([{"game_id": 1}])
+    original.to_csv(output, index=False)
+
+    written = save_csv(pd.DataFrame(columns=["game_id"]), output)
+
+    assert written is False
+    pd.testing.assert_frame_equal(pd.read_csv(output), original)
 
 
 def test_normalize_player_key_basic():
@@ -237,10 +323,12 @@ def test_player_id_cleaning_and_player_season_mode_with_name_fallback():
     assert "understat_player_id" in pm_clean.columns
     assert pm_clean.loc[pm_clean["player"] == "Alex Scott", "player_id"].eq("11111111").all()
     assert pm_clean.loc[pm_clean["player"] == "Mystery Name", "player_id_missing"].all()
+    assert pm_clean["is_starter"].eq(1).all()
+    assert pm_clean.loc[pm_clean["player"] == "Alex Scott", "position_group_match"].eq("MID").all()
 
     by_id, by_name = build_fpl_mode_maps(pm_clean)
     assert by_id[("ENG-Premier League", "2025-2026", "11111111")] == "MID"
-    assert by_name[("ENG-Premier League", "2025-2026", normalize_player_key("Mystery Name"))] == "FWD"
+    assert by_name[("ENG-Premier League", "2025-2026", normalize_player_key("Mystery Name"))] == "UNK"
 
     ps = pd.DataFrame(
         [
@@ -265,4 +353,35 @@ def test_player_id_cleaning_and_player_season_mode_with_name_fallback():
     mystery = ps_clean.loc[ps_clean["player"] == "Mystery Name"].iloc[0]
     assert alex["player_id"] == "11111111"
     assert alex["fpl_pos"] == "MID"
-    assert mystery["fpl_pos"] == "FWD"
+    assert mystery["fpl_pos"] == "UNK"
+
+
+def test_understat_official_fpl_position_is_authoritative_and_sub_marks_nonstarter():
+    frame = pd.DataFrame(
+        [{
+            "league": "EPL",
+            "season": 2025,
+            "player": "Alex Scott",
+            "player_id": 999,
+            "position": "Sub",
+            "minutes": 20,
+        }]
+    )
+    cleaned, _, mismatches = process_player_match(
+        frame,
+        league_std="ENG-Premier League",
+        season_long="2025-2026",
+        player_lookup={normalize_player_key("Alex Scott"): "11111111"},
+        ambiguous_lookup_keys=set(),
+        override_lookup={},
+        master_fpl={"11111111": {"career": {"2025-26": {"fpl_position": "MID"}}}},
+        teams_name_to_code={},
+        official_fpl_positions={"11111111": "FWD"},
+    )
+
+    assert cleaned.loc[0, "position"] == "Sub"
+    assert cleaned.loc[0, "position_group_match"] == "SUB"
+    assert cleaned.loc[0, "is_starter"] == 0
+    assert cleaned.loc[0, "fpl_pos"] == "FWD"
+    assert cleaned.loc[0, "fpl_position_source"] == "fpl.cleaned_players.fpl_pos"
+    assert len(mismatches) == 0
