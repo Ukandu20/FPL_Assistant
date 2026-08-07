@@ -159,7 +159,7 @@ def test_future_fixture_gets_start_elo_only_and_missing_history_is_audited():
     assert set(audit["reason"]) == {"missing_history"}
 
 
-def test_run_pipeline_writes_processed_clubelo_and_overwrites_understat():
+def test_run_pipeline_writes_processed_clubelo_without_mutating_understat_source():
     tmp_root = Path(".tmp") / f"clubelo_understat_{uuid.uuid4().hex}"
     raw_dir = tmp_root / "raw" / "clubelo" / "team_history"
     understat_dir = tmp_root / "processed" / "understat"
@@ -215,9 +215,20 @@ def test_run_pipeline_writes_processed_clubelo_and_overwrites_understat():
 
     assert summary["clubelo_processed_files_written"] == 1
     assert summary["understat_match_files_written"] == 1
+    assert summary["source_files_modified"] is False
     assert (out_root / "ENG-Premier League" / "2025-2026" / "team_history.csv").exists()
 
-    enriched = pd.read_csv(season_dir / "team_match.csv", dtype=str, keep_default_na=False)
+    source = pd.read_csv(season_dir / "team_match.csv", dtype=str, keep_default_na=False)
+    assert "team_start_elo" not in source.columns
+    enriched = pd.read_csv(
+        out_root
+        / "understat"
+        / "ENG-Premier League"
+        / "2025-2026"
+        / "team_match.csv",
+        dtype=str,
+        keep_default_na=False,
+    )
     assert enriched.loc[0, "team_start_elo"] == "1500"
     assert enriched.loc[0, "team_end_elo"] == "1510"
     assert enriched.loc[0, "opp_start_elo"] == "1600"

@@ -12,6 +12,7 @@ import pandas as pd
 
 DEFAULT_MANIFEST = Path("data/config/transfermarkt_premier_league_clubs.json")
 DEFAULT_CLUBELO_DIR = Path("data/raw/clubelo/team_history")
+DEFAULT_OUT_DIR = Path("data/processed/clubelo/enriched/team_history")
 DEFAULT_FBREF_DIR = Path("data/processed/fbref/ENG-Premier League")
 
 MATCH_COLS = [
@@ -192,13 +193,15 @@ def process_pair(
     clubelo_path: Path,
     schedule_df: pd.DataFrame,
     *,
+    output_path: Path,
     team_code: str,
     date_col: str,
     country_filter: str,
     level_filter: str,
     max_offset_days: int,
 ) -> tuple[int, int, int]:
-    clubelo_df = pd.read_csv(clubelo_path, dtype=str, keep_default_na=False)
+    source_path = output_path if output_path.is_file() else clubelo_path
+    clubelo_df = pd.read_csv(source_path, dtype=str, keep_default_na=False)
     enriched = add_fbref_match_columns(
         clubelo_df,
         schedule_df,
@@ -211,7 +214,10 @@ def process_pair(
     matched_rows = int((enriched["fbref_match_id"] != "").sum())
     total_rows = len(enriched)
     total_matches = len(schedule_df)
-    enriched.to_csv(clubelo_path, index=False)
+    if output_path.resolve() == clubelo_path.resolve():
+        raise ValueError("Refusing to overwrite raw ClubElo input in place.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_csv(output_path, index=False)
     return matched_rows, total_rows, total_matches
 
 
@@ -221,6 +227,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--clubelo-dir", type=Path, default=DEFAULT_CLUBELO_DIR)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--fbref-dir", type=Path, default=DEFAULT_FBREF_DIR)
     parser.add_argument("--date-col", default="from")
     parser.add_argument("--country-filter", default="ENG")
@@ -257,6 +264,7 @@ def main() -> int:
         matched_rows, row_count, fixture_count = process_pair(
             clubelo_path,
             schedule_df,
+            output_path=args.out_dir / clubelo_path.name,
             team_code=item.team_code,
             date_col=args.date_col,
             country_filter=args.country_filter,
@@ -268,8 +276,8 @@ def main() -> int:
         total_matched += matched_rows
         total_fixtures += fixture_count
         logging.info(
-            "Updated %s: tagged %s ClubElo rows from %s FBref fixtures",
-            clubelo_path.name,
+            "Wrote %s: tagged %s ClubElo rows from %s FBref fixtures",
+            args.out_dir / clubelo_path.name,
             matched_rows,
             fixture_count,
         )

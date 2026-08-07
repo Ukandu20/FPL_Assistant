@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import unescape
@@ -613,10 +614,13 @@ def enrich_understat_files(
     seasons: list[SeasonInfo],
     elo_lookup: Dict[tuple[str, str], pd.DataFrame],
     *,
-    overwrite: bool,
-) -> tuple[int, pd.DataFrame]:
+    enriched_root: Optional[Path],
+) -> tuple[int, pd.DataFrame, Dict[str, Dict[str, int]]]:
     files_written = 0
     audit_parts: list[pd.DataFrame] = []
+    coverage_counts: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"side_rows": 0, "missing_rows": 0}
+    )
     for info in seasons:
         for filename in MATCH_FILES:
             path = info.path / filename
@@ -628,14 +632,18 @@ def enrich_understat_files(
                 audit_parts.append(pd.DataFrame([{"source_path": str(path), "reason": f"read_failed:{exc}"}]))
                 continue
             enriched, audit = enrich_understat_match_df(df, elo_lookup, source_path=str(path))
+            coverage_counts[info.league]["side_rows"] += len(df) * 2
+            coverage_counts[info.league]["missing_rows"] += len(audit)
             if not audit.empty:
                 audit_parts.append(audit)
-            if overwrite:
-                enriched.to_csv(path, index=False)
+            if enriched_root is not None:
+                destination = enriched_root / info.league / info.season / filename
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                enriched.to_csv(destination, index=False)
                 files_written += 1
 
     audit_df = pd.concat(audit_parts, ignore_index=True) if audit_parts else pd.DataFrame()
-    return files_written, audit_df
+    return files_written, audit_df, dict(coverage_counts)
 
 
 def write_audits(out_root: Path, *, missing_mappings: pd.DataFrame, missing_elo: pd.DataFrame, summary: Dict[str, Any]) -> None:
@@ -654,9 +662,21 @@ def run_pipeline(
     teams_config_path: Path = DEFAULT_TEAMS_CONFIG,
     aliases_path: Path = DEFAULT_ALIASES,
     overwrite: bool = False,
+    enriched_understat_root: Optional[Path] = None,
+    min_coverage: float = 0.95,
+    allow_partial: bool = False,
     leagues: Optional[Iterable[str]] = None,
     seasons: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
+    if not 0 < min_coverage <= 1:
+        raise ValueError("min_coverage must be in (0, 1].")
+    if overwrite:
+        LOG.warning(
+            "--overwrite is deprecated; enriched Understat files are written to "
+            "the ClubElo output tree without modifying their source files."
+        )
+    if enriched_understat_root is None:
+        enriched_understat_root = out_root / "understat"
     resolver = load_team_resolver(teams_config_path, aliases_path)
     season_infos = discover_understat_seasons(understat_root, leagues=leagues, seasons=seasons)
     clubelo_leagues = sorted({info.clubelo_league for info in season_infos})
@@ -668,14 +688,36 @@ def run_pipeline(
     )
     processed_files = write_processed_clubelo_by_season(history, season_infos, out_root)
     elo_lookup = build_elo_lookup(history)
-    enriched_files, missing_elo = enrich_understat_files(season_infos, elo_lookup, overwrite=overwrite)
+    enriched_files, missing_elo, coverage_counts = enrich_understat_files(
+        season_infos,
+        elo_lookup,
+        enriched_root=enriched_understat_root,
+    )
+    league_coverage: Dict[str, Dict[str, Any]] = {}
+    failed_leagues: list[str] = []
+    for league, counts in sorted(coverage_counts.items()):
+        total = counts["side_rows"]
+        coverage = 1.0 - (counts["missing_rows"] / total) if total else 0.0
+        status = "complete" if coverage >= min_coverage else (
+            "unavailable" if coverage == 0 else "partial"
+        )
+        league_coverage[league] = {
+            **counts,
+            "coverage": coverage,
+            "status": status,
+        }
+        if coverage < min_coverage:
+            failed_leagues.append(league)
 
     summary = {
         "run_utc": datetime.now(timezone.utc).isoformat(),
         "raw_clubelo_dir": str(raw_clubelo_dir),
         "understat_root": str(understat_root),
         "out_root": str(out_root),
-        "overwrite": bool(overwrite),
+        "source_files_modified": False,
+        "enriched_understat_root": str(enriched_understat_root),
+        "min_coverage": min_coverage,
+        "league_coverage": league_coverage,
         "seasons_discovered": len(season_infos),
         "clubelo_rows_cleaned": int(len(history)),
         "clubelo_processed_files_written": int(processed_files),
@@ -684,6 +726,10 @@ def run_pipeline(
         "missing_understat_elo_rows": int(len(missing_elo)),
     }
     write_audits(out_root, missing_mappings=missing_mappings, missing_elo=missing_elo, summary=summary)
+    if failed_leagues and not allow_partial:
+        raise ValueError(
+            "ClubElo coverage below threshold for: " + ", ".join(failed_leagues)
+        )
     return summary
 
 
@@ -694,7 +740,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
     parser.add_argument("--teams-config", type=Path, default=DEFAULT_TEAMS_CONFIG)
     parser.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES)
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite processed Understat match CSVs in place.")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Deprecated; retained for compatibility and never modifies source files.",
+    )
+    parser.add_argument("--enriched-understat-root", type=Path, default=None)
+    parser.add_argument("--min-coverage", type=float, default=0.95)
+    parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--league", action="append", default=None, help="Optional processed league name filter. Can repeat.")
     parser.add_argument("--season", action="append", default=None, help="Optional season filter like 2025-2026. Can repeat.")
     parser.add_argument("--verbose", action="store_true")
@@ -711,6 +764,9 @@ def main() -> int:
         teams_config_path=args.teams_config,
         aliases_path=args.aliases,
         overwrite=args.overwrite,
+        enriched_understat_root=args.enriched_understat_root,
+        min_coverage=args.min_coverage,
+        allow_partial=args.allow_partial,
         leagues=args.league,
         seasons=args.season,
     )

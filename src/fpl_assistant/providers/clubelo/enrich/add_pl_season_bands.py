@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 DEFAULT_CLUBELO_DIR = Path("data/raw/clubelo/team_history")
+DEFAULT_OUT_DIR = Path("data/processed/clubelo/enriched/team_history")
 DEFAULT_SEASONS_CSV = Path("data/raw/pl_seasons.csv")
 
 
@@ -84,11 +85,13 @@ def process_clubelo_file(
     path: Path,
     seasons_df: pd.DataFrame,
     *,
+    output_path: Path,
     date_col: str,
     country_filter: str,
     level_filter: str,
 ) -> tuple[int, int]:
-    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    source_path = output_path if output_path.is_file() else path
+    df = pd.read_csv(source_path, dtype=str, keep_default_na=False)
     enriched = add_season_band_columns(
         df,
         seasons_df,
@@ -98,7 +101,10 @@ def process_clubelo_file(
     )
     banded_rows = int((enriched["season"] != "").sum())
     total_rows = len(enriched)
-    enriched.to_csv(path, index=False)
+    if output_path.resolve() == path.resolve():
+        raise ValueError("Refusing to overwrite raw ClubElo input in place.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_csv(output_path, index=False)
     return banded_rows, total_rows
 
 
@@ -107,6 +113,7 @@ def parse_args() -> argparse.Namespace:
         description="Add Premier League season-band columns to ClubElo team-history CSVs."
     )
     parser.add_argument("--clubelo-dir", type=Path, default=DEFAULT_CLUBELO_DIR)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--seasons-csv", type=Path, default=DEFAULT_SEASONS_CSV)
     parser.add_argument("--glob", default="*.csv")
     parser.add_argument("--date-col", default="from")
@@ -132,6 +139,7 @@ def main() -> int:
         banded_rows, row_count = process_clubelo_file(
             path,
             seasons_df,
+            output_path=args.out_dir / path.name,
             date_col=args.date_col,
             country_filter=args.country_filter,
             level_filter=args.level_filter,
@@ -139,7 +147,7 @@ def main() -> int:
         total_files += 1
         total_rows += row_count
         total_banded += banded_rows
-        logging.info("Updated %s: %s/%s rows banded", path.name, banded_rows, row_count)
+        logging.info("Wrote %s: %s/%s rows banded", args.out_dir / path.name, banded_rows, row_count)
 
     logging.info(
         "Finished season-band enrichment for %s files: %s/%s rows banded",

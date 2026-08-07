@@ -12,6 +12,7 @@ import pandas as pd
 
 DEFAULT_MANIFEST = Path("data/config/transfermarkt_premier_league_clubs.json")
 DEFAULT_CLUBELO_DIR = Path("data/raw/clubelo/team_history")
+DEFAULT_OUT_DIR = Path("data/processed/clubelo/enriched/team_history")
 DEFAULT_MANAGERS_DIR = Path("data/raw/transfermarkt/premier_league/managers")
 
 
@@ -92,13 +93,23 @@ def add_manager_columns(
     return out
 
 
-def process_pair(clubelo_path: Path, manager_path: Path, *, date_col: str) -> tuple[int, int]:
-    clubelo_df = pd.read_csv(clubelo_path, dtype=str, keep_default_na=False)
+def process_pair(
+    clubelo_path: Path,
+    manager_path: Path,
+    *,
+    output_path: Path,
+    date_col: str,
+) -> tuple[int, int]:
+    source_path = output_path if output_path.is_file() else clubelo_path
+    clubelo_df = pd.read_csv(source_path, dtype=str, keep_default_na=False)
     managers_df = load_managers(manager_path)
     enriched = add_manager_columns(clubelo_df, managers_df, date_col=date_col)
     filled_rows = int((enriched["manager"] != "").sum())
     total_rows = len(enriched)
-    enriched.to_csv(clubelo_path, index=False)
+    if output_path.resolve() == clubelo_path.resolve():
+        raise ValueError("Refusing to overwrite raw ClubElo input in place.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_csv(output_path, index=False)
     return filled_rows, total_rows
 
 
@@ -108,6 +119,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--clubelo-dir", type=Path, default=DEFAULT_CLUBELO_DIR)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--managers-dir", type=Path, default=DEFAULT_MANAGERS_DIR)
     parser.add_argument("--date-col", default="from")
     parser.add_argument("--team-code", default="", help="Optional single team code filter, e.g. MUN")
@@ -135,11 +147,17 @@ def main() -> int:
         if not clubelo_path.exists():
             logging.info("Skipping %s: ClubElo file missing at %s", item.team_code, clubelo_path)
             continue
-        filled_rows, total = process_pair(clubelo_path, manager_path, date_col=args.date_col)
+        output_path = args.out_dir / clubelo_path.name
+        filled_rows, total = process_pair(
+            clubelo_path,
+            manager_path,
+            output_path=output_path,
+            date_col=args.date_col,
+        )
         total_files += 1
         total_rows += total
         total_filled += filled_rows
-        logging.info("Updated %s: %s/%s rows assigned a manager", clubelo_path.name, filled_rows, total)
+        logging.info("Wrote %s: %s/%s rows assigned a manager", output_path, filled_rows, total)
 
     logging.info(
         "Finished manager enrichment for %s files: %s/%s rows assigned a manager",
