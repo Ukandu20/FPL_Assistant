@@ -140,4 +140,5 @@ cython_debug/
 # documentation
 docs/*
 !docs/FBREF_PIPELINE.md
+!docs/FPL_PIPELINE.md
 archived_files/

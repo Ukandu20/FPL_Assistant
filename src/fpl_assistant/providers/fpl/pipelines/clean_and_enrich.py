@@ -13,6 +13,7 @@ import pandas as pd
 from unidecode import unidecode
 
 from fpl_assistant.canonical.identity import stable_canonical_id
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
 # Prefer rapidfuzz; fallback to fuzzywuzzy
 try:
@@ -38,6 +39,45 @@ FPL_POS_ALIASES = {
     "4": "FWD", "FW": "FWD", "FWD": "FWD",
 }
 FPL_TO_FBREF_POS = {"GKP": "GK", "DEF": "DF", "MID": "MF", "FWD": "FW"}
+SEASON_CUMULATIVE_COLUMNS = {
+    "assists", "bonus", "bps", "clean_sheets", "creativity",
+    "expected_assists", "expected_goal_involvements", "expected_goals",
+    "expected_goals_conceded", "goals_conceded", "goals_scored",
+    "ict_index", "influence", "minutes", "own_goals", "penalties_missed",
+    "penalties_saved", "red_cards", "saves", "starts", "threat",
+    "total_points", "yellow_cards",
+}
+PLAYER_SEASON_STAT_COLUMNS = [
+    "blocks",
+    "interceptions",
+    "clearances",
+    "tackles_won",
+    "recoveries",
+    "defcon",
+    "xg",
+    "xa",
+]
+PLAYER_SEASON_PROVENANCE_COLUMNS = [
+    "defensive_stats_source",
+    "expected_stats_source",
+    "stats_coverage_status",
+]
+GOALKEEPER_SEASON_STAT_COLUMNS = [
+    "shots_on_target_against",
+    "saves",
+    "goals_against",
+    "save_pct",
+    "penalties_faced",
+    "penalties_allowed",
+    "penalties_saved",
+    "penalties_missed",
+    "penalty_save_pct",
+]
+GOALKEEPER_PROVENANCE_COLUMNS = [
+    "goalkeeper_stats_source",
+    "goalkeeper_stats_coverage",
+]
+MODERN_PLAYER_STATS_START_SEASON = 2025
 
 def canonical(s: str) -> str:
     """Lowercase, accent-fold, treat separators as spaces, strip punctuation, squeeze."""
@@ -200,6 +240,559 @@ def attach_fpl_context(df: pd.DataFrame, season_dir: Path) -> pd.DataFrame:
         validate="many_to_one",
     )
     return result.drop(columns=["_fpl_join_key"])
+
+
+def reset_preseason_carryover(
+    df: pd.DataFrame, season_dir: Path
+) -> tuple[pd.DataFrame, list[str]]:
+    """Reset prior-season totals when every target-season fixture is unstarted."""
+    fixtures_path = season_dir / "season" / "fixtures.csv"
+    if not fixtures_path.is_file():
+        return df, []
+
+    fixtures = read_csv_flex(fixtures_path)
+    state_columns = [
+        column
+        for column in ("started", "finished", "finished_provisional")
+        if column in fixtures.columns
+    ]
+    if fixtures.empty or not state_columns:
+        return df, []
+
+    has_started = any(
+        fixtures[column].astype("string").str.lower().eq("true").any()
+        for column in state_columns
+    )
+    if has_started:
+        return df, []
+
+    candidates = sorted(SEASON_CUMULATIVE_COLUMNS.intersection(df.columns))
+    carried = [
+        column
+        for column in candidates
+        if pd.to_numeric(df[column], errors="coerce").fillna(0).ne(0).any()
+    ]
+    if not carried:
+        return df, []
+
+    result = df.copy()
+    result.loc[:, candidates] = 0
+    result["season_data_status"] = "preseason_roster"
+    result["performance_data_status"] = "prior_season_carryover_reset"
+    return result, carried
+
+
+def _provider_league_root(root: Optional[Path], league: str) -> Optional[Path]:
+    if root is None:
+        return None
+    path = Path(root)
+    return path if path.name == league else path / league
+
+
+def _normalise_join_value(value) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _source_lookup(
+    source: pd.DataFrame,
+    key_columns: list[str],
+    metric_mapping: Dict[str, str],
+    source_name: str,
+) -> tuple[Dict[tuple, dict], list[dict]]:
+    """Build a unique provider lookup without allowing row multiplication."""
+    required = {*key_columns, *metric_mapping}
+    missing = sorted(required - set(source.columns))
+    if missing:
+        raise ValueError(f"{source_name} is missing required columns: {missing}")
+
+    prepared = source[[*key_columns, *metric_mapping]].copy()
+    for column in key_columns:
+        prepared[column] = prepared[column].map(_normalise_join_value)
+        if column == "team":
+            prepared[column] = prepared[column].str.upper()
+
+    duplicate_mask = prepared.duplicated(key_columns, keep=False)
+    duplicate_keys = (
+        prepared.loc[duplicate_mask, key_columns]
+        .drop_duplicates()
+        .to_dict("records")
+    )
+    if duplicate_keys:
+        raise ValueError(
+            f"{source_name} has duplicate join keys; refusing a row-multiplying "
+            f"join: {duplicate_keys[:10]}"
+        )
+
+    lookup: Dict[tuple, dict] = {}
+    for record in prepared.to_dict("records"):
+        key = tuple(record[column] for column in key_columns)
+        if any(value is None for value in key):
+            continue
+        lookup[key] = {
+            output: pd.to_numeric(record[source_column], errors="coerce")
+            for source_column, output in metric_mapping.items()
+        }
+    return lookup, duplicate_keys
+
+
+def _aggregate_modern_goalkeepers(
+    path: Path,
+) -> tuple[pd.DataFrame, int, list[str]]:
+    """Aggregate valid WhoScored keeper appearances from player-match rows."""
+    matches = read_csv_flex(path)
+    required = {
+        "player_id",
+        "fpl_pos",
+        "minutes",
+        "shots_on_target_against",
+        "goals_against",
+        "saves",
+        "penalties_faced",
+    }
+    missing = sorted(required - set(matches.columns))
+    if missing:
+        raise ValueError(
+            "whoscored.player_match.keepers is missing required columns: "
+            f"{missing}"
+        )
+
+    minutes = pd.to_numeric(matches["minutes"], errors="coerce")
+    keepers = matches.loc[
+        matches["fpl_pos"].astype("string").eq("GKP") & minutes.gt(0)
+    ].copy()
+    keepers["minutes"] = minutes.loc[keepers.index]
+    match_key = next(
+        (
+            columns
+            for columns in (
+                ["provider_match_id", "team_id"],
+                ["match_id", "team_id"],
+                ["game", "team"],
+            )
+            if set(columns).issubset(keepers.columns)
+        ),
+        None,
+    )
+    shared_appearance_rows = 0
+    shared_player_ids: list[str] = []
+    if match_key:
+        shared = keepers.groupby(match_key, dropna=False)["player_id"].transform("nunique")
+        shared_appearance_rows = int(shared.gt(1).sum())
+        shared_player_ids = sorted(
+            keepers.loc[shared.gt(1), "player_id"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+    additive = [
+        "shots_on_target_against",
+        "goals_against",
+        "saves",
+        "penalties_faced",
+    ]
+    for column in additive:
+        keepers[column] = pd.to_numeric(keepers[column], errors="coerce")
+    aggregated = (
+        keepers.groupby("player_id", as_index=False, dropna=False)[additive]
+        .sum(min_count=1)
+    )
+    aggregated["save_pct"] = (
+        100
+        * aggregated["saves"]
+        / aggregated["shots_on_target_against"].where(
+            aggregated["shots_on_target_against"].gt(0)
+        )
+    )
+    return aggregated, shared_appearance_rows, shared_player_ids
+
+
+def enrich_player_season_stats(
+    players: pd.DataFrame,
+    season: str,
+    league: str = DEFAULT_FPL_LEAGUE,
+    fbref_root: Optional[Path] = None,
+    whoscored_root: Optional[Path] = None,
+    understat_root: Optional[Path] = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Attach position-aware CBIT/DEFCON ingredients and xG/xA."""
+    result = players.copy()
+    row_count_before = len(result)
+    season_full = season_longform(season)
+    start_year = int(season_full.split("-", 1)[0])
+
+    for column in PLAYER_SEASON_STAT_COLUMNS:
+        result[column] = pd.Series(pd.NA, index=result.index, dtype="Float64")
+    for column in PLAYER_SEASON_PROVENANCE_COLUMNS:
+        result[column] = pd.Series(pd.NA, index=result.index, dtype="string")
+    for column in GOALKEEPER_SEASON_STAT_COLUMNS:
+        result[column] = pd.Series(pd.NA, index=result.index, dtype="Float64")
+    for column in GOALKEEPER_PROVENANCE_COLUMNS:
+        result[column] = pd.Series(pd.NA, index=result.index, dtype="string")
+
+    fbref_league = _provider_league_root(fbref_root, league)
+    whoscored_league = _provider_league_root(whoscored_root, league)
+    understat_league = _provider_league_root(understat_root, league)
+
+    if start_year >= MODERN_PLAYER_STATS_START_SEASON:
+        defense_path = (
+            whoscored_league / season_full / "player_season" / "defense.csv"
+            if whoscored_league is not None
+            else None
+        )
+        expected_path = (
+            understat_league / season_full / "player_season.csv"
+            if understat_league is not None
+            else None
+        )
+        defense_keys = ["player_id"]
+        defense_mapping = {
+            "blocks": "blocks",
+            "interceptions": "interceptions",
+            "clearances": "clearances",
+            "tackles_won": "tackles_won",
+            "recoveries": "recoveries",
+        }
+        recoveries_path = None
+        expected_keys = ["player_id"]
+        expected_mapping = {"xg": "xg", "xa": "xa"}
+        goalkeeper_path = (
+            whoscored_league / season_full / "player_match" / "keepers.csv"
+            if whoscored_league is not None
+            else None
+        )
+        goalkeeper_keys = ["player_id"]
+        goalkeeper_mapping = {
+            "shots_on_target_against": "shots_on_target_against",
+            "saves": "saves",
+            "goals_against": "goals_against",
+            "save_pct": "save_pct",
+            "penalties_faced": "penalties_faced",
+        }
+        defense_source = "whoscored.player_season.defense"
+        expected_source = "understat.player_season"
+        goalkeeper_source = "whoscored.player_match.keepers.filtered_appearances"
+    else:
+        defense_path = (
+            fbref_league / season_full / "player_season" / "defense.csv"
+            if fbref_league is not None
+            else None
+        )
+        expected_path = (
+            fbref_league / season_full / "player_season" / "standard.csv"
+            if fbref_league is not None
+            else None
+        )
+        defense_keys = ["player_id", "team"]
+        defense_mapping = {
+            "blocks": "blocks",
+            "int": "interceptions",
+            "clr": "clearances",
+            "tklw": "tackles_won",
+        }
+        recoveries_path = (
+            fbref_league / season_full / "player_season" / "misc.csv"
+            if fbref_league is not None
+            else None
+        )
+        expected_keys = ["player_id", "team"]
+        expected_mapping = {"xg": "xg", "xag": "xa"}
+        goalkeeper_path = (
+            fbref_league / season_full / "player_season" / "keeper.csv"
+            if fbref_league is not None
+            else None
+        )
+        goalkeeper_keys = ["player_id", "team"]
+        goalkeeper_mapping = {
+            "sota": "shots_on_target_against",
+            "saves": "saves",
+            "ga": "goals_against",
+            "save": "save_pct",
+            "pkatt": "penalties_faced",
+            "pka": "penalties_allowed",
+            "pksv": "penalties_saved",
+            "pkm": "penalties_missed",
+            "save_save": "penalty_save_pct",
+        }
+        defense_source = "fbref.player_season.defense"
+        expected_source = "fbref.player_season.standard"
+        goalkeeper_source = "fbref.player_season.keeper"
+
+    source_paths = {
+        "defensive": str(defense_path) if defense_path is not None else None,
+        "expected": str(expected_path) if expected_path is not None else None,
+        "goalkeeper": str(goalkeeper_path) if goalkeeper_path is not None else None,
+    }
+    source_available = {
+        "defensive": bool(defense_path and defense_path.is_file()),
+        "expected": bool(expected_path and expected_path.is_file()),
+        "goalkeeper": bool(goalkeeper_path and goalkeeper_path.is_file()),
+    }
+
+    def _player_keys(columns: list[str]) -> list[tuple]:
+        keys = []
+        for record in result.to_dict("records"):
+            values = []
+            for column in columns:
+                value = _normalise_join_value(record.get(column))
+                if column == "team" and value is not None:
+                    value = value.upper()
+                values.append(value)
+            keys.append(tuple(values))
+        return keys
+
+    matched = {"defensive": 0, "expected": 0, "goalkeeper": 0}
+    shared_goalkeeper_appearance_rows = 0
+    shared_goalkeeper_player_ids: list[str] = []
+    if source_available["defensive"]:
+        defense = read_csv_flex(defense_path)
+        lookup, _ = _source_lookup(
+            defense, defense_keys, defense_mapping, defense_source
+        )
+        records = [lookup.get(key) for key in _player_keys(defense_keys)]
+        matched["defensive"] = sum(record is not None for record in records)
+        for index, record in zip(result.index, records):
+            if record is None:
+                continue
+            for column, value in record.items():
+                result.at[index, column] = value
+            result.at[index, "defensive_stats_source"] = defense_source
+
+        if recoveries_path is not None and recoveries_path.is_file():
+            recoveries = read_csv_flex(recoveries_path)
+            recoveries_lookup, _ = _source_lookup(
+                recoveries,
+                defense_keys,
+                {"recov": "recoveries"},
+                "fbref.player_season.misc",
+            )
+            recovery_records = [
+                recoveries_lookup.get(key) for key in _player_keys(defense_keys)
+            ]
+            for index, record in zip(result.index, recovery_records):
+                if record is not None:
+                    result.at[index, "recoveries"] = record["recoveries"]
+
+    if source_available["expected"]:
+        expected = read_csv_flex(expected_path)
+        lookup, _ = _source_lookup(
+            expected, expected_keys, expected_mapping, expected_source
+        )
+        records = [lookup.get(key) for key in _player_keys(expected_keys)]
+        matched["expected"] = sum(record is not None for record in records)
+        for index, record in zip(result.index, records):
+            if record is None:
+                continue
+            for column, value in record.items():
+                result.at[index, column] = value
+            result.at[index, "expected_stats_source"] = expected_source
+
+    if source_available["goalkeeper"]:
+        if start_year >= MODERN_PLAYER_STATS_START_SEASON:
+            (
+                goalkeeper,
+                shared_goalkeeper_appearance_rows,
+                shared_goalkeeper_player_ids,
+            ) = (
+                _aggregate_modern_goalkeepers(goalkeeper_path)
+            )
+        else:
+            goalkeeper = read_csv_flex(goalkeeper_path)
+        lookup, _ = _source_lookup(
+            goalkeeper,
+            goalkeeper_keys,
+            goalkeeper_mapping,
+            goalkeeper_source,
+        )
+        records = [lookup.get(key) for key in _player_keys(goalkeeper_keys)]
+        matched["goalkeeper"] = sum(record is not None for record in records)
+        for index, record in zip(result.index, records):
+            if record is None:
+                continue
+            for column, value in record.items():
+                result.at[index, column] = value
+            result.at[index, "goalkeeper_stats_source"] = goalkeeper_source
+
+    minutes = pd.to_numeric(
+        result.get("minutes", pd.Series(index=result.index, dtype="float64")),
+        errors="coerce",
+    )
+    zero_minutes = minutes.eq(0)
+    base_defcon_columns = [
+        "clearances",
+        "blocks",
+        "interceptions",
+        "tackles_won",
+    ]
+    defensive_columns = [*base_defcon_columns, "recoveries"]
+    expected_columns = ["xg", "xa"]
+    goalkeeper_core_columns = [
+        "shots_on_target_against",
+        "saves",
+        "goals_against",
+        "save_pct",
+        "penalties_faced",
+    ]
+    normalized_positions = result.get(
+        "fpl_pos", pd.Series(index=result.index, dtype="string")
+    ).map(normalise_fpl_position).astype("string")
+    goalkeeper_mask = normalized_positions.eq("GKP").fillna(False) | result[
+        "goalkeeper_stats_source"
+    ].notna()
+    known_position = normalized_positions.notna()
+
+    if source_available["defensive"]:
+        defensive_zero_fill = zero_minutes & result[defensive_columns].isna().all(axis=1)
+        result.loc[defensive_zero_fill, defensive_columns] = 0.0
+        result.loc[defensive_zero_fill, "defensive_stats_source"] = (
+            "derived.zero_minutes"
+        )
+    if source_available["expected"]:
+        expected_zero_fill = zero_minutes & result[expected_columns].isna().all(axis=1)
+        result.loc[expected_zero_fill, expected_columns] = 0.0
+        result.loc[expected_zero_fill, "expected_stats_source"] = (
+            "derived.zero_minutes"
+        )
+    if source_available["goalkeeper"]:
+        goalkeeper_zero_fill = (
+            goalkeeper_mask
+            & zero_minutes
+            & result[goalkeeper_core_columns].isna().all(axis=1)
+        )
+        goalkeeper_count_columns = [
+            column
+            for column in GOALKEEPER_SEASON_STAT_COLUMNS
+            if column not in {"save_pct", "penalty_save_pct"}
+        ]
+        result.loc[goalkeeper_zero_fill, goalkeeper_count_columns] = 0.0
+        result.loc[goalkeeper_zero_fill, "goalkeeper_stats_source"] = (
+            "derived.zero_minutes"
+        )
+
+    base_defcon = result[base_defcon_columns].sum(axis=1, min_count=4)
+    midfield_forward = normalized_positions.isin(["MID", "FWD"])
+    result["defcon"] = base_defcon
+    result.loc[midfield_forward, "defcon"] = (
+        base_defcon + result["recoveries"]
+    )
+    defense_complete = result[base_defcon_columns].notna().all(axis=1) & (
+        ~midfield_forward | result["recoveries"].notna()
+    )
+    expected_complete = result[expected_columns].notna().all(axis=1)
+    any_metric = result[PLAYER_SEASON_STAT_COLUMNS].notna().any(axis=1)
+    both_sources_missing = not (
+        source_available["defensive"] or source_available["expected"]
+    )
+
+    result.loc[defense_complete & expected_complete, "stats_coverage_status"] = (
+        "complete"
+    )
+    result.loc[
+        ~(defense_complete & expected_complete) & any_metric,
+        "stats_coverage_status",
+    ] = "partial"
+    if both_sources_missing:
+        result.loc[:, "stats_coverage_status"] = "provider_data_unavailable"
+    else:
+        unresolved = result["stats_coverage_status"].isna()
+        result.loc[unresolved & minutes.gt(0), "stats_coverage_status"] = (
+            "unmatched_active"
+        )
+        result.loc[
+            result["stats_coverage_status"].isna(), "stats_coverage_status"
+        ] = "unavailable"
+
+    goalkeeper_complete = result[goalkeeper_core_columns].notna().all(axis=1)
+    goalkeeper_any = result[GOALKEEPER_SEASON_STAT_COLUMNS].notna().any(axis=1)
+    result.loc[
+        ~goalkeeper_mask & known_position, "goalkeeper_stats_coverage"
+    ] = "not_applicable"
+    result.loc[
+        ~goalkeeper_mask & ~known_position, "goalkeeper_stats_coverage"
+    ] = "unknown_position"
+    result.loc[
+        goalkeeper_mask & zero_minutes & source_available["goalkeeper"],
+        "goalkeeper_stats_coverage",
+    ] = "zero_minutes"
+    result.loc[
+        goalkeeper_mask & ~zero_minutes & goalkeeper_complete,
+        "goalkeeper_stats_coverage",
+    ] = "complete"
+    shared_goalkeeper_mask = result.get(
+        "player_id", pd.Series(index=result.index, dtype="string")
+    ).astype("string").isin(shared_goalkeeper_player_ids)
+    result.loc[
+        goalkeeper_mask & shared_goalkeeper_mask & ~zero_minutes,
+        "goalkeeper_stats_coverage",
+    ] = "shared_match_warning"
+    result.loc[
+        goalkeeper_mask & ~zero_minutes & ~goalkeeper_complete & goalkeeper_any,
+        "goalkeeper_stats_coverage",
+    ] = "partial"
+    if not source_available["goalkeeper"]:
+        result.loc[goalkeeper_mask, "goalkeeper_stats_coverage"] = (
+            "provider_data_unavailable"
+        )
+    else:
+        result.loc[
+            goalkeeper_mask
+            & result["goalkeeper_stats_coverage"].isna()
+            & minutes.gt(0),
+            "goalkeeper_stats_coverage",
+        ] = "unmatched_active"
+        result.loc[
+            goalkeeper_mask & result["goalkeeper_stats_coverage"].isna(),
+            "goalkeeper_stats_coverage",
+        ] = "unavailable"
+
+    incomplete_active = minutes.gt(0) & ~(
+        defense_complete & expected_complete
+    )
+    audit_columns = [
+        column
+        for column in ("player_id", "name", "team", "minutes")
+        if column in result.columns
+    ]
+    audit = {
+        "season": season_full,
+        "league": league,
+        "row_count_before": row_count_before,
+        "row_count_after": len(result),
+        "row_count_preserved": len(result) == row_count_before,
+        "source_paths": source_paths,
+        "source_available": source_available,
+        "matched_rows": matched,
+        "shared_goalkeeper_appearance_rows": shared_goalkeeper_appearance_rows,
+        "shared_goalkeeper_player_ids": shared_goalkeeper_player_ids,
+        "coverage_status_counts": {
+            str(status): int(count)
+            for status, count in result["stats_coverage_status"]
+            .value_counts(dropna=False)
+            .items()
+        },
+        "incomplete_active_count": int(incomplete_active.sum()),
+        "incomplete_active_players": json.loads(
+            result.loc[incomplete_active, audit_columns].to_json(
+                orient="records"
+            )
+        ),
+        "goalkeeper_coverage_counts": {
+            str(status): int(count)
+            for status, count in result["goalkeeper_stats_coverage"]
+            .value_counts(dropna=False)
+            .items()
+        },
+    }
+    if len(result) != row_count_before:
+        raise RuntimeError(
+            f"[{season_full}] player-season enrichment changed row count from "
+            f"{row_count_before} to {len(result)}"
+        )
+    return result, audit
 
 # ───────────────────────── Season selection helpers ─────────────────────────
 
@@ -387,7 +980,11 @@ def enrich_season(season_dir: Path,
                   team_ids: Dict[str, str],
                   generate_missing_ids: bool,
                   threshold: int,
-                  fail_if_unmatched_pct: float) -> None:
+                  fail_if_unmatched_pct: float,
+                  league: str = DEFAULT_FPL_LEAGUE,
+                  fbref_root: Optional[Path] = None,
+                  whoscored_root: Optional[Path] = None,
+                  understat_root: Optional[Path] = None) -> None:
     season = season_dir.name
     season_full = season_longform(season)
 
@@ -402,6 +999,13 @@ def enrich_season(season_dir: Path,
         return
 
     df = attach_fpl_context(df, season_dir)
+    df, reset_columns = reset_preseason_carryover(df, season_dir)
+    if reset_columns:
+        logging.warning(
+            "[%s] all fixtures are unstarted; reset carried season totals: %s",
+            season,
+            ", ".join(reset_columns),
+        )
 
     # Normalise "name"
     if "name" not in df.columns:
@@ -552,6 +1156,15 @@ def enrich_season(season_dir: Path,
     # Names should be FBref canonical names where matched
     df["name"] = pd.Series(master_names, dtype="string").fillna(df["name"].astype("string"))
 
+    df, player_stats_audit = enrich_player_season_stats(
+        df,
+        season=season_full,
+        league=league,
+        fbref_root=fbref_root,
+        whoscored_root=whoscored_root,
+        understat_root=understat_root,
+    )
+
     # Review partitions
     unmatched_ids = df[df["player_id"].isna()].copy()
     # "no season entry" = player_id matched but FBref has no career record for this season
@@ -562,6 +1175,24 @@ def enrich_season(season_dir: Path,
     out_csv = out_root / season / "season" / "cleaned_players.csv"
     write_csv_utf8(out_csv, df)
     logging.info("[%s] wrote enriched players: %s (rows=%d)", season, out_csv, len(df))
+
+    review_dir = out_root / season / "_manual_review"
+    write_json_utf8(
+        review_dir / f"player_season_stat_enrichment_{season_full}.json",
+        player_stats_audit,
+    )
+
+    if reset_columns:
+        review_dir = out_root / season / "_manual_review"
+        write_json_utf8(
+            review_dir / f"preseason_carryover_reset_{season}.json",
+            {
+                "season": season,
+                "status": "preseason_roster",
+                "reason": "all fixtures unstarted and cumulative values were non-zero",
+                "reset_columns": reset_columns,
+            },
+        )
 
     # Write unmatched IDs (CSV)
     if len(unmatched_ids):
@@ -612,18 +1243,64 @@ def enrich_season(season_dir: Path,
     if pct_unmatched > fail_if_unmatched_pct:
         raise SystemExit(f"[{season}] Unmatched {pct_unmatched:.2f}% > {fail_if_unmatched_pct:.2f}% threshold")
 
+
+def backfill_published_season_stats(
+    season_dir: Path,
+    league: str = DEFAULT_FPL_LEAGUE,
+    fbref_root: Optional[Path] = None,
+    whoscored_root: Optional[Path] = None,
+    understat_root: Optional[Path] = None,
+) -> dict:
+    """Enrich an already-published roster in place while preserving its rows."""
+    season = season_dir.name
+    roster_path = season_dir / "season" / "cleaned_players.csv"
+    if not roster_path.is_file():
+        raise FileNotFoundError(f"Missing published roster: {roster_path}")
+
+    players = read_csv_flex(roster_path)
+    enriched, audit = enrich_player_season_stats(
+        players,
+        season=season,
+        league=league,
+        fbref_root=fbref_root,
+        whoscored_root=whoscored_root,
+        understat_root=understat_root,
+    )
+    write_csv_utf8(roster_path, enriched)
+    write_json_utf8(
+        season_dir / "_manual_review" / f"player_season_stat_enrichment_{season}.json",
+        audit,
+    )
+    logging.info(
+        "[%s] backfilled player-season stats: %s (rows=%d)",
+        season,
+        roster_path,
+        len(enriched),
+    )
+    return audit
+
 # ───────────────────────── CLI ─────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Enrich FPL season players with FBref metadata (names are FBref canonical)."
     )
-    ap.add_argument("--raw-root", type=Path, required=True,
-                    help="Processed FPL root with <season>/season/cleaned_players.csv")
+    ap.add_argument("--raw-root", type=Path, default=None,
+                    help="Raw FPL provider root or already league-scoped root")
     ap.add_argument("--proc-root", type=Path, required=True,
-                    help="Output root (usually same as --raw-root)")
-    ap.add_argument("--fbref-master", type=Path, required=True,
+                    help="Processed FPL provider root or already league-scoped root")
+    ap.add_argument("--league", default=DEFAULT_FPL_LEAGUE,
+                    help="League folder beneath the provider roots")
+    ap.add_argument("--fbref-master", type=Path, default=None,
                     help="FBref master players JSON (source of truth)")
+    ap.add_argument("--fbref-root", type=Path, default=Path("data/processed/fbref"),
+                    help="Processed FBref provider root")
+    ap.add_argument("--whoscored-root", type=Path,
+                    default=Path("data/processed/whoscored"),
+                    help="Processed WhoScored provider root")
+    ap.add_argument("--understat-root", type=Path,
+                    default=Path("data/processed/understat"),
+                    help="Processed Understat provider root")
     ap.add_argument("--overrides", type=Path, default=None,
                     help="Manual overrides JSON (e.g., 'first | last': 'pid')")
     ap.add_argument("--team-map", type=Path, default=None,
@@ -636,8 +1313,14 @@ def main() -> None:
                     help="Fail run if unmatched percentage exceeds this value")
     ap.add_argument("--season", type=str, default="all",
                     help="Which season to process: 'all' (default), 'latest', or a specific season like '2025-26'/'2025-2026'")
+    ap.add_argument("--stats-only", action="store_true",
+                    help="Backfill player-season stats into already-published rosters")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
+
+    args.proc_root = league_scoped_root(args.proc_root, args.league)
+    if args.raw_root is not None:
+        args.raw_root = league_scoped_root(args.raw_root, args.league)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -645,20 +1328,17 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    pid2rec, key2pid = load_fbref_master(args.fbref_master)
-    overrides = load_overrides(args.overrides)
-    team_ids = load_team_id_lookup(args.team_map)
+    discovery_root = args.proc_root if args.stats_only else args.raw_root
+    if discovery_root is None or not discovery_root.exists():
+        option = "--proc-root" if args.stats_only else "--raw-root"
+        raise SystemExit(f"{option} does not exist: {discovery_root}")
 
-    # Discover available season directories under --raw-root
-    if not args.raw_root.exists():
-        raise SystemExit(f"--raw-root does not exist: {args.raw_root}")
-
-    all_dirs = [d for d in args.raw_root.iterdir() if d.is_dir()]
+    all_dirs = [d for d in discovery_root.iterdir() if d.is_dir()]
     season_dirs = [d for d in all_dirs if _looks_like_season(d.name)]
     season_dirs = sorted(season_dirs, key=_season_sort_key)
 
     if not season_dirs:
-        logging.warning("No season-like folders under %s", args.raw_root)
+        logging.warning("No season-like folders under %s", discovery_root)
         return
 
     sel = (args.season or "all").strip().lower()
@@ -670,12 +1350,30 @@ def main() -> None:
         match = _match_season_dir(season_dirs, args.season.strip())
         if not match:
             raise SystemExit(
-                f"Requested season {args.season!r} not found under {args.raw_root}. "
+                f"Requested season {args.season!r} not found under {discovery_root}. "
                 f"Available: {[d.name for d in season_dirs]}"
             )
         seasons = [match]
 
     logging.info("Processing season folder(s): %s", [d.name for d in seasons])
+
+    if args.stats_only:
+        for season_dir in seasons:
+            backfill_published_season_stats(
+                season_dir=season_dir,
+                league=args.league,
+                fbref_root=args.fbref_root,
+                whoscored_root=args.whoscored_root,
+                understat_root=args.understat_root,
+            )
+        return
+
+    if args.fbref_master is None or not args.fbref_master.is_file():
+        raise SystemExit("--fbref-master is required for full enrichment")
+
+    pid2rec, key2pid = load_fbref_master(args.fbref_master)
+    overrides = load_overrides(args.overrides)
+    team_ids = load_team_id_lookup(args.team_map)
 
     for season_dir in seasons:
         logging.info("Season %s …", season_dir.name)
@@ -688,7 +1386,11 @@ def main() -> None:
             team_ids=team_ids,
             generate_missing_ids=args.generate_missing_ids,
             threshold=args.threshold,
-            fail_if_unmatched_pct=args.fail_if_unmatched
+            fail_if_unmatched_pct=args.fail_if_unmatched,
+            league=args.league,
+            fbref_root=args.fbref_root,
+            whoscored_root=args.whoscored_root,
+            understat_root=args.understat_root,
         )
 
 if __name__ == "__main__":

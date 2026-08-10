@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple, NamedTuple
 import numpy as np
 import pandas as pd
 from unidecode import unidecode
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
 # ---------- regex & constants ----------
 SEASON_KEY_RE = re.compile(r"^(\d{4})(?:[-–_](\d{2}|\d{4}))?$")
@@ -652,8 +653,11 @@ def build_suggestions_from_unmatched(unmatched_rows: List[dict],
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw-root",   required=True, type=Path, help="data/raw/fpl")
-    ap.add_argument("--proc-root",  required=True, type=Path, help="data/processed/fpl")
+    ap.add_argument("--raw-root", required=True, type=Path,
+                    help="Raw FPL provider root or league root")
+    ap.add_argument("--proc-root", required=True, type=Path,
+                    help="Processed FPL provider root or league root")
+    ap.add_argument("--league", default=DEFAULT_FPL_LEAGUE)
     ap.add_argument("--master",     required=True, type=Path, help="data/processed/registry/master_players.json")
     ap.add_argument("--overrides",  type=Path, help="data/processed/registry/overrides.json")
     ap.add_argument("--team-map",   required=True, type=Path, help="data/processed/registry/_id_lookup_teams.json")  # code->hex (lowercase keys ok)
@@ -668,6 +672,9 @@ def main():
     ap.add_argument("--force", action="store_true", help="Skip seasons with missing gws/ or teams.csv instead of aborting")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+
+    args.raw_root = league_scoped_root(args.raw_root, args.league)
+    args.proc_root = league_scoped_root(args.proc_root, args.league)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -699,7 +706,7 @@ def main():
                 logging.warning("%s — skipping", msg); continue
             logging.error("%s — aborting this season", msg); continue
 
-        teams_csv = seas_dir / "teams.csv"
+        teams_csv = seas_dir / "season" / "teams.csv"
         if not teams_csv.is_file():
             msg = f"missing teams.csv in {seas_dir}"
             if args.force:

@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from fpl_assistant.canonical.bridges import upsert_match_bridges
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 from dateutil import tz as dateutil_tz
 from unidecode import unidecode
 
@@ -507,7 +508,8 @@ def process_season(proc_season_dir: Path,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Assign FBref game_id to FPL GW rows using summary.csv; matches.csv uses FPL round.")
-    ap.add_argument("--proc-root",  required=True, type=Path, help="data/processed/fpl")
+    ap.add_argument("--proc-root", required=True, type=Path,
+                    help="Processed FPL provider root or league root")
     ap.add_argument("--fbref-root", required=True, type=Path, help="data/processed/fbref")
     ap.add_argument(
         "--fixture-calendar-root",
@@ -515,12 +517,15 @@ def main() -> None:
         default=Path("data/processed/registry/fixtures"),
         help="Registry fixture calendars used to map official FPL fixture IDs.",
     )
-    ap.add_argument("--league",     default="ENG-Premier League", help="League folder under fbref-root")
+    ap.add_argument("--league", default=DEFAULT_FPL_LEAGUE,
+                    help="League folder under provider roots")
     ap.add_argument("--summary-name", default="summary.csv", help="If your file isn’t named summary.csv")
     ap.add_argument("--season", help="Only process one season (e.g., '2025-26' or '2025-2026').")
     ap.add_argument("--tz", default="UTC", help="Timezone for date_played/time (e.g., 'Africa/Lagos').")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
+
+    args.proc_root = league_scoped_root(args.proc_root, args.league)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

@@ -748,4 +748,5 @@ def main():
             logging.info("%s • all rows matched 🎉", seas_dir.name)
 
 if __name__ == "__main__":
-    main()
+    from fpl_assistant.providers.fpl.clean.gw_stats_cleaner import main as package_main
+    package_main()

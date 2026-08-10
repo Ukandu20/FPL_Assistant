@@ -692,4 +692,5 @@ def main() -> None:
         )
 
 if __name__ == "__main__":
-    main()
+    from fpl_assistant.providers.fpl.pipelines.clean_and_enrich import main as package_main
+    package_main()

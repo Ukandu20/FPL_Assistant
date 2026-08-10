@@ -29,8 +29,8 @@ Only rows with non-null player_id are considered.
 
 CLI
 ---
-py -m scripts.fpl_pipeline.prices.prices_from_merged ^
-  --proc-root data/processed/fpl ^
+python -m fpl_assistant.providers.fpl.pipelines.prices_from_merged `
+  --proc-root "data/processed/fpl/ENG-Premier League" `
   --out-json-dir data/processed/registry/prices ^
   --out-parquet-dir data/processed/registry/prices_parquet ^
   --season 2025-2026 ^
@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
 from typing import Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
 PRICE_CANDIDATES = ["price", "now_cost", "value", "cost"]
 
@@ -211,11 +213,14 @@ def process_season(season_dir: Path, out_json_dir: Path, out_parquet_dir: Path) 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build per-season player price registry from processed merged_gws.csv files.")
     ap.add_argument("--proc-root", required=True, type=Path, help="Root with <season>/gws/merged_gws.csv")
+    ap.add_argument("--league", default=DEFAULT_FPL_LEAGUE)
     ap.add_argument("--out-json-dir", type=Path, default=Path("data/processed/registry/prices"))
     ap.add_argument("--out-parquet-dir", type=Path, default=Path("data/processed/registry/prices_parquet"))
     ap.add_argument("--season", help="Only process a single season (e.g., '2025-26' or '2025-2026').")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+
+    args.proc_root = league_scoped_root(args.proc_root, args.league)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -237,5 +242,4 @@ def main() -> None:
         process_season(sdir, args.out_json_dir, args.out_parquet_dir)
 
 if __name__ == "__main__":
-    import re
     main()

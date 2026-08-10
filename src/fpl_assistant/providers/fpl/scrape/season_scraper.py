@@ -7,11 +7,12 @@ Changes vs your version
 • Weekly reruns overwrite: all .to_csv are atomic (temp write then os.replace).
 • Optional --fresh to remove known generated CSVs before run (safe cleanup).
 • Creates needed folders safely.
-• cleaned_players.csv and ALL fixture CSVs live under data/raw/fpl/<SEASON>/season/
+• cleaned_players.csv and ALL fixture CSVs live under
+  data/raw/fpl/<LEAGUE>/<SEASON>/season/
 
 Outputs
 -------
-Under data/raw/fpl/<YYYY-YYYY+1>/:
+Under data/raw/fpl/<LEAGUE>/<YYYY-YYYY+1>/:
   players/                       (player histories)
   gws/xP<gw>.csv, gws/* merged GW artifacts via your functions
   season/:
@@ -31,9 +32,12 @@ import datetime as dt
 import os
 import re
 import csv
+from pathlib import Path
 from typing import Optional, List
 
 import pandas as pd
+
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
 from scripts.fpl_pipeline.utils.parse_helpers import *  # noqa: F401,F403
 from scripts.fpl_pipeline.clean.cleaners import clean_players, id_players, get_player_ids
@@ -105,8 +109,12 @@ def _delete_if_exists(path: str) -> None:
     except FileNotFoundError:
         pass
 
-def _season_root(season_norm: str) -> str:
-    return os.path.join("data", "raw", "fpl", season_norm)
+def _season_root(
+    season_norm: str,
+    raw_root: Path = Path("data/raw/fpl"),
+    league: str = DEFAULT_FPL_LEAGUE,
+) -> str:
+    return str(league_scoped_root(raw_root, league) / season_norm)
 
 def _fresh_cleanup(season_dir: str) -> None:
     gws_dir = os.path.join(season_dir, "gws")
@@ -278,9 +286,14 @@ def _promote_cleaned_players_to_season_subdir(season_dir: str, season_dir_season
     except Exception as e:
         print(f"WARN: Failed to promote cleaned players CSV from {src}: {e}")
 
-def parse_data(season_input: Optional[str], fresh: bool) -> None:
+def parse_data(
+    season_input: Optional[str],
+    fresh: bool,
+    raw_root: Path = Path("data/raw/fpl"),
+    league: str = DEFAULT_FPL_LEAGUE,
+) -> None:
     season = _normalize_season_fmt(season_input)
-    season_dir = _season_root(season)
+    season_dir = _season_root(season, raw_root, league)
     players_dir = os.path.join(season_dir, "players")
     gws_dir     = os.path.join(season_dir, "gws")
     season_dir_season = os.path.join(season_dir, "season")
@@ -361,9 +374,13 @@ def main():
                         help="Season (e.g., 2025-2026, 2025-26, 2025/26, 2025). Defaults to current.")
     parser.add_argument("--fresh", action="store_true",
                         help="Optional: remove known generated CSVs in season folder before writing.")
+    parser.add_argument("--raw-root", type=Path, default=Path("data/raw/fpl"),
+                        help="FPL provider root or an already league-scoped root.")
+    parser.add_argument("--league", default=DEFAULT_FPL_LEAGUE,
+                        help="League folder beneath --raw-root.")
     args = parser.parse_args()
     try:
-        parse_data(args.season, args.fresh)
+        parse_data(args.season, args.fresh, args.raw_root, args.league)
     except FPLApiError as exc:
         parser.exit(1, f"ERROR: {exc}\n")
 

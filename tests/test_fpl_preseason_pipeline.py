@@ -7,8 +7,10 @@ import pandas as pd
 from fpl_assistant.providers.fpl.pipelines.clean_and_enrich import (
     attach_fpl_context,
     enrich_season,
+    reset_preseason_carryover,
 )
 from fpl_assistant.providers.fpl.pipelines.prices_from_merged import process_season
+from fpl_assistant.providers.fpl.paths import league_scoped_root
 from fpl_assistant.testing.paths import get_test_run_dir
 
 
@@ -170,3 +172,55 @@ def test_price_export_uses_preseason_roster_as_opening_gw1():
         (parquet_dir / "2026-2027.parquet").is_file()
         or (parquet_dir / "2026-2027.csv").is_file()
     )
+
+
+def test_league_scoped_root_accepts_provider_or_scoped_root():
+    provider_root = TEST_ROOT / "paths" / "fpl"
+    scoped_root = provider_root / "ENG-Premier League"
+
+    assert league_scoped_root(provider_root) == scoped_root
+    assert league_scoped_root(scoped_root) == scoped_root
+
+
+def test_preseason_carryover_is_reset_but_roster_fields_are_retained():
+    tmp_path = _case_dir("carryover")
+    season_dir = tmp_path / "2026-2027"
+    (season_dir / "season").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"started": False, "finished": False, "kickoff_time": "2026-08-21T19:00:00Z"}]
+    ).to_csv(season_dir / "season" / "fixtures.csv", index=False)
+    roster = pd.DataFrame(
+        [{
+            "name": "Example Player",
+            "team": "ARS",
+            "now_cost": 75,
+            "selected_by_percent": 12.3,
+            "minutes": 2500,
+            "total_points": 180,
+            "goals_scored": 12,
+        }]
+    )
+
+    result, reset_columns = reset_preseason_carryover(roster, season_dir)
+
+    assert set(reset_columns) == {"goals_scored", "minutes", "total_points"}
+    assert result.loc[0, "minutes"] == 0
+    assert result.loc[0, "total_points"] == 0
+    assert result.loc[0, "now_cost"] == 75
+    assert result.loc[0, "selected_by_percent"] == 12.3
+    assert result.loc[0, "performance_data_status"] == "prior_season_carryover_reset"
+
+
+def test_started_season_totals_are_not_reset():
+    tmp_path = _case_dir("started")
+    season_dir = tmp_path / "2026-2027"
+    (season_dir / "season").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"started": True, "finished": False}]).to_csv(
+        season_dir / "season" / "fixtures.csv", index=False
+    )
+    roster = pd.DataFrame([{"minutes": 90, "total_points": 8}])
+
+    result, reset_columns = reset_preseason_carryover(roster, season_dir)
+
+    assert reset_columns == []
+    assert result.loc[0, "total_points"] == 8

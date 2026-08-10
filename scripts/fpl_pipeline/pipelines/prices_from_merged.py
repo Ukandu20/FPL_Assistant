@@ -237,5 +237,5 @@ def main() -> None:
         process_season(sdir, args.out_json_dir, args.out_parquet_dir)
 
 if __name__ == "__main__":
-    import re
-    main()
+    from fpl_assistant.providers.fpl.pipelines.prices_from_merged import main as package_main
+    package_main()

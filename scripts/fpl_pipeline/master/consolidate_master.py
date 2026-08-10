@@ -433,4 +433,5 @@ def main():
         logging.info("No missing career entries to review.")
 
 if __name__ == "__main__":
-    main()
+    from fpl_assistant.providers.fpl.master.consolidate_master import main as package_main
+    package_main()

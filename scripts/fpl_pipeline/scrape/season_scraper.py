@@ -368,4 +368,5 @@ def main():
         parser.exit(1, f"ERROR: {exc}\n")
 
 if __name__ == "__main__":
-    main()
+    from fpl_assistant.providers.fpl.scrape.season_scraper import main as package_main
+    package_main()

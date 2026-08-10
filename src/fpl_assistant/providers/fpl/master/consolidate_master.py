@@ -39,7 +39,7 @@ Rules:
 CLI:
 py -m scripts.fpl_pipeline.master.consolidate_master ^
   --fbref-master data/processed/registry/master_players.json ^
-  --proc-root    data/processed/fpl ^
+  --proc-root    "data/processed/fpl/ENG-Premier League" ^
   --prices-dir   data/processed/registry/prices ^
   --out-json     data/processed/registry/master_fpl.json ^
   --league       "ENG-Premier League" ^
@@ -53,6 +53,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
+from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
@@ -248,12 +249,12 @@ def main():
     )
     ap.add_argument("--fbref-master", type=Path, required=True)
     ap.add_argument("--proc-root",    type=Path, required=True,
-                    help="data/processed/fpl with <season>/season/cleaned_players.csv")
+                    help="Processed FPL provider root or league root")
     ap.add_argument("--prices-dir",   type=Path, required=True,
                     help="prices registry dir produced by prices_from_merged.py")
     ap.add_argument("--out-json",     type=Path, required=True,
                     help="output master_fpl.json")
-    ap.add_argument("--league",       default="ENG-Premier League")
+    ap.add_argument("--league",       default=DEFAULT_FPL_LEAGUE)
     ap.add_argument("--season",       type=str, default="all",
                     help="Season selector: 'all' (default), 'latest', or a specific like '2025-26'/'2025-2026'")
     ap.add_argument("--seasons",      type=str, default="",
@@ -261,6 +262,8 @@ def main():
                          "If provided, takes precedence over --season.")
     ap.add_argument("--log-level",    default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = ap.parse_args()
+
+    args.proc_root = league_scoped_root(args.proc_root, args.league)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

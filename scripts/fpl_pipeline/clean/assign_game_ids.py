@@ -507,4 +507,5 @@ def main() -> None:
         )
 
 if __name__ == "__main__":
-    main()
+    from fpl_assistant.providers.fpl.clean.assign_game_ids import main as package_main
+    package_main()

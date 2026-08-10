@@ -23,6 +23,10 @@ canonical tables, never join provider names directly. A new provider is added
 by building identity bridges and staging mappings; it does not change model
 keys.
 
+The league-scoped FPL scrape, cleaning, preseason carry-over policy, and exact
+operational commands are documented in the
+[FPL pipeline runbook](docs/FPL_PIPELINE.md).
+
 ## Provider responsibilities
 
 | Provider | Primary responsibility |
