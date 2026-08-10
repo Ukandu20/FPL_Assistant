@@ -17,6 +17,11 @@ dependencies = [
 fpl-canonical = "fpl_assistant.canonical.cli:main"
 
 [project.optional-dependencies]
+app = [
+  "plotly>=6.0",
+  "streamlit>=1.45",
+  "streamlit-shadcn-ui>=1.0.1",
+]
 scraping = [
   "beautifulsoup4>=4.12",
   "lxml>=5.0",

@@ -1,44 +1,43 @@
-from pathlib import Path
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from apps.fpl.catalog import (
+    UNDERSTAT_ROOT,
+    discover_leagues as catalog_discover_leagues,
+    discover_seasons as catalog_discover_seasons,
+    file_version,
+    understat_team_season_path,
+)
+
 
 st.set_page_config(page_title="League Tables", layout="wide")
-
-UNDERSTAT_ROOT = Path("data/processed/understat")
-EXCLUDED_DIRS = {"_audit"}
 
 
 @st.cache_data(show_spinner=False)
 def discover_leagues() -> list[str]:
-    if not UNDERSTAT_ROOT.exists():
-        return []
-    leagues = [
-        d.name
-        for d in UNDERSTAT_ROOT.iterdir()
-        if d.is_dir() and d.name not in EXCLUDED_DIRS
+    return [
+        league
+        for league in catalog_discover_leagues(UNDERSTAT_ROOT)
+        if league != "_audit"
     ]
-    return sorted(leagues)
 
 
 @st.cache_data(show_spinner=False)
 def discover_seasons(league: str) -> list[str]:
-    league_dir = UNDERSTAT_ROOT / league
-    if not league_dir.exists():
-        return []
-    seasons = [
-        d.name
-        for d in league_dir.iterdir()
-        if d.is_dir() and (d / "team_season.csv").exists()
-    ]
-    return sorted(seasons)
+    return catalog_discover_seasons(
+        league, root=UNDERSTAT_ROOT, required_path="team_season.csv"
+    )
 
 
 @st.cache_data(show_spinner=False)
-def load_team_season(league: str, season: str) -> pd.DataFrame:
-    path = UNDERSTAT_ROOT / league / season / "team_season.csv"
+def load_team_season(
+    league: str,
+    season: str,
+    data_version: tuple[int, int] | None = None,
+) -> pd.DataFrame:
+    del data_version
+    path = understat_team_season_path(league, season)
     if not path.exists():
         return pd.DataFrame()
     return pd.read_csv(path)
@@ -104,7 +103,7 @@ def render_table(table: pd.DataFrame) -> None:
 
     st.dataframe(
         display,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "xPts": st.column_config.NumberColumn(format="%.2f"),
@@ -137,7 +136,7 @@ def render_charts(table: pd.DataFrame) -> None:
             margin=dict(t=50, b=20, l=20, r=20),
             yaxis_title=None,
         )
-        st.plotly_chart(fig_points, use_container_width=True)
+        st.plotly_chart(fig_points, width="stretch")
 
     with col2:
         fig_perf = px.scatter(
@@ -166,11 +165,12 @@ def render_charts(table: pd.DataFrame) -> None:
             height=max(380, len(table) * 22),
             margin=dict(t=50, b=20, l=20, r=20),
         )
-        st.plotly_chart(fig_perf, use_container_width=True)
+        st.plotly_chart(fig_perf, width="stretch")
 
 
 def render_league_tab(league: str, season: str) -> None:
-    df = load_team_season(league, season)
+    path = understat_team_season_path(league, season)
+    df = load_team_season(league, season, file_version(path))
     if df.empty:
         st.warning(f"No team_season data found for {league} ({season}).")
         return
@@ -218,11 +218,14 @@ def main() -> None:
 
     global_season = None
     if season_mode == "Choose one season":
-        all_seasons = sorted({s for lg in selected_leagues for s in discover_seasons(lg)})
+        all_seasons = sorted(
+            {s for lg in selected_leagues for s in discover_seasons(lg)},
+            reverse=True,
+        )
         if not all_seasons:
             st.error("No seasons with team_season.csv were found for the selected leagues.")
             return
-        global_season = st.sidebar.selectbox("Season to use", options=all_seasons, index=len(all_seasons) - 1)
+        global_season = st.sidebar.selectbox("Season to use", options=all_seasons)
 
     tabs = st.tabs(selected_leagues)
     for tab, league in zip(tabs, selected_leagues):
@@ -232,7 +235,7 @@ def main() -> None:
                 st.warning(f"No seasons found for {league}.")
                 continue
 
-            season = seasons[-1] if season_mode == "Latest per league" else global_season
+            season = seasons[0] if season_mode == "Latest per league" else global_season
             if season not in seasons:
                 st.info(f"{league} does not have data for {season}. Available: {', '.join(seasons)}")
                 continue

@@ -63,6 +63,19 @@ git clone https://github.com/your-username/FPL_Assistant.git
 cd FPL_Assistant
 ```
 
+## Run the analytics app
+
+Install the application dependencies and launch the canonical multipage entry
+point from the repository root:
+
+```powershell
+python -m pip install -e ".[app]"
+streamlit run apps/fpl/app.py
+```
+
+The public app is read-only. Model execution and optimizer controls remain in
+the separate research control panel.
+
 ## Provider processing safety
 
 - Files under `data/raw` are immutable provider inputs. Cleaning and enrichment
