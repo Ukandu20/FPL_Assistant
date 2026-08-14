@@ -6,13 +6,20 @@ import pandas as pd
 
 from fpl_assistant.providers.whoscored.clean.whoscored_cleaner import (
     _authoritative_fpl_positions,
+    _build_team_match,
     _event_aggregates,
     _match_resolution,
     _normalize_events,
     _player_resolution,
+    _pivot_stats,
     _resolve_player_positions,
     _season_table,
+    _set_piece_roles,
     normalize_season,
+    PLAYER_TABLES,
+    ROLE_COLUMNS,
+    TEAM_EXTRA_TABLES,
+    TEAM_ONLY_TABLES,
 )
 
 
@@ -33,6 +40,64 @@ IDENTITY_COLUMNS = [
 def test_normalize_whoscored_split_season():
     assert normalize_season("2025") == ("2025-2026", "2025")
     assert normalize_season("2025-2026") == ("2025-2026", "2025")
+
+
+def test_team_stat_pivot_preserves_text_metadata_without_suffix_columns():
+    raw = pd.DataFrame(
+        [
+            {"game_id": 1, "team_id": 2, "team": "ARS", "stat_key": "ratings", "value": "7.1", "value_text": "7.1"},
+            {"game_id": 1, "team_id": 2, "team": "ARS", "stat_key": "manager_name", "value": "Manager", "value_text": "Manager"},
+            {"game_id": 1, "team_id": 2, "team": "ARS", "stat_key": "country_name", "value": "England", "value_text": "England"},
+        ]
+    )
+
+    result, _ = _pivot_stats(raw, keys=["game_id", "team_id", "team"])
+
+    assert result.loc[0, "manager_name"] == "Manager"
+    assert result.loc[0, "country_name"] == "England"
+    assert not any(column.endswith(("_x", "_y")) for column in result)
+
+
+def test_event_metric_schema_covers_all_direct_metric_families():
+    required = {
+        "passing": {
+            "big_chances_created", "shot_creating_actions", "goal_creating_actions",
+            "crosses_completed", "cross_completion_pct", "box_entries_by_pass",
+        },
+        "passing_types": {
+            "long_balls_completed", "head_passes_completed",
+            "through_balls_completed", "layoffs_completed",
+            "chipped_passes_completed",
+        },
+        "shooting": {
+            "big_chance_shots", "big_chances_scored", "big_chances_missed",
+            "assisted_shots", "first_touch_shots", "one_on_one_shots",
+            "fast_break_shots", "shots_from_corner", "shots_from_set_piece",
+            "direct_free_kick_shots",
+        },
+        "defense": {
+            "errors_leading_to_attempt", "errors_leading_to_goal",
+            "last_man_actions", "offsides_provoked",
+            "possessions_won_attacking_third", "defensive_actions_penalty_area",
+        },
+        "possession": {
+            "possessions_won_attacking_third",
+            "possessions_lost_defensive_third",
+            "shielding_actions", "overruns", "good_skills",
+        },
+        "keepers": {
+            "diving_saves", "standing_saves", "saves_penalty_area",
+            "saves_outside_box", "keeper_throws", "goal_kicks",
+        },
+    }
+
+    for table, metrics in required.items():
+        assert metrics <= set(PLAYER_TABLES[table])
+    assert {
+        "big_chances_created", "big_chance_shots", "shot_creating_actions",
+        "goal_creating_actions", "big_chances_conceded",
+    } <= set(TEAM_EXTRA_TABLES["goal_shot_creation"])
+    assert "big_chances_conceded" in TEAM_ONLY_TABLES["defense"]
 
 
 def test_player_resolution_uses_registry_alias_and_team_season_surname():
@@ -181,6 +246,28 @@ def test_player_resolution_prefers_current_fpl_id_over_stale_registry_id():
     assert audit.loc[0, "canonical_id"] == "generated-fpl-id"
 
 
+def test_player_resolution_accepts_empty_preseason_player_set():
+    audit, bridges = _player_resolution(
+        pd.DataFrame(
+            columns=[
+                "provider_player_id",
+                "provider_player_name",
+                "provider_team_id",
+            ]
+        ),
+        player_lookup={},
+        master_players={},
+        official_fpl_players=pd.DataFrame(),
+        player_aliases={},
+        team_map={},
+        season="2026-2027",
+        existing=pd.DataFrame(columns=IDENTITY_COLUMNS),
+    )
+
+    assert audit.empty
+    assert list(bridges.columns) == IDENTITY_COLUMNS
+
+
 def test_match_resolution_handles_rescheduled_unique_team_pair():
     fixture_path = Path(".tmp") / "test_whoscored_fixture_calendar.csv"
     fixture_path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,6 +356,507 @@ def test_event_aggregation_keeps_action_families_separate():
     assert player["progressive_passes"] == 1
     assert player["goals"] == 1
     assert player["fouls_drawn"] == 1
+
+
+def test_event_aggregation_accepts_empty_preseason_event_set():
+    events = pd.DataFrame(
+        columns=[
+            "provider_match_id",
+            "provider_player_id",
+            "provider_team_id",
+            "provider_related_player_id",
+            "type",
+            "is_successful",
+            "qualifiers",
+            "x",
+            "y",
+            "end_x",
+            "end_y",
+            "is_touch",
+            "card_type",
+        ]
+    )
+
+    aggregated, normalized = _event_aggregates(events)
+
+    assert aggregated.empty
+    assert normalized.empty
+    assert "fouls_drawn" in aggregated
+
+
+def test_event_aggregation_publishes_direct_chance_context_and_spatial_metrics():
+    def qualifiers(*names: str) -> str:
+        return str(
+            [
+                {"type": {"value": index, "displayName": name}}
+                for index, name in enumerate(names, start=1)
+            ]
+        )
+
+    def event(
+        player_id: str,
+        event_type: str,
+        *,
+        successful: bool = True,
+        related_player_id: str = "",
+        qualifier_names: tuple[str, ...] = (),
+        x: float = 50,
+        y: float = 50,
+        end_x: float | None = None,
+        end_y: float | None = None,
+    ) -> dict:
+        return {
+            "provider_match_id": "m1",
+            "provider_player_id": player_id,
+            "provider_team_id": "t1",
+            "provider_related_player_id": related_player_id,
+            "type": event_type,
+            "is_successful": successful,
+            "qualifiers": qualifiers(*qualifier_names),
+            "x": x,
+            "y": y,
+            "end_x": end_x,
+            "end_y": end_y,
+            "is_touch": True,
+            "card_type": "",
+        }
+
+    events = pd.DataFrame(
+        [
+            event(
+                "creator",
+                "Pass",
+                qualifier_names=(
+                    "KeyPass", "BigChanceCreated", "Cross", "Longball",
+                    "HeadPass", "Throughball", "LayOff", "Chipped",
+                ),
+                x=60,
+                y=50,
+                end_x=90,
+                end_y=50,
+            ),
+            event(
+                "creator",
+                "BallTouch",
+                qualifier_names=("KeyPass", "BigChanceCreated"),
+                x=85,
+            ),
+            event(
+                "shooter",
+                "Goal",
+                related_player_id="creator",
+                qualifier_names=(
+                    "Assisted", "BigChance", "FirstTouch", "OneOnOne", "FastBreak",
+                ),
+                x=90,
+            ),
+            event(
+                "shooter",
+                "MissedShots",
+                related_player_id="creator",
+                qualifier_names=(
+                    "Assisted", "BigChance", "FromCorner", "SetPiece",
+                    "DirectFreekick",
+                ),
+                x=88,
+            ),
+            event("creator", "Error", qualifier_names=("LeadingToAttempt",), x=20),
+            event("creator", "Error", qualifier_names=("LeadingToGoal",), x=20),
+            event("creator", "Tackle", qualifier_names=("LastMan",), x=70),
+            event("creator", "Interception", qualifier_names=("LastMan",), x=10),
+            event("creator", "Save", qualifier_names=("LastMan",), x=5),
+            event("creator", "BallRecovery", x=75),
+            event("creator", "OffsideProvoked", x=25),
+            event("creator", "CornerAwarded", x=92),
+            event("creator", "Clearance", qualifier_names=("BlockedCross",), x=10),
+            event("creator", "Pass", successful=False, x=20, end_x=40, end_y=50),
+        ]
+    )
+
+    aggregated, _ = _event_aggregates(events)
+    creator = aggregated.set_index("provider_player_id").loc["creator"]
+    shooter = aggregated.set_index("provider_player_id").loc["shooter"]
+
+    assert creator["key_passes"] == 2
+    assert creator["big_chances_created"] == 2
+    assert creator["crosses_completed"] == 1
+    assert creator["long_balls_completed"] == 1
+    assert creator["head_passes_completed"] == 1
+    assert creator["through_balls_completed"] == 1
+    assert creator["layoffs_completed"] == 1
+    assert creator["chipped_passes_completed"] == 1
+    assert creator["box_entries_by_pass"] == 1
+    assert creator["errors_leading_to_attempt"] == 1
+    assert creator["errors_leading_to_goal"] == 1
+    assert creator["last_man_actions"] == 3
+    assert creator["last_man_tackles"] == 1
+    assert creator["last_man_interceptions"] == 1
+    assert creator["last_man_saves"] == 1
+    assert creator["offsides_provoked"] == 1
+    assert creator["corners_won"] == 1
+    assert creator["crosses_blocked"] == 1
+    assert creator["possessions_won_attacking_third"] == 2
+    assert creator["possessions_lost_defensive_third"] == 3
+    assert creator["defensive_actions_penalty_area"] == 3
+    assert creator["shot_creating_actions"] == 2
+    assert creator["goal_creating_actions"] == 1
+
+    assert shooter["big_chance_shots"] == 2
+    assert shooter["big_chances_scored"] == 1
+    assert shooter["big_chances_missed"] == 1
+    assert shooter["assisted_shots"] == 2
+    assert shooter["first_touch_shots"] == 1
+    assert shooter["one_on_one_shots"] == 1
+    assert shooter["fast_break_shots"] == 1
+    assert shooter["fast_break_goals"] == 1
+    assert shooter["open_play_shots"] == 1
+    assert shooter["shots_from_corner"] == 1
+    assert shooter["shots_from_set_piece"] == 1
+    assert shooter["direct_free_kick_shots"] == 1
+
+
+def test_event_aggregation_infers_carries_and_box_entries_from_event_sequence():
+    events = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "provider_player_id": "passer",
+                "provider_team_id": "t1", "provider_related_player_id": "",
+                "type": "Pass", "is_successful": True, "qualifiers": "[]",
+                "x": 60, "y": 50, "end_x": 75, "end_y": 50,
+                "expanded_minute": 10, "second": 0, "is_touch": True, "card_type": "",
+            },
+            {
+                "provider_match_id": "m1", "provider_player_id": "receiver",
+                "provider_team_id": "t1", "provider_related_player_id": "",
+                "type": "Pass", "is_successful": True, "qualifiers": "[]",
+                "x": 86, "y": 50, "end_x": 90, "end_y": 50,
+                "expanded_minute": 10, "second": 5, "is_touch": True, "card_type": "",
+            },
+        ]
+    )
+
+    aggregated, _ = _event_aggregates(events)
+    receiver = aggregated.set_index("provider_player_id").loc["receiver"]
+
+    assert receiver["carries"] == 1
+    assert receiver["progressive_carries"] == 1
+    assert receiver["box_entries_by_carry"] == 1
+    assert receiver["box_entries"] == 1
+
+
+def test_event_aggregation_publishes_remaining_direct_provider_signals():
+    def event(player: str, kind: str, *qualifiers: str, successful: bool = True) -> dict:
+        return {
+            "provider_match_id": "m1", "provider_player_id": player,
+            "provider_team_id": "t1", "provider_related_player_id": "",
+            "type": kind, "is_successful": successful,
+            "qualifiers": str([
+                {"type": {"value": i, "displayName": name}}
+                for i, name in enumerate(qualifiers, 1)
+            ]),
+            "x": 50, "y": 50, "end_x": 70, "end_y": 50,
+            "expanded_minute": 1, "second": 0, "is_touch": True, "card_type": "",
+        }
+
+    events = pd.DataFrame(
+        [
+            event("victim", "Foul", "Penalty"),
+            event("offender", "Foul", "Penalty", "AerialFoul", successful=False),
+            event("passer", "Pass", "ThrowIn", "ShotAssist", "IntentionalAssist"),
+            event("corner", "Pass", "CornerTaken"),
+            event("keeper", "Save", "DivingSave", "KeeperSaveInTheBox"),
+            event("keeper", "Pass", "KeeperThrow"),
+            event("shooter", "Goal", "LeftFoot", "Volley", "IndividualPlay"),
+            event("skill", "ShieldBallOpp", "OverRun"),
+            event("skill", "GoodSkill"),
+            event("", "FormationChange"),
+        ]
+    )
+
+    result, _ = _event_aggregates(events)
+    by_player = result.set_index("provider_player_id")
+
+    assert by_player.loc["victim", "penalties_won"] == 1
+    assert by_player.loc["offender", "penalties_conceded"] == 1
+    assert by_player.loc["offender", "aerial_fouls"] == 1
+    assert by_player.loc["passer", "throw_ins_completed"] == 1
+    assert by_player.loc["passer", "shot_assists"] == 1
+    assert by_player.loc["passer", "intentional_assists"] == 1
+    assert by_player.loc["corner", "corners_completed"] == 1
+    assert by_player.loc["keeper", "diving_saves"] == 1
+    assert by_player.loc["keeper", "saves_penalty_area"] == 1
+    assert by_player.loc["keeper", "keeper_throws"] == 1
+    assert by_player.loc["shooter", "left_foot_shots"] == 1
+    assert by_player.loc["shooter", "left_foot_goals"] == 1
+    assert by_player.loc["shooter", "volleys"] == 1
+    assert by_player.loc["skill", "shielding_actions"] == 1
+    assert by_player.loc["skill", "good_skills"] == 1
+    assert by_player.loc["", "formation_changes"] == 1
+
+
+def test_season_rates_are_recomputed_from_summed_event_counts():
+    frame = pd.DataFrame(
+        [
+            {
+                "league": "ENG-Premier League", "season": "2025-2026",
+                "provider_season": "2025", "match_id": "m1", "team_id": "t1",
+                "crosses": 2, "crosses_completed": 1,
+                "throw_ins": 4, "throw_ins_completed": 3,
+                "corners": 2, "corners_completed": 1,
+                "big_chance_shots": 1, "big_chances_scored": 1,
+            },
+            {
+                "league": "ENG-Premier League", "season": "2025-2026",
+                "provider_season": "2025", "match_id": "m2", "team_id": "t1",
+                "crosses": 8, "crosses_completed": 2,
+                "throw_ins": 6, "throw_ins_completed": 5,
+                "corners": 3, "corners_completed": 1,
+                "big_chance_shots": 3, "big_chances_scored": 0,
+            },
+        ]
+    )
+
+    result = _season_table(
+        frame,
+        player=False,
+        metrics=[
+            "crosses", "crosses_completed", "cross_completion_pct",
+            "throw_ins", "throw_ins_completed", "throw_in_completion_pct",
+            "corners", "corners_completed", "corner_completion_pct",
+            "big_chance_shots", "big_chances_scored", "big_chance_conversion_pct",
+        ],
+    )
+
+    assert result.loc[0, "cross_completion_pct"] == 30.0
+    assert result.loc[0, "throw_in_completion_pct"] == 80.0
+    assert result.loc[0, "corner_completion_pct"] == 40.0
+    assert result.loc[0, "big_chance_conversion_pct"] == 25.0
+
+
+def test_team_metrics_include_events_without_player_attribution():
+    player_match = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "provider_team_id": "13",
+                "corners_won": 1, "shots_on_target": 0,
+            },
+            {
+                "provider_match_id": "m1", "provider_team_id": "14",
+                "corners_won": 0, "shots_on_target": 0,
+            },
+        ]
+    )
+    event_metrics = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "provider_team_id": "13",
+                "provider_player_id": "p1", "corners_won": 1,
+                "shots_on_target": 0,
+            },
+            {
+                "provider_match_id": "m1", "provider_team_id": "13",
+                "provider_player_id": "", "corners_won": 1,
+                "shots_on_target": 0,
+            },
+            {
+                "provider_match_id": "m1", "provider_team_id": "14",
+                "provider_player_id": "p2", "corners_won": 0,
+                "shots_on_target": 0,
+            },
+        ]
+    )
+    context = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "game": "ARS-CHE",
+                "game_date": "2025-08-01", "kickoff_utc": "2025-08-01T12:00:00Z",
+                "gameweek": 1, "status": "complete", "home_team_id": "ars",
+                "away_team_id": "che", "home": "ARS", "away": "CHE",
+                "home_score": 0, "away_score": 0, "score": "0-0",
+                "league": "ENG-Premier League",
+            }
+        ]
+    )
+    team_stats = pd.DataFrame(columns=["game_id", "team_id", "team"])
+
+    result = _build_team_match(
+        team_stats,
+        player_match,
+        event_metrics=event_metrics,
+        context=context,
+        match_map={"m1": "canonical-m1"},
+        team_map={"13": "ars", "14": "che"},
+        team_names={"ars": "ARS", "che": "CHE"},
+        season="2025-2026",
+        provider_season="2025",
+    )
+
+    arsenal = result[result["team_id"].eq("ars")].iloc[0]
+    assert arsenal["corners_won"] == 2
+
+
+def test_team_big_chances_conceded_comes_from_opponent_shots():
+    player_match = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "provider_team_id": "13",
+                "shots_total": 10, "shots_on_target": 4, "shots_off_target": 3,
+                "shots_blocked": 3, "shots_on_post": 1, "shots_box": 7,
+                "shots_outside_box": 3, "headed_shots": 2, "open_play_shots": 8,
+                "shots_from_set_piece": 2, "shots_from_corner": 1,
+                "direct_free_kick_shots": 1, "penalty_attempts": 0,
+                "big_chance_shots": 2, "box_entries_by_pass": 9,
+                "box_entries_by_carry": 4, "box_entries": 13,
+            },
+            {
+                "provider_match_id": "m1", "provider_team_id": "14",
+                "shots_total": 16, "shots_on_target": 7, "shots_off_target": 5,
+                "shots_blocked": 4, "shots_on_post": 0, "shots_box": 12,
+                "shots_outside_box": 4, "headed_shots": 5, "open_play_shots": 11,
+                "shots_from_set_piece": 5, "shots_from_corner": 3,
+                "direct_free_kick_shots": 1, "penalty_attempts": 1,
+                "big_chance_shots": 5, "box_entries_by_pass": 14,
+                "box_entries_by_carry": 6, "box_entries": 20,
+            },
+        ]
+    )
+    context = pd.DataFrame(
+        [{
+            "provider_match_id": "m1", "game": "ARS-CHE", "game_date": "2025-08-01",
+            "kickoff_utc": "2025-08-01T12:00:00Z", "gameweek": 1, "status": "complete",
+            "home_team_id": "ars", "away_team_id": "che", "home": "ARS", "away": "CHE",
+            "home_score": 1, "away_score": 0, "score": "1-0", "league": "ENG-Premier League",
+        }]
+    )
+
+    result = _build_team_match(
+        pd.DataFrame(columns=["game_id", "team_id", "team"]), player_match,
+        context=context, match_map={"m1": "canonical-m1"},
+        team_map={"13": "ars", "14": "che"}, team_names={"ars": "ARS", "che": "CHE"},
+        season="2025-2026", provider_season="2025",
+    ).set_index("team_id")
+
+    assert result.loc["ars", "big_chances_conceded"] == 5
+    assert result.loc["che", "big_chances_conceded"] == 2
+    assert result.loc["ars", "shots_against"] == 16
+    assert result.loc["ars", "shots_conceded"] == 16
+    assert result.loc["ars", "shots_on_target_against"] == 7
+    assert result.loc["ars", "shots_off_target_against"] == 5
+    assert result.loc["ars", "shots_blocked_against"] == 4
+    assert result.loc["ars", "shots_blocked_defensively"] == 4
+    assert result.loc["ars", "shots_box_against"] == 12
+    assert result.loc["ars", "shots_outside_box_against"] == 4
+    assert result.loc["ars", "headed_shots_against"] == 5
+    assert result.loc["ars", "open_play_shots_against"] == 11
+    assert result.loc["ars", "shots_from_set_piece_against"] == 5
+    assert result.loc["ars", "penalty_attempts_against"] == 1
+    assert result.loc["ars", "box_entries_by_pass_against"] == 14
+    assert result.loc["ars", "box_entries_by_carry_against"] == 6
+    assert result.loc["ars", "box_entries_against"] == 20
+    assert result.loc["ars", "box_entries_allowed"] == 20
+    assert result.loc["ars", "box_entries_conceded"] == 20
+    assert result.loc["ars", "box_entries_by_pass_allowed"] == 14
+    assert result.loc["ars", "box_entries_by_carry_allowed"] == 6
+    assert result.loc["che", "shots_against"] == 10
+    assert result.loc["che", "box_entries_allowed"] == 13
+
+
+def test_set_piece_roles_rank_observed_takers_and_keep_corner_side_separate():
+    def event(
+        event_id: str,
+        match_id: str,
+        player_id: str,
+        player: str,
+        role_qualifier: str,
+        *,
+        event_type: str = "Pass",
+        game_date: str = "2025-08-10",
+        x: float = 80,
+        y: float = 80,
+        end_x: float = 90,
+        end_y: float = 50,
+    ) -> dict:
+        return {
+            "event_id": event_id,
+            "match_id": match_id,
+            "provider_match_id": match_id,
+            "team_id": "team-1",
+            "team": "ARS",
+            "provider_team_id": "13",
+            "player_id": player_id,
+            "player": player,
+            "provider_player_id": player_id,
+            "type": event_type,
+            "qualifiers": (
+                "[{'type': {'value': 1, 'displayName': '"
+                + role_qualifier
+                + "'}}]"
+            ),
+            "x": x,
+            "y": y,
+            "end_x": end_x,
+            "end_y": end_y,
+            "game_date": game_date,
+            "league": "ENG-Premier League",
+            "season": "2025-2026",
+            "provider_season": "2025",
+            "coverage_status": "complete",
+        }
+
+    events = pd.DataFrame(
+        [
+            event("c1", "m1", "p1", "Primary", "CornerTaken", y=90),
+            event("c2", "m1", "p1", "Primary", "CornerTaken", y=90),
+            event("c3", "m2", "p2", "Secondary", "CornerTaken", y=90),
+            event("c4", "m2", "p2", "Secondary", "CornerTaken", y=10),
+            event("p1", "m1", "p1", "Primary", "Penalty", event_type="Goal"),
+            event("p2", "m2", "p1", "Primary", "Penalty", event_type="SavedShot"),
+            event("p3", "m2", "p2", "Secondary", "Penalty", event_type="Goal"),
+            event("d1", "m2", "p1", "Primary", "DirectFreekick", event_type="MissedShots"),
+            event("f1", "m2", "p1", "Primary", "FreekickTaken"),
+            event("i1", "m2", "p2", "Secondary", "IndirectFreekickTaken"),
+            event("l1", "m2", "p2", "Secondary", "ThrowIn", x=60, end_x=85, y=10, end_y=10),
+        ]
+    )
+    appearances = pd.DataFrame(
+        [
+            {"match_id": "m1", "team_id": "team-1", "player_id": "p1", "minutes": 90},
+            {"match_id": "m1", "team_id": "team-1", "player_id": "p2", "minutes": 0},
+            {"match_id": "m2", "team_id": "team-1", "player_id": "p1", "minutes": 90},
+            {"match_id": "m2", "team_id": "team-1", "player_id": "p2", "minutes": 90},
+        ]
+    )
+
+    roles = _set_piece_roles(events, appearances)
+
+    assert set(roles["role"]) == {
+        "corner",
+        "penalty",
+        "direct_free_kick",
+        "free_kick",
+        "indirect_free_kick",
+        "long_throw",
+    }
+    corners = roles[roles["role"].eq("corner")]
+    assert set(corners["side"]) == {"left", "right"}
+    assert corners["role"].eq("corner").all()
+    left = corners[corners["side"].eq("left")].set_index("player_id")
+    assert left.loc["p1", "role_rank"] == "primary"
+    assert left.loc["p2", "role_rank"] == "secondary"
+    penalties = roles[roles["role"].eq("penalty")].set_index("player_id")
+    assert penalties.loc["p1", "attempts"] == 2
+    assert penalties.loc["p1", "role_rank"] == "primary"
+    assert roles["opportunity_policy"].eq(
+        "team_events_in_matches_with_minutes"
+    ).all()
+    assert roles["as_of"].eq("2025-08-10").all()
+
+
+def test_set_piece_roles_are_empty_when_season_has_no_events():
+    roles = _set_piece_roles(pd.DataFrame())
+
+    assert roles.empty
+    assert list(roles.columns) == ROLE_COLUMNS
 
 
 def test_normalized_events_get_stable_unique_event_ids():

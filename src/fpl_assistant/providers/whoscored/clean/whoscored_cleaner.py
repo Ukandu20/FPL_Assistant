@@ -27,7 +27,52 @@ from fpl_assistant.canonical.identity import normalize_identity_text, stable_can
 
 LOG = logging.getLogger("whoscored.clean")
 PROVIDER = "whoscored"
-PROCESSING_VERSION = "1.2.0"
+PROCESSING_VERSION = "1.7.0"
+
+ROLE_COLUMNS = [
+    "league",
+    "season",
+    "provider_season",
+    "team_id",
+    "team",
+    "provider_team_id",
+    "player_id",
+    "player",
+    "provider_player_id",
+    "role",
+    "side",
+    "attempts",
+    "team_attempts",
+    "eligible_team_attempts",
+    "share",
+    "recency_weighted_attempts",
+    "eligible_recency_weighted_attempts",
+    "recency_weighted_share",
+    "role_score",
+    "rank",
+    "role_rank",
+    "confidence",
+    "confidence_label",
+    "last_taken",
+    "as_of",
+    "opportunity_policy",
+    "source",
+    "provider",
+    "processing_version",
+    "metric_definition_version",
+    "metric_source_policy",
+    "coverage_status",
+]
+
+ROLE_MINIMUM_SAMPLES = {
+    "corner": 12,
+    "penalty": 5,
+    "direct_free_kick": 6,
+    "free_kick": 12,
+    "indirect_free_kick": 10,
+    "long_throw": 8,
+}
+ROLE_RECENCY_HALF_LIFE_DAYS = 90.0
 
 BUILTIN_PLAYER_ALIASES = {
     "andy robertson": "andrew robertson",
@@ -63,6 +108,8 @@ PLAYER_ID_COLUMNS = ID_COLUMNS + [
     "nation",
     "born",
     "age",
+    "height",
+    "weight",
     "provider_position_match",
     "is_starter",
     "position_detail_match",
@@ -165,25 +212,47 @@ PLAYER_TABLES: dict[str, list[str]] = {
         "goals", "assists", "shots_total", "shots_on_target", "yellow_cards",
         "red_cards", "touches", "tackles", "interceptions", "blocks",
         "passes_completed", "passes_attempted", "pass_completion_pct", "key_passes",
-        "takeons_attempted", "takeons_successful", "rating", "is_man_of_the_match",
+        "big_chances_created", "big_chance_shots", "big_chances_scored",
+        "errors_leading_to_attempt", "errors_leading_to_goal",
+        "shot_creating_actions", "goal_creating_actions", "takeons_attempted",
+        "takeons_successful", "rating", "is_man_of_the_match",
     ],
     "defense": [
         "tackles", "tackles_won", "tackles_lost", "dribbled_past", "blocks",
         "interceptions", "clearances", "errors", "recoveries", "defensive_aerials",
+        "errors_leading_to_attempt", "errors_leading_to_goal", "last_man_actions",
+        "last_man_tackles", "last_man_interceptions", "last_man_saves",
+        "offsides_provoked", "tackles_defensive_third", "tackles_middle_third",
+        "tackles_attacking_third", "interceptions_attacking_third",
+        "recoveries_attacking_third", "defensive_actions_penalty_area",
+        "possessions_won_attacking_third", "crosses_blocked",
     ],
     "keepers": [
         "shots_on_target_against", "goals_against", "saves", "save_pct", "claims_high",
         "collected", "parried_danger", "parried_safe", "punches", "keeper_pickups",
         "keeper_sweeper_actions", "smothers", "penalties_faced", "crosses_not_claimed",
+        "diving_saves", "standing_saves", "saves_six_yard_box",
+        "saves_penalty_area", "saves_outside_box", "keeper_throws", "goal_kicks",
     ],
     "passing": [
         "passes_completed", "passes_attempted", "pass_completion_pct", "key_passes",
+        "big_chances_created", "shot_creating_actions", "goal_creating_actions",
         "assists", "progressive_passes", "passes_final_third", "passes_penalty_area",
-        "crosses_penalty_area",
+        "box_entries_by_pass", "crosses", "crosses_completed",
+        "cross_completion_pct", "crosses_penalty_area", "shot_assists",
+        "intentional_assists", "intentional_goal_assists", "pass_distance",
+        "progressive_pass_distance", "forward_passes", "backward_passes",
     ],
     "passing_types": [
         "passes_attempted", "passes_live", "passes_dead", "passes_free_kick",
-        "through_balls", "switches", "crosses", "throw_ins", "corners",
+        "long_balls", "long_balls_completed", "long_ball_completion_pct",
+        "head_passes", "head_passes_completed", "head_pass_completion_pct",
+        "through_balls", "through_balls_completed", "through_ball_completion_pct",
+        "layoffs", "layoffs_completed", "layoff_completion_pct", "chipped_passes",
+        "chipped_passes_completed", "chipped_pass_completion_pct", "switches",
+        "crosses", "crosses_completed", "cross_completion_pct", "throw_ins", "corners",
+        "throw_ins_completed", "throw_in_completion_pct", "corners_completed",
+        "corner_completion_pct", "goal_kicks", "keeper_throws",
         "corners_inswinging", "corners_outswinging", "corners_straight",
         "passes_completed", "passes_offside", "passes_blocked",
     ],
@@ -191,17 +260,38 @@ PLAYER_TABLES: dict[str, list[str]] = {
         "touches", "touches_defensive_third", "touches_middle_third",
         "touches_attacking_third", "touches_penalty_area", "takeons_attempted",
         "takeons_successful", "takeon_success_pct", "dribbled_past", "dispossessed",
-        "recoveries", "carries", "progressive_carries",
+        "recoveries", "recoveries_attacking_third", "possessions_won_attacking_third",
+        "possessions_lost_defensive_third", "box_entries_by_pass",
+        "box_entries_by_carry", "box_entries", "carries", "progressive_carries",
+        "takeons_unsuccessful", "shielding_actions", "overruns", "good_skills",
+        "dribbles_lost",
     ],
     "misc": [
         "yellow_cards", "red_cards", "fouls_committed", "fouls_drawn", "offsides",
         "crosses", "interceptions", "tackles_won", "penalties_won",
         "penalties_conceded", "own_goals", "recoveries", "aerials_won", "aerials_lost",
+        "crosses_blocked", "corners_won", "offsides_provoked", "last_man_actions",
+        "aerial_fouls", "obstructions", "disallowed_goals",
     ],
     "shooting": [
         "goals", "shots_total", "shots_on_target", "shots_off_target", "shots_blocked",
         "shots_on_post", "shot_on_target_pct", "goals_per_shot", "average_shot_distance",
         "shots_box", "shots_outside_box", "headed_shots", "penalty_goals", "penalty_attempts",
+        "big_chance_shots", "big_chances_scored", "big_chances_missed",
+        "big_chance_conversion_pct", "assisted_shots", "unassisted_shots",
+        "first_touch_shots", "one_on_one_shots", "fast_break_shots",
+        "fast_break_goals", "open_play_shots", "shots_from_corner",
+        "goals_from_corner", "shots_from_set_piece", "goals_from_set_piece",
+        "direct_free_kick_shots", "direct_free_kick_goals",
+        "left_foot_shots", "left_foot_goals", "right_foot_shots",
+        "right_foot_goals", "other_body_part_shots", "other_body_part_goals",
+        "volleys", "volley_goals", "individual_play_shots",
+        "individual_play_goals", "regular_play_shots", "regular_play_goals",
+        "disallowed_goals",
+        "shots_on_target_high_left", "shots_on_target_high_centre",
+        "shots_on_target_high_right", "shots_on_target_low_left",
+        "shots_on_target_low_centre", "shots_on_target_low_right",
+        "shots_missed_left", "shots_missed_right", "shots_missed_high",
     ],
     "ratings": ["rating", "is_man_of_the_match"],
     "duels": [
@@ -211,14 +301,51 @@ PLAYER_TABLES: dict[str, list[str]] = {
     ],
 }
 
+# Metrics that are meaningful only at team grain.  Keeping these separate from
+# PLAYER_TABLES avoids publishing a team exposure metric on every player row.
+TEAM_ONLY_TABLES: dict[str, list[str]] = {
+    "defense": [
+        "shots_against", "shots_conceded", "shots_on_target_against", "shots_off_target_against",
+        "shots_blocked_against", "shots_blocked_defensively",
+        "shots_on_post_against", "shots_box_against", "shots_outside_box_against",
+        "headed_shots_against", "open_play_shots_against",
+        "shots_from_set_piece_against", "shots_from_corner_against",
+        "direct_free_kick_shots_against", "penalty_attempts_against",
+        "big_chances_conceded", "box_entries_by_pass_against",
+        "box_entries_by_carry_against", "box_entries_against",
+        "box_entries_by_pass_allowed", "box_entries_by_carry_allowed",
+        "box_entries_allowed", "box_entries_conceded",
+    ],
+    "keepers": [
+        "shots_against", "shots_conceded", "shots_on_target_against", "shots_off_target_against",
+        "shots_blocked_against", "shots_on_post_against", "shots_box_against",
+        "shots_outside_box_against", "big_chances_conceded",
+    ],
+    "shooting": [
+        "shots_against", "shots_conceded", "shots_on_target_against", "shots_off_target_against",
+        "shots_blocked_against", "shots_on_post_against", "shots_box_against",
+        "shots_outside_box_against", "big_chances_conceded",
+    ],
+    "possession": [
+        "box_entries_by_pass_against", "box_entries_by_carry_against",
+        "box_entries_by_pass_allowed", "box_entries_by_carry_allowed",
+        "box_entries_against", "box_entries_allowed", "box_entries_conceded",
+    ],
+    "summary": ["average_age", "formation_changes"],
+    "misc": ["formation_changes"],
+}
+
 TEAM_EXTRA_TABLES: dict[str, list[str]] = {
     "schedule": [
         "home_team_id", "away_team_id", "status", "home_score", "away_score",
         "score", "venue", "referee", "attendance", "formation", "opponent_formation",
+        "manager_name", "country_name",
     ],
     "shot_zones": [],
     "goal_shot_creation": [
-        "key_passes", "assists", "shots_total", "fouls_drawn",
+        "key_passes", "big_chances_created", "assists", "shots_total",
+        "big_chance_shots", "big_chances_scored", "big_chances_conceded",
+        "assisted_shots", "fouls_drawn",
         "takeons_successful", "shot_creating_actions", "goal_creating_actions",
     ],
 }
@@ -227,7 +354,34 @@ NON_SUM_METRICS = {
     "rating", "is_man_of_the_match", "pass_completion_pct", "save_pct",
     "takeon_success_pct", "shot_on_target_pct", "goals_per_shot",
     "average_shot_distance", "aerial_success_pct", "tackle_success_pct",
-    "possession", "average_age",
+    "big_chance_conversion_pct", "cross_completion_pct",
+    "long_ball_completion_pct", "head_pass_completion_pct",
+    "through_ball_completion_pct", "layoff_completion_pct",
+    "chipped_pass_completion_pct", "possession", "average_age",
+    "throw_in_completion_pct", "corner_completion_pct",
+}
+
+RATE_DEFINITIONS: dict[str, tuple[str, str, float]] = {
+    "pass_completion_pct": ("passes_completed", "passes_attempted", 100.0),
+    "save_pct": ("saves", "shots_on_target_against", 100.0),
+    "takeon_success_pct": ("takeons_successful", "takeons_attempted", 100.0),
+    "shot_on_target_pct": ("shots_on_target", "shots_total", 100.0),
+    "goals_per_shot": ("goals", "shots_total", 1.0),
+    "aerial_success_pct": ("aerials_won", "aerials_total", 100.0),
+    "tackle_success_pct": ("tackles_won", "tackles", 100.0),
+    "big_chance_conversion_pct": ("big_chances_scored", "big_chance_shots", 100.0),
+    "cross_completion_pct": ("crosses_completed", "crosses", 100.0),
+    "long_ball_completion_pct": ("long_balls_completed", "long_balls", 100.0),
+    "head_pass_completion_pct": ("head_passes_completed", "head_passes", 100.0),
+    "through_ball_completion_pct": (
+        "through_balls_completed", "through_balls", 100.0,
+    ),
+    "layoff_completion_pct": ("layoffs_completed", "layoffs", 100.0),
+    "chipped_pass_completion_pct": (
+        "chipped_passes_completed", "chipped_passes", 100.0,
+    ),
+    "throw_in_completion_pct": ("throw_ins_completed", "throw_ins", 100.0),
+    "corner_completion_pct": ("corners_completed", "corners", 100.0),
 }
 
 
@@ -563,7 +717,23 @@ def _player_resolution(
                 ),
             }
         )
-    audit = pd.DataFrame(rows)
+    audit = pd.DataFrame(
+        rows,
+        columns=[
+            "entity_type",
+            "provider",
+            "provider_id",
+            "provider_name",
+            "canonical_id",
+            "provider_team_ids",
+            "canonical_team_ids",
+            "valid_from",
+            "valid_to",
+            "match_method",
+            "match_confidence",
+            "review_status",
+        ],
+    )
     resolved = audit[audit["canonical_id"].notna()].loc[:, list(existing.columns)].copy()
     combined = pd.concat([existing, resolved], ignore_index=True)
     combined = combined.drop_duplicates(["entity_type", "provider", "provider_id"], keep="last")
@@ -591,8 +761,20 @@ def _match_resolution(
     work["kickoff_utc"] = pd.to_datetime(work.get("start_time"), utc=True, errors="coerce")
 
     fixtures = _read_csv(fixture_path)
-    fixture_date_col = "date_played" if "date_played" in fixtures else "date_sched"
-    fixture_cols = ["fbref_id", "fpl_id", fixture_date_col, "home_id", "away_id"]
+    fixture_id_col = "match_id" if "match_id" in fixtures else "fbref_id"
+    if fixture_id_col not in fixtures:
+        raise ValueError(f"{fixture_path} lacks match_id/fbref_id")
+    played_dates = (
+        pd.to_datetime(fixtures["date_played"], errors="coerce")
+        if "date_played" in fixtures
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    fixture_date_col = (
+        "date_played"
+        if "date_played" in fixtures and played_dates.notna().any()
+        else "date_sched"
+    )
+    fixture_cols = [fixture_id_col, "fpl_id", fixture_date_col, "home_id", "away_id"]
     if "gw_played" in fixtures:
         fixture_cols.append("gw_played")
     fixtures = fixtures[fixture_cols].drop_duplicates().copy()
@@ -600,6 +782,7 @@ def _match_resolution(
     fixtures = fixtures.rename(
         columns={
             fixture_date_col: "game_date",
+            fixture_id_col: "fixture_match_id",
             "gw_played": "gameweek",
             "home_id": "home_team_id",
             "away_id": "away_team_id",
@@ -617,13 +800,13 @@ def _match_resolution(
     pair_counts = fixtures.groupby(["home_team_id", "away_team_id"]).size()
     unique_pairs = pair_counts[pair_counts.eq(1)].index
     pair_fixtures = fixtures.set_index(["home_team_id", "away_team_id"])
-    unresolved_fixture = work["fbref_id"].isna()
+    unresolved_fixture = work["fixture_match_id"].isna()
     for index in work.index[unresolved_fixture]:
         pair = (work.at[index, "home_team_id"], work.at[index, "away_team_id"])
         if pair not in unique_pairs:
             continue
         candidate = pair_fixtures.loc[pair]
-        for column in ("fbref_id", "fpl_id", "gameweek"):
+        for column in ("fixture_match_id", "fpl_id", "gameweek"):
             if column in candidate:
                 work.at[index, column] = candidate[column]
         work.at[index, "fixture_match_method_candidate"] = "registry_fixture_team_pair"
@@ -638,8 +821,8 @@ def _match_resolution(
         match_id = existing_lookup.get(provider_id)
         method = "existing_bridge" if match_id else ""
         confidence = 1.0 if match_id else 0.0
-        if match_id is None and pd.notna(row.fbref_id):
-            match_id = _provider_id(row.fbref_id)
+        if match_id is None and pd.notna(row.fixture_match_id):
+            match_id = _provider_id(row.fixture_match_id)
             method = row.fixture_match_method_candidate
             confidence = 1.0 if method == "registry_fixture_exact" else 0.98
         rows.append(
@@ -702,6 +885,16 @@ def _pivot_stats(
     )
     wide = chosen.pivot(index=keys, columns="metric", values="numeric_value").reset_index()
     wide.columns.name = None
+    text_metrics = {"manager_name", "country_name"}
+    text = chosen[chosen["metric"].isin(text_metrics)].copy()
+    if not text.empty:
+        wide = wide.drop(columns=list(text_metrics), errors="ignore")
+        text["text_value"] = text["value_text"].fillna(text["value"])
+        text_wide = text.pivot(
+            index=keys, columns="metric", values="text_value"
+        ).reset_index()
+        text_wide.columns.name = None
+        wide = wide.merge(text_wide, on=keys, how="outer", validate="one_to_one")
     return wide, conflict
 
 
@@ -787,7 +980,8 @@ def _normalize_events(
         work["event_bin"].eq("set_piece")
         | _qualifier_flag(qualifiers, "SetPiece")
         | _qualifier_flag(qualifiers, "FromCorner")
-        | _qualifier_flag(qualifiers, "FreeKick")
+        | _qualifier_flag(qualifiers, "FreekickTaken")
+        | _qualifier_flag(qualifiers, "DirectFreekick")
         | _qualifier_flag(qualifiers, "Penalty")
     )
     work["league"] = work.get("league", pd.Series(index=work.index, dtype="object"))
@@ -819,6 +1013,14 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "is_set_piece",
         pd.Series(False, index=work.index, dtype="bool"),
     ).fillna(False).astype(bool)
+    set_piece = (
+        set_piece
+        | _qualifier_flag(qualifiers, "SetPiece")
+        | _qualifier_flag(qualifiers, "FromCorner")
+        | _qualifier_flag(qualifiers, "FreekickTaken")
+        | _qualifier_flag(qualifiers, "DirectFreekick")
+        | _qualifier_flag(qualifiers, "Penalty")
+    )
     blocked_shot = event_type.eq("SavedShot") & _qualifier_flag(qualifiers, "Blocked")
     own_goal = event_type.eq("Goal") & _qualifier_flag(qualifiers, "OwnGoal")
     shot = event_type.isin({"Goal", "MissedShots", "SavedShot", "ShotOnPost", "ChanceMissed"}) & ~own_goal
@@ -829,6 +1031,104 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     y = pd.to_numeric(work.get("y"), errors="coerce")
     end_y = pd.to_numeric(work.get("end_y"), errors="coerce")
     work["_shot_distance"] = np.sqrt(((100 - x) * 1.05) ** 2 + ((50 - y) * 0.68) ** 2).where(shot)
+    big_chance = shot & _qualifier_flag(qualifiers, "BigChance")
+    assisted_shot = shot & _qualifier_flag(qualifiers, "Assisted")
+    cross = pass_event & _qualifier_flag(qualifiers, "Cross")
+    long_ball = pass_event & _qualifier_flag(qualifiers, "Longball")
+    head_pass = pass_event & _qualifier_flag(qualifiers, "HeadPass")
+    through_ball = pass_event & _qualifier_flag(qualifiers, "Throughball")
+    layoff = pass_event & _qualifier_flag(qualifiers, "LayOff")
+    chipped_pass = pass_event & _qualifier_flag(qualifiers, "Chipped")
+    throw_in = pass_event & _qualifier_flag(qualifiers, "ThrowIn")
+    corner = pass_event & _qualifier_flag(qualifiers, "CornerTaken")
+    penalty_context = _qualifier_flag(qualifiers, "Penalty")
+    defensive_action = event_type.isin(
+        {"Tackle", "Interception", "Clearance", "BlockedPass", "BallRecovery", "Save"}
+    )
+    won_possession = (
+        event_type.isin({"BallRecovery", "Interception"})
+        | (event_type.eq("Tackle") & outcome)
+    )
+    lost_possession = (
+        event_type.isin({"Dispossessed", "Error"})
+        | (event_type.isin({"Pass", "TakeOn"}) & ~outcome)
+    )
+    own_penalty_area = (x <= 17) & y.between(21, 79)
+    opponent_penalty_area = (end_x >= 83) & end_y.between(21, 79)
+
+    # WhoScored does not emit a distinct Carry event. Infer conservative carries
+    # between consecutive on-ball events for the same team. The recipient/current
+    # event owns the carry: the prior event's end location is the carry start and
+    # the current event's start location is its end. Time and distance bounds
+    # suppress restarts, data gaps, and negligible control touches.
+    sequence = work.assign(
+        _source_order=np.arange(len(work)),
+        _carry_minute=work.get(
+            "expanded_minute", work.get("minute", pd.Series(np.nan, index=work.index))
+        ),
+        _carry_second=work.get("second", pd.Series(0, index=work.index)),
+    ).sort_values(
+        ["provider_match_id", "_carry_minute", "_carry_second", "_source_order"],
+        kind="stable",
+    )
+    previous = sequence.shift(1)
+    current_time = (
+        pd.to_numeric(sequence["_carry_minute"], errors="coerce") * 60
+        + pd.to_numeric(sequence["_carry_second"], errors="coerce").fillna(0)
+    )
+    previous_time = (
+        pd.to_numeric(previous["_carry_minute"], errors="coerce") * 60
+        + pd.to_numeric(previous["_carry_second"], errors="coerce").fillna(0)
+    )
+    carry_start_x = pd.to_numeric(previous.get("end_x"), errors="coerce").fillna(
+        pd.to_numeric(previous.get("x"), errors="coerce")
+    )
+    carry_start_y = pd.to_numeric(previous.get("end_y"), errors="coerce").fillna(
+        pd.to_numeric(previous.get("y"), errors="coerce")
+    )
+    carry_end_x = pd.to_numeric(sequence.get("x"), errors="coerce")
+    carry_end_y = pd.to_numeric(sequence.get("y"), errors="coerce")
+    carry_distance = np.sqrt(
+        ((carry_end_x - carry_start_x) * 1.05) ** 2
+        + ((carry_end_y - carry_start_y) * 0.68) ** 2
+    )
+    same_possession_team = (
+        sequence["provider_match_id"].eq(previous["provider_match_id"])
+        & sequence["provider_team_id"].eq(previous["provider_team_id"])
+    )
+    previous_pass_ok = ~previous["type"].eq("Pass") | previous["is_successful"].fillna(False)
+    current_has_player = sequence["provider_player_id"].ne("")
+    current_on_ball = sequence.get(
+        "is_touch", pd.Series(False, index=sequence.index)
+    ).fillna(False).astype(bool)
+    dead_ball = sequence.get(
+        "is_set_piece", pd.Series(False, index=sequence.index)
+    ).fillna(False).astype(bool) | previous.get(
+        "is_set_piece", pd.Series(False, index=sequence.index)
+    ).fillna(False).astype(bool)
+    elapsed = current_time - previous_time
+    inferred_carry = (
+        same_possession_team
+        & previous_pass_ok
+        & current_has_player
+        & current_on_ball
+        & ~dead_ball
+        & elapsed.between(1, 10, inclusive="both")
+        & carry_distance.between(3, 60, inclusive="both")
+    )
+    carry_flags = pd.DataFrame(
+        {
+            "_carry": inferred_carry,
+            "_progressive_carry": inferred_carry & ((carry_end_x - carry_start_x) >= 10),
+            "_box_entry_by_carry": (
+                inferred_carry
+                & ~((carry_start_x >= 83) & carry_start_y.between(21, 79))
+                & (carry_end_x >= 83)
+                & carry_end_y.between(21, 79)
+            ),
+        },
+        index=sequence.index,
+    ).reindex(work.index).fillna(False)
     flags: dict[str, pd.Series] = {
         "goals": normal_goal,
         "own_goals": own_goal,
@@ -842,6 +1142,24 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "headed_shots": shot & _qualifier_flag(qualifiers, "Head"),
         "penalty_attempts": shot & _qualifier_flag(qualifiers, "Penalty"),
         "penalty_goals": normal_goal & _qualifier_flag(qualifiers, "Penalty"),
+        "penalties_won": event_type.eq("Foul") & outcome & penalty_context,
+        "penalties_conceded": event_type.eq("Foul") & ~outcome & penalty_context,
+        "big_chance_shots": big_chance,
+        "big_chances_scored": normal_goal & big_chance,
+        "big_chances_missed": big_chance & ~normal_goal,
+        "assisted_shots": assisted_shot,
+        "unassisted_shots": shot & ~_qualifier_flag(qualifiers, "Assisted"),
+        "first_touch_shots": shot & _qualifier_flag(qualifiers, "FirstTouch"),
+        "one_on_one_shots": shot & _qualifier_flag(qualifiers, "OneOnOne"),
+        "fast_break_shots": shot & _qualifier_flag(qualifiers, "FastBreak"),
+        "fast_break_goals": normal_goal & _qualifier_flag(qualifiers, "FastBreak"),
+        "open_play_shots": shot & ~set_piece,
+        "shots_from_corner": shot & _qualifier_flag(qualifiers, "FromCorner"),
+        "goals_from_corner": normal_goal & _qualifier_flag(qualifiers, "FromCorner"),
+        "shots_from_set_piece": shot & set_piece,
+        "goals_from_set_piece": normal_goal & set_piece,
+        "direct_free_kick_shots": shot & _qualifier_flag(qualifiers, "DirectFreekick"),
+        "direct_free_kick_goals": normal_goal & _qualifier_flag(qualifiers, "DirectFreekick"),
         "tackles": event_type.eq("Tackle"),
         "tackles_won": event_type.eq("Tackle") & outcome,
         "tackles_lost": event_type.eq("Tackle") & ~outcome,
@@ -850,28 +1168,70 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "blocks": event_type.eq("BlockedPass"),
         "recoveries": event_type.eq("BallRecovery"),
         "errors": event_type.eq("Error"),
+        "errors_leading_to_attempt": event_type.eq("Error") & _qualifier_flag(qualifiers, "LeadingToAttempt"),
+        "errors_leading_to_goal": event_type.eq("Error") & _qualifier_flag(qualifiers, "LeadingToGoal"),
+        "last_man_actions": defensive_action & _qualifier_flag(qualifiers, "LastMan"),
+        "last_man_tackles": event_type.eq("Tackle") & _qualifier_flag(qualifiers, "LastMan"),
+        "last_man_interceptions": event_type.eq("Interception") & _qualifier_flag(qualifiers, "LastMan"),
+        "last_man_saves": event_type.eq("Save") & _qualifier_flag(qualifiers, "LastMan"),
+        "offsides_provoked": event_type.eq("OffsideProvoked"),
+        "tackles_defensive_third": event_type.eq("Tackle") & (x < 33.3),
+        "tackles_middle_third": event_type.eq("Tackle") & x.between(33.3, 66.7, inclusive="left"),
+        "tackles_attacking_third": event_type.eq("Tackle") & (x >= 66.7),
+        "interceptions_attacking_third": event_type.eq("Interception") & (x >= 66.7),
+        "recoveries_attacking_third": event_type.eq("BallRecovery") & (x >= 66.7),
+        "defensive_actions_penalty_area": defensive_action & own_penalty_area,
+        "possessions_won_attacking_third": won_possession & (x >= 66.7),
+        "possessions_lost_defensive_third": lost_possession & (x < 33.3),
         "challenges": event_type.eq("Challenge"),
         "dribbled_past": event_type.eq("Challenge"),
         "passes_attempted": pass_event,
         "passes_completed": pass_event & outcome,
         "passes_live": pass_event & ~set_piece,
         "passes_dead": pass_event & set_piece,
-        "passes_free_kick": pass_event & _qualifier_flag(qualifiers, "FreeKickTaken"),
-        "through_balls": pass_event & _qualifier_flag(qualifiers, "Throughball"),
+        "passes_free_kick": pass_event & _qualifier_flag(qualifiers, "FreekickTaken"),
+        "long_balls": long_ball,
+        "long_balls_completed": long_ball & outcome,
+        "head_passes": head_pass,
+        "head_passes_completed": head_pass & outcome,
+        "through_balls": through_ball,
+        "through_balls_completed": through_ball & outcome,
+        "layoffs": layoff,
+        "layoffs_completed": layoff & outcome,
+        "chipped_passes": chipped_pass,
+        "chipped_passes_completed": chipped_pass & outcome,
         "switches": pass_event & (_qualifier_flag(qualifiers, "SwitchOfPlay") | ((end_y - y).abs() >= 50)),
-        "crosses": pass_event & _qualifier_flag(qualifiers, "Cross"),
-        "throw_ins": pass_event & _qualifier_flag(qualifiers, "ThrowIn"),
-        "corners": pass_event & _qualifier_flag(qualifiers, "CornerTaken"),
+        "crosses": cross,
+        "crosses_completed": cross & outcome,
+        "crosses_blocked": _qualifier_flag(qualifiers, "BlockedCross"),
+        "throw_ins": throw_in,
+        "throw_ins_completed": throw_in & outcome,
+        "corners": corner,
+        "corners_completed": corner & outcome,
         "corners_inswinging": pass_event & _qualifier_flag(qualifiers, "Inswinger"),
         "corners_outswinging": pass_event & _qualifier_flag(qualifiers, "Outswinger"),
         "corners_straight": pass_event & _qualifier_flag(qualifiers, "Straight"),
         "passes_offside": event_type.eq("OffsidePass"),
         "passes_blocked": pass_event & _qualifier_flag(qualifiers, "BlockedPass"),
-        "key_passes": pass_event & _qualifier_flag(qualifiers, "KeyPass"),
+        # WhoScored also marks touches and rebound shots as creating actions;
+        # these qualifiers are intentionally not restricted to Pass events.
+        "key_passes": _qualifier_flag(qualifiers, "KeyPass"),
+        "shot_assists": _qualifier_flag(qualifiers, "ShotAssist"),
+        "intentional_assists": _qualifier_flag(qualifiers, "IntentionalAssist"),
+        "intentional_goal_assists": _qualifier_flag(qualifiers, "IntentionalGoalAssist"),
+        "big_chances_created": _qualifier_flag(qualifiers, "BigChanceCreated"),
         "progressive_passes": pass_event & outcome & ((end_x - x) >= 10),
         "passes_final_third": pass_event & outcome & (x < 66.7) & (end_x >= 66.7),
-        "passes_penalty_area": pass_event & outcome & (end_x >= 83) & end_y.between(21, 79),
-        "crosses_penalty_area": pass_event & outcome & _qualifier_flag(qualifiers, "Cross") & (end_x >= 83) & end_y.between(21, 79),
+        "passes_penalty_area": pass_event & outcome & opponent_penalty_area,
+        "box_entries_by_pass": pass_event & outcome & ~((x >= 83) & y.between(21, 79)) & opponent_penalty_area,
+        "box_entries_by_carry": carry_flags["_box_entry_by_carry"],
+        "box_entries": (
+            (pass_event & outcome & ~((x >= 83) & y.between(21, 79)) & opponent_penalty_area)
+            | carry_flags["_box_entry_by_carry"]
+        ),
+        "carries": carry_flags["_carry"],
+        "progressive_carries": carry_flags["_progressive_carry"],
+        "crosses_penalty_area": cross & outcome & opponent_penalty_area,
         "touches": work.get("is_touch", pd.Series(False, index=work.index)).fillna(False).astype(bool),
         "touches_defensive_third": work.get("is_touch", pd.Series(False, index=work.index)).fillna(False).astype(bool) & (x < 33.3),
         "touches_middle_third": work.get("is_touch", pd.Series(False, index=work.index)).fillna(False).astype(bool) & x.between(33.3, 66.7, inclusive="left"),
@@ -879,9 +1239,16 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "touches_penalty_area": work.get("is_touch", pd.Series(False, index=work.index)).fillna(False).astype(bool) & (x >= 83) & y.between(21, 79),
         "takeons_attempted": event_type.eq("TakeOn"),
         "takeons_successful": event_type.eq("TakeOn") & outcome,
+        "takeons_unsuccessful": event_type.eq("TakeOn") & ~outcome,
+        "shielding_actions": event_type.eq("ShieldBallOpp"),
+        "overruns": _qualifier_flag(qualifiers, "OverRun"),
+        "good_skills": event_type.eq("GoodSkill"),
         "dispossessed": event_type.eq("Dispossessed"),
         "fouls_committed": event_type.eq("Foul"),
+        "aerial_fouls": event_type.eq("Foul") & _qualifier_flag(qualifiers, "AerialFoul"),
+        "obstructions": event_type.eq("Foul") & _qualifier_flag(qualifiers, "Obstruction"),
         "offsides": event_type.eq("OffsideGiven"),
+        "corners_won": event_type.eq("CornerAwarded") & outcome,
         "yellow_cards": event_type.eq("Card") & work.get("card_type", "").astype("string").str.contains("Yellow", case=False, na=False),
         "red_cards": event_type.eq("Card") & work.get("card_type", "").astype("string").str.contains("Red", case=False, na=False),
         "aerials_total": event_type.eq("Aerial"),
@@ -896,14 +1263,73 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "smothers": event_type.eq("Smother"),
         "penalties_faced": event_type.eq("PenaltyFaced"),
         "crosses_not_claimed": event_type.eq("CrossNotClaimed"),
+        "diving_saves": event_type.eq("Save") & _qualifier_flag(qualifiers, "DivingSave"),
+        "standing_saves": event_type.eq("Save") & _qualifier_flag(qualifiers, "StandingSave"),
+        "saves_six_yard_box": event_type.eq("Save") & _qualifier_flag(qualifiers, "KeeperSaveInSixYard"),
+        "saves_penalty_area": event_type.eq("Save") & _qualifier_flag(qualifiers, "KeeperSaveInTheBox"),
+        "saves_outside_box": event_type.eq("Save") & _qualifier_flag(qualifiers, "KeeperSaveObox"),
+        "keeper_throws": pass_event & _qualifier_flag(qualifiers, "KeeperThrow"),
+        "goal_kicks": pass_event & _qualifier_flag(qualifiers, "GoalKick"),
+        "left_foot_shots": shot & _qualifier_flag(qualifiers, "LeftFoot"),
+        "left_foot_goals": normal_goal & _qualifier_flag(qualifiers, "LeftFoot"),
+        "right_foot_shots": shot & _qualifier_flag(qualifiers, "RightFoot"),
+        "right_foot_goals": normal_goal & _qualifier_flag(qualifiers, "RightFoot"),
+        "other_body_part_shots": shot & _qualifier_flag(qualifiers, "OtherBodyPart"),
+        "other_body_part_goals": normal_goal & _qualifier_flag(qualifiers, "OtherBodyPart"),
+        "volleys": shot & _qualifier_flag(qualifiers, "Volley"),
+        "volley_goals": normal_goal & _qualifier_flag(qualifiers, "Volley"),
+        "individual_play_shots": shot & _qualifier_flag(qualifiers, "IndividualPlay"),
+        "individual_play_goals": normal_goal & _qualifier_flag(qualifiers, "IndividualPlay"),
+        "regular_play_shots": shot & _qualifier_flag(qualifiers, "RegularPlay"),
+        "regular_play_goals": normal_goal & _qualifier_flag(qualifiers, "RegularPlay"),
+        "disallowed_goals": _qualifier_flag(qualifiers, "GoalDisallowed"),
+        "shots_on_target_high_left": shot & _qualifier_flag(qualifiers, "HighLeft"),
+        "shots_on_target_high_centre": shot & _qualifier_flag(qualifiers, "HighCentre"),
+        "shots_on_target_high_right": shot & _qualifier_flag(qualifiers, "HighRight"),
+        "shots_on_target_low_left": shot & _qualifier_flag(qualifiers, "LowLeft"),
+        "shots_on_target_low_centre": shot & _qualifier_flag(qualifiers, "LowCentre"),
+        "shots_on_target_low_right": shot & _qualifier_flag(qualifiers, "LowRight"),
+        "shots_missed_left": shot & _qualifier_flag(qualifiers, "MissLeft"),
+        "shots_missed_right": shot & _qualifier_flag(qualifiers, "MissRight"),
+        "shots_missed_high": shot & _qualifier_flag(qualifiers, "MissHigh"),
+        "formation_changes": event_type.eq("FormationChange"),
+        "forward_passes": pass_event & outcome & ((end_x - x) > 1),
+        "backward_passes": pass_event & outcome & ((end_x - x) < -1),
     }
-    for name, values in flags.items():
-        work[f"_m_{name}"] = values.astype("int16")
+    metric_frame = pd.DataFrame(
+        {
+            f"_m_{name}": values.fillna(False).astype("int16")
+            for name, values in flags.items()
+        },
+        index=work.index,
+    )
+    work = pd.concat([work, metric_frame], axis=1)
     metric_columns = [f"_m_{name}" for name in flags]
     grouped = work.groupby(keys, dropna=False)[metric_columns].sum().reset_index()
     grouped = grouped.rename(columns={f"_m_{name}": name for name in flags})
     distances = work.dropna(subset=["_shot_distance"]).groupby(keys, dropna=False)["_shot_distance"].mean().rename("average_shot_distance").reset_index()
     grouped = grouped.merge(distances, on=keys, how="left")
+    pass_distance = np.sqrt(
+        ((end_x - x) * 1.05) ** 2 + ((end_y - y) * 0.68) ** 2
+    ).where(pass_event & outcome)
+    work["_pass_distance"] = pass_distance
+    work["_progressive_pass_distance"] = pass_distance.where(
+        pass_event & outcome & ((end_x - x) >= 10)
+    )
+    distance_totals = (
+        work.groupby(keys, dropna=False)[
+            ["_pass_distance", "_progressive_pass_distance"]
+        ]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(
+            columns={
+                "_pass_distance": "pass_distance",
+                "_progressive_pass_distance": "progressive_pass_distance",
+            }
+        )
+    )
+    grouped = grouped.merge(distance_totals, on=keys, how="left")
 
     assist_rows = work[
         event_type.eq("Goal")
@@ -920,6 +1346,34 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     else:
         grouped["assists"] = 0
 
+    # WhoScored links assisted shots to the creating player through
+    # related_player_id. These are direct creating actions only; no inferred
+    # second preceding action or possession-chain modelling is introduced.
+    creation_specs = {
+        "shot_creating_actions": shot,
+        "goal_creating_actions": normal_goal,
+    }
+    for metric, terminal_event in creation_specs.items():
+        creation_rows = work[
+            terminal_event
+            & work["provider_related_player_id"].ne("")
+            & _qualifier_flag(qualifiers, "Assisted")
+        ][["provider_match_id", "provider_related_player_id", "provider_team_id"]].copy()
+        if creation_rows.empty:
+            grouped[metric] = 0
+            continue
+        creation = (
+            creation_rows.rename(
+                columns={"provider_related_player_id": "provider_player_id"}
+            )
+            .groupby(keys)
+            .size()
+            .rename(metric)
+            .reset_index()
+        )
+        grouped = grouped.merge(creation, on=keys, how="outer")
+        grouped[metric] = grouped[metric].fillna(0)
+
     foul_drawn = work[event_type.eq("Foul") & work["provider_related_player_id"].ne("")][
         ["provider_match_id", "provider_related_player_id", "provider_team_id"]
     ].copy()
@@ -928,8 +1382,244 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         drawn = foul_drawn.rename(columns={"provider_related_player_id": "provider_player_id"})
         drawn = drawn.groupby(["provider_match_id", "provider_player_id"]).size().rename("fouls_drawn").reset_index()
         grouped = grouped.merge(drawn, on=["provider_match_id", "provider_player_id"], how="left")
-    grouped["fouls_drawn"] = grouped.get("fouls_drawn", 0).fillna(0)
+    if "fouls_drawn" in grouped:
+        grouped["fouls_drawn"] = grouped["fouls_drawn"].fillna(0)
+    else:
+        grouped["fouls_drawn"] = 0
     return grouped.fillna({column: 0 for column in flags}), work
+
+
+def _set_piece_roles(
+    events: pd.DataFrame,
+    player_match: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Infer season-specific observed set-piece roles from WhoScored events.
+
+    Roles are never carried between seasons. Corner takers retain one ``corner``
+    role and are differentiated by ``side``. Shares use team role events from
+    matches in which the player recorded minutes when player-match data is
+    available; otherwise the full team-season event total is the denominator.
+    """
+    if events.empty:
+        return pd.DataFrame(columns=ROLE_COLUMNS)
+
+    work = events.copy()
+    qualifiers = work.get(
+        "qualifiers", pd.Series("", index=work.index, dtype="string")
+    )
+    event_type = work.get(
+        "type", pd.Series("", index=work.index, dtype="string")
+    ).astype("string")
+    is_shot = event_type.isin(
+        {"Goal", "MissedShots", "SavedShot", "ShotOnPost", "ChanceMissed"}
+    )
+    is_pass = event_type.isin({"Pass", "OffsidePass"})
+    x = pd.to_numeric(work.get("x"), errors="coerce")
+    y = pd.to_numeric(work.get("y"), errors="coerce")
+    end_x = pd.to_numeric(work.get("end_x"), errors="coerce")
+    end_y = pd.to_numeric(work.get("end_y"), errors="coerce")
+    throw_length_metres = np.sqrt(
+        ((end_x - x) * 1.05) ** 2 + ((end_y - y) * 0.68) ** 2
+    )
+
+    corner = is_pass & _qualifier_flag(qualifiers, "CornerTaken")
+    penalty = is_shot & _qualifier_flag(qualifiers, "Penalty")
+    direct_free_kick = is_shot & _qualifier_flag(qualifiers, "DirectFreekick")
+    indirect_free_kick = (
+        is_pass
+        & _qualifier_flag(qualifiers, "IndirectFreekickTaken")
+        & x.ge(50)
+    )
+    free_kick = (
+        is_pass
+        & _qualifier_flag(qualifiers, "FreekickTaken")
+        & ~_qualifier_flag(qualifiers, "IndirectFreekickTaken")
+        & x.ge(50)
+    )
+    long_throw = (
+        is_pass
+        & _qualifier_flag(qualifiers, "ThrowIn")
+        & x.ge(50)
+        & throw_length_metres.ge(20)
+    )
+
+    role_parts: list[pd.DataFrame] = []
+    for role, mask in (
+        ("corner", corner),
+        ("penalty", penalty),
+        ("direct_free_kick", direct_free_kick),
+        ("free_kick", free_kick),
+        ("indirect_free_kick", indirect_free_kick),
+        ("long_throw", long_throw),
+    ):
+        part = work.loc[mask].copy()
+        if part.empty:
+            continue
+        part["role"] = role
+        part["side"] = ""
+        if role == "corner":
+            part["side"] = np.where(
+                y.loc[part.index].isna(),
+                "unknown",
+                np.where(y.loc[part.index].ge(50), "left", "right"),
+            )
+        role_parts.append(part)
+    if not role_parts:
+        return pd.DataFrame(columns=ROLE_COLUMNS)
+
+    roles = pd.concat(role_parts, ignore_index=True, sort=False)
+    roles["game_date"] = pd.to_datetime(
+        roles.get("game_date"), errors="coerce"
+    ).dt.normalize()
+    as_of = pd.to_datetime(work.get("game_date"), errors="coerce").max()
+    if pd.isna(as_of):
+        as_of = roles["game_date"].max()
+    as_of = as_of.normalize() if pd.notna(as_of) else pd.NaT
+    age_days = (
+        (as_of - roles["game_date"]).dt.days.clip(lower=0)
+        if pd.notna(as_of)
+        else pd.Series(0.0, index=roles.index)
+    )
+    roles["_recency_weight"] = np.power(
+        0.5, age_days.fillna(0) / ROLE_RECENCY_HALF_LIFE_DAYS
+    )
+
+    team_keys = ["team_id", "role", "side"]
+    player_keys = [*team_keys, "player_id"]
+    valid_team = roles["team_id"].notna() & roles["match_id"].notna()
+    team_events = roles.loc[valid_team].copy()
+    if team_events.empty:
+        return pd.DataFrame(columns=ROLE_COLUMNS)
+
+    team_totals = (
+        team_events.groupby(team_keys, dropna=False)
+        .agg(
+            team_attempts=("event_id", "size"),
+            team_recency_weighted_attempts=("_recency_weight", "sum"),
+        )
+        .reset_index()
+    )
+    valid_player = valid_team & roles["player_id"].notna()
+    player_events = roles.loc[valid_player].copy()
+    if player_events.empty:
+        return pd.DataFrame(columns=ROLE_COLUMNS)
+
+    grouped = player_events.groupby(player_keys, dropna=False)
+    out = grouped.agg(
+        attempts=("event_id", "size"),
+        recency_weighted_attempts=("_recency_weight", "sum"),
+        last_taken=("game_date", "max"),
+        team=("team", "last"),
+        provider_team_id=("provider_team_id", "last"),
+        player=("player", "last"),
+        provider_player_id=("provider_player_id", "last"),
+        league=("league", "last"),
+        season=("season", "last"),
+        provider_season=("provider_season", "last"),
+    ).reset_index()
+    out = out.merge(team_totals, on=team_keys, how="left", validate="many_to_one")
+
+    opportunity_policy = "team_season_events"
+    eligible = pd.DataFrame()
+    if player_match is not None and not player_match.empty:
+        appearance_columns = {"match_id", "team_id", "player_id", "minutes"}
+        if appearance_columns <= set(player_match.columns):
+            appearances = player_match.loc[
+                pd.to_numeric(player_match["minutes"], errors="coerce").gt(0),
+                ["match_id", "team_id", "player_id"],
+            ].dropna().drop_duplicates()
+            match_role_totals = (
+                team_events.groupby(["match_id", *team_keys], dropna=False)
+                .agg(
+                    eligible_team_attempts=("event_id", "size"),
+                    eligible_recency_weighted_attempts=("_recency_weight", "sum"),
+                )
+                .reset_index()
+            )
+            eligible = appearances.merge(
+                match_role_totals,
+                on=["match_id", "team_id"],
+                how="inner",
+                validate="many_to_many",
+            )
+            if not eligible.empty:
+                eligible = (
+                    eligible.groupby(player_keys, dropna=False)[
+                        [
+                            "eligible_team_attempts",
+                            "eligible_recency_weighted_attempts",
+                        ]
+                    ]
+                    .sum()
+                    .reset_index()
+                )
+                opportunity_policy = "team_events_in_matches_with_minutes"
+
+    if not eligible.empty:
+        out = out.merge(eligible, on=player_keys, how="left", validate="one_to_one")
+    else:
+        out["eligible_team_attempts"] = out["team_attempts"]
+        out["eligible_recency_weighted_attempts"] = out[
+            "team_recency_weighted_attempts"
+        ]
+    out["eligible_team_attempts"] = out["eligible_team_attempts"].fillna(
+        out["team_attempts"]
+    )
+    out["eligible_recency_weighted_attempts"] = out[
+        "eligible_recency_weighted_attempts"
+    ].fillna(out["team_recency_weighted_attempts"])
+    out["share"] = np.where(
+        out["eligible_team_attempts"].gt(0),
+        out["attempts"] / out["eligible_team_attempts"],
+        0.0,
+    )
+    out["recency_weighted_share"] = np.where(
+        out["eligible_recency_weighted_attempts"].gt(0),
+        out["recency_weighted_attempts"]
+        / out["eligible_recency_weighted_attempts"],
+        0.0,
+    )
+    out["role_score"] = out["recency_weighted_share"] * np.log1p(out["attempts"])
+    out = out.sort_values(
+        [
+            *team_keys,
+            "role_score",
+            "recency_weighted_attempts",
+            "attempts",
+            "last_taken",
+            "player_id",
+        ],
+        ascending=[True, True, True, False, False, False, False, True],
+        kind="stable",
+    )
+    out["rank"] = out.groupby(team_keys, dropna=False).cumcount() + 1
+    out["role_rank"] = out["rank"].map(
+        lambda value: "primary" if value == 1 else "secondary" if value == 2 else "backup"
+    )
+    minimum_samples = out["role"].map(ROLE_MINIMUM_SAMPLES).fillna(10)
+    sample_strength = (out["attempts"] / minimum_samples).clip(upper=1.0)
+    dominance = out[["share", "recency_weighted_share"]].max(axis=1).clip(0, 1)
+    out["confidence"] = np.sqrt(sample_strength * dominance).round(4)
+    out["confidence_label"] = np.select(
+        [out["confidence"].ge(0.75), out["confidence"].ge(0.45)],
+        ["high", "medium"],
+        default="low",
+    )
+    out["last_taken"] = out["last_taken"].dt.strftime("%Y-%m-%d")
+    out["as_of"] = as_of.strftime("%Y-%m-%d") if pd.notna(as_of) else pd.NA
+    out["opportunity_policy"] = opportunity_policy
+    out["source"] = "whoscored.events"
+    out["provider"] = PROVIDER
+    out["processing_version"] = PROCESSING_VERSION
+    out["metric_definition_version"] = PROCESSING_VERSION
+    out["metric_source_policy"] = (
+        "observed_current_season_events_recency_and_availability"
+    )
+    out["coverage_status"] = work.get(
+        "coverage_status", pd.Series("", index=work.index)
+    ).iloc[0]
+    out = out.drop(columns=["team_recency_weighted_attempts"], errors="ignore")
+    return _ordered(out, ROLE_COLUMNS)
 
 
 def _coalesced_metric(frame: pd.DataFrame, candidates: Iterable[str]) -> pd.Series:
@@ -942,20 +1632,10 @@ def _coalesced_metric(frame: pd.DataFrame, candidates: Iterable[str]) -> pd.Seri
 
 def _derive_rates(frame: pd.DataFrame) -> pd.DataFrame:
     work = frame.copy()
-    ratios = {
-        "pass_completion_pct": ("passes_completed", "passes_attempted"),
-        "save_pct": ("saves", "shots_on_target_against"),
-        "takeon_success_pct": ("takeons_successful", "takeons_attempted"),
-        "shot_on_target_pct": ("shots_on_target", "shots_total"),
-        "goals_per_shot": ("goals", "shots_total"),
-        "aerial_success_pct": ("aerials_won", "aerials_total"),
-        "tackle_success_pct": ("tackles_won", "tackles"),
-    }
-    for target, (numerator, denominator) in ratios.items():
+    for target, (numerator, denominator, multiplier) in RATE_DEFINITIONS.items():
         if {numerator, denominator} <= set(work.columns):
             den = pd.to_numeric(work[denominator], errors="coerce")
             num = pd.to_numeric(work[numerator], errors="coerce")
-            multiplier = 1.0 if target == "goals_per_shot" else 100.0
             work[target] = np.where(den > 0, multiplier * num / den, np.nan)
     if {"aerials_total", "aerials_won"} <= set(work.columns):
         work["aerials_lost"] = work["aerials_total"] - work["aerials_won"]
@@ -1289,6 +1969,17 @@ def _build_player_match(
     stat_roster = player_stats_wide[[c for c in ["game_id", "team_id", "team", "player_id", "player"] if c in player_stats_wide]].copy()
     roster_parts.append(stat_roster)
     roster = pd.concat(roster_parts, ignore_index=True, sort=False)
+    if roster.empty:
+        return pd.DataFrame(
+            columns=[
+                *PLAYER_ID_COLUMNS,
+                "provider",
+                "processing_version",
+                "metric_definition_version",
+                "metric_source_policy",
+                "coverage_status",
+            ]
+        )
     roster["provider_match_id"] = roster["game_id"].map(_provider_id)
     roster["provider_team_id"] = roster["team_id"].map(_provider_id)
     roster["provider_player_id"] = roster["player_id"].map(_provider_id)
@@ -1347,6 +2038,7 @@ def _build_player_match(
         "key_passes": ["key_passes_event", "passes_key"],
         "takeons_attempted": ["takeons_attempted_event", "dribbles_attempted"],
         "takeons_successful": ["takeons_successful_event", "dribbles_won"],
+        "dribbles_lost": ["dribbles_lost"],
         "dispossessed": ["dispossessed_event", "dispossessed"],
         "aerials_total": ["aerials_total_event", "aerials_total"],
         "aerials_won": ["aerials_won_event", "aerials_won"],
@@ -1434,8 +2126,6 @@ def _build_player_match(
     roster["metric_source_policy"] = "events_primary_match_stats_metadata"
     roster["coverage_status"] = "covered"
     roster = _derive_rates(roster)
-    roster["carries"] = np.nan
-    roster["progressive_carries"] = np.nan
     return roster
 
 
@@ -1443,6 +2133,7 @@ def _build_team_match(
     team_stats_wide: pd.DataFrame,
     player_match: pd.DataFrame,
     *,
+    event_metrics: pd.DataFrame | None = None,
     context: pd.DataFrame,
     match_map: Mapping[str, str],
     team_map: Mapping[str, str],
@@ -1450,6 +2141,17 @@ def _build_team_match(
     season: str,
     provider_season: str,
 ) -> pd.DataFrame:
+    if team_stats_wide.empty and player_match.empty:
+        return pd.DataFrame(
+            columns=[
+                *ID_COLUMNS,
+                "provider",
+                "processing_version",
+                "metric_definition_version",
+                "metric_source_policy",
+                "coverage_status",
+            ]
+        )
     work = team_stats_wide.copy()
     work["provider_match_id"] = work["game_id"].map(_provider_id)
     work["provider_team_id"] = work["team_id"].map(_provider_id)
@@ -1459,10 +2161,44 @@ def _build_team_match(
     work["team"] = work["team_id"].map(team_names)
     work = work.drop(columns=[c for c in ["game_id"] if c in work])
 
-    additive = sorted({metric for metrics in PLAYER_TABLES.values() for metric in metrics} - NON_SUM_METRICS)
+    additive = sorted(
+        (
+            {metric for metrics in PLAYER_TABLES.values() for metric in metrics}
+            | {metric for metrics in TEAM_ONLY_TABLES.values() for metric in metrics}
+        )
+        - NON_SUM_METRICS
+    )
     available = [metric for metric in additive if metric in player_match]
     summed = player_match.groupby(["provider_match_id", "provider_team_id"], dropna=False)[available].sum(min_count=1).reset_index()
     work = work.merge(summed, on=["provider_match_id", "provider_team_id"], how="outer", suffixes=("", "_players"))
+    event_available: list[str] = []
+    if event_metrics is not None and not event_metrics.empty:
+        event_available = [metric for metric in additive if metric in event_metrics]
+        if event_available:
+            event_summed = (
+                event_metrics.groupby(
+                    ["provider_match_id", "provider_team_id"], dropna=False
+                )[event_available]
+                .sum(min_count=1)
+                .reset_index()
+                .rename(
+                    columns={metric: f"{metric}_events" for metric in event_available}
+                )
+            )
+            work = work.merge(
+                event_summed,
+                on=["provider_match_id", "provider_team_id"],
+                how="outer",
+            )
+    # Outer joins may introduce an event-only team row after the initial
+    # canonical mapping, so fill identities again from stable provider keys.
+    work["match_id"] = work.get("match_id").fillna(
+        work["provider_match_id"].map(match_map)
+    )
+    work["team_id"] = work.get("team_id").fillna(
+        work["provider_team_id"].map(team_map)
+    )
+    work["team"] = work.get("team").fillna(work["team_id"].map(team_names))
     direct = {
         "rating": ["ratings"], "possession": ["possession"], "average_age": ["average_age"],
         "touches": ["touches_players", "touches"],
@@ -1477,6 +2213,7 @@ def _build_team_match(
         "key_passes": ["key_passes_players", "passes_key"],
         "takeons_attempted": ["takeons_attempted_players", "dribbles_attempted"],
         "takeons_successful": ["takeons_successful_players", "dribbles_won"],
+        "dribbles_lost": ["dribbles_lost_players", "dribbles_lost"],
         "dispossessed": ["dispossessed_players", "dispossessed"],
         "aerials_total": ["aerials_total_players", "aerials_total"],
         "aerials_won": ["aerials_won_players", "aerials_won"],
@@ -1488,9 +2225,20 @@ def _build_team_match(
         "shots_blocked": ["shots_blocked_players", "shots_blocked"],
         "shots_on_post": ["shots_on_post_players", "shots_on_post"],
     }
-    source_policy = dict(direct)
-    for metric in available:
-        source_policy[metric] = [f"{metric}_players", metric]
+    source_policy = {
+        metric: (
+            [f"{metric}_events", *candidates]
+            if metric in event_available
+            else candidates
+        )
+        for metric, candidates in direct.items()
+    }
+    for metric in sorted(set(available) | set(event_available)):
+        source_policy[metric] = [
+            *([f"{metric}_events"] if metric in event_available else []),
+            *([f"{metric}_players"] if metric in available else []),
+            metric,
+        ]
     derived_metrics = pd.DataFrame(
         {
             target: _coalesced_metric(work, candidates)
@@ -1523,7 +2271,45 @@ def _build_team_match(
     work["opponent_formation"] = np.where(work["is_home"], work.get("away_formation"), work.get("home_formation"))
     work["goals"] = np.where(work["is_home"], work.get("home_score"), work.get("away_score"))
     work["goals_against"] = np.where(work["is_home"], work.get("away_score"), work.get("home_score"))
-    work["shots_on_target_against"] = work.groupby("provider_match_id")["shots_on_target"].transform(lambda values: values.iloc[::-1].to_numpy() if len(values) == 2 else np.full(len(values), np.nan))
+    opponent_index = pd.MultiIndex.from_frame(
+        work[["provider_match_id", "opponent_id"]].rename(
+            columns={"opponent_id": "team_id"}
+        )
+    )
+    opponent_metric_map = {
+        "shots_total": "shots_against",
+        "shots_on_target": "shots_on_target_against",
+        "shots_off_target": "shots_off_target_against",
+        "shots_blocked": "shots_blocked_against",
+        "shots_on_post": "shots_on_post_against",
+        "shots_box": "shots_box_against",
+        "shots_outside_box": "shots_outside_box_against",
+        "headed_shots": "headed_shots_against",
+        "open_play_shots": "open_play_shots_against",
+        "shots_from_set_piece": "shots_from_set_piece_against",
+        "shots_from_corner": "shots_from_corner_against",
+        "direct_free_kick_shots": "direct_free_kick_shots_against",
+        "penalty_attempts": "penalty_attempts_against",
+        "big_chance_shots": "big_chances_conceded",
+        "box_entries_by_pass": "box_entries_by_pass_against",
+        "box_entries_by_carry": "box_entries_by_carry_against",
+        "box_entries": "box_entries_against",
+    }
+    opponent_keys = ["provider_match_id", "team_id"]
+    for source_metric, target_metric in opponent_metric_map.items():
+        if source_metric not in work:
+            work[target_metric] = np.nan
+            continue
+        source = work.set_index(opponent_keys)[source_metric]
+        work[target_metric] = opponent_index.map(source)
+    # `allowed` is retained as a discoverability alias for consumers that use
+    # that terminology; it is definitionally identical to entries against.
+    work["shots_conceded"] = work["shots_against"]
+    work["box_entries_by_pass_allowed"] = work["box_entries_by_pass_against"]
+    work["box_entries_by_carry_allowed"] = work["box_entries_by_carry_against"]
+    work["box_entries_allowed"] = work["box_entries_against"]
+    work["box_entries_conceded"] = work["box_entries_against"]
+    work["shots_blocked_defensively"] = work["shots_blocked_against"]
     work["league"] = context["league"].dropna().iloc[0]
     work["season"] = season
     work["provider_season"] = provider_season
@@ -1614,7 +2400,7 @@ def _season_table(frame: pd.DataFrame, *, player: bool, metrics: list[str]) -> p
 
         metadata_columns = [
             column for column in (
-                "player", "nation", "born", "position", "primary_position", "fpl_pos",
+                "player", "nation", "born", "height", "weight", "position", "primary_position", "fpl_pos",
                 "fpl_position_source", "fpl_position_confidence",
             )
             if column in work
@@ -1643,10 +2429,7 @@ def _season_table(frame: pd.DataFrame, *, player: bool, metrics: list[str]) -> p
     else:
         out["matches_played"] = out["matches_covered"]
     for metric in numeric_metrics:
-        if metric in NON_SUM_METRICS and metric not in {
-            "pass_completion_pct", "save_pct", "takeon_success_pct", "shot_on_target_pct",
-            "goals_per_shot", "aerial_success_pct", "tackle_success_pct",
-        }:
+        if metric in NON_SUM_METRICS and metric not in RATE_DEFINITIONS:
             out[metric] = grouped[metric].mean().to_numpy()
     out = _derive_rates(out)
     out["provider"] = PROVIDER
@@ -1667,6 +2450,8 @@ def _write_table_families(
     manifests: list[dict[str, Any]] = []
     id_columns = PLAYER_ID_COLUMNS if player and level == "match" else ID_COLUMNS
     for table, metrics in PLAYER_TABLES.items():
+        if not player:
+            metrics = list(dict.fromkeys([*metrics, *TEAM_ONLY_TABLES.get(table, [])]))
         if not player and table == "keepers":
             output_name = "keeper"
         else:
@@ -1677,7 +2462,7 @@ def _write_table_families(
             table_frame = _season_table(frame, player=player, metrics=metrics)
             identity = ["league", "season", "provider_season"]
             identity += [
-                "player_id", "player", "nation", "born", "position", "primary_position",
+                "player_id", "player", "nation", "born", "height", "weight", "position", "primary_position",
                 "fpl_pos", "fpl_position_source", "fpl_position_confidence",
             ] if player else ["team_id"]
             table_frame = _ordered(table_frame, identity + ["matches_played", "matches_covered"] + metrics)
@@ -1758,7 +2543,12 @@ def clean_whoscored_season(
         ].copy()
     master_players = _load_json(registry_root / "master_players.json")
     master_teams = _load_json(registry_root / "master_teams.json")
-    official_fpl_path = fpl_root / canonical_season / "season" / "cleaned_players.csv"
+    official_fpl_path = (
+        fpl_root / league / canonical_season / "season" / "cleaned_players.csv"
+    )
+    if not official_fpl_path.is_file():
+        # Also support callers that already pass a league-scoped FPL root.
+        official_fpl_path = fpl_root / canonical_season / "season" / "cleaned_players.csv"
     official_fpl_players = (
         _drop_export_index(_read_csv(official_fpl_path))
         if official_fpl_path.is_file()
@@ -1965,7 +2755,7 @@ def clean_whoscored_season(
         )
     team_match = _build_team_match(
         team_stats_wide, player_match, context=context, match_map=match_map,
-        team_map=team_map, team_names=team_names,
+        event_metrics=event_metrics, team_map=team_map, team_names=team_names,
         season=canonical_season, provider_season=provider_season,
     )
     team_match = team_match.dropna(subset=["match_id", "team_id"]).copy()
@@ -1981,15 +2771,45 @@ def clean_whoscored_season(
     manifest_rows += _write_table_families(team_match, output_dir=output_dir, level="match", player=False)
     manifest_rows += _write_table_families(team_match, output_dir=output_dir, level="season", player=False)
 
+    roles = _set_piece_roles(normalized_events, player_match)
+    roles_path = output_dir / "player_season" / "roles.csv"
+    _atomic_csv(roles, roles_path)
+    role_key = ["season", "team_id", "player_id", "role", "side"]
+    manifest_rows.append(
+        {
+            "table": "player_season/roles",
+            "path": str(roles_path),
+            "rows": len(roles),
+            "duplicate_keys": int(roles.duplicated(role_key).sum()),
+            "sha256": _hash_file(roles_path),
+        }
+    )
+
     schedule_columns = ID_COLUMNS + TEAM_EXTRA_TABLES["schedule"]
+    schedule_base = _build_schedule_table(
+        context,
+        match_map=match_map,
+        team_names=team_names,
+        season=canonical_season,
+        provider_season=provider_season,
+    )
+    schedule_metadata = team_match[
+        [
+            column
+            for column in ("match_id", "team_id", "manager_name", "country_name")
+            if column in team_match
+        ]
+    ].drop_duplicates(["match_id", "team_id"])
+    schedule_base = schedule_base.drop(
+        columns=["manager_name", "country_name"], errors="ignore"
+    ).merge(
+        schedule_metadata,
+        on=["match_id", "team_id"],
+        how="left",
+        validate="one_to_one",
+    )
     schedule_table = _ordered(
-        _build_schedule_table(
-            context,
-            match_map=match_map,
-            team_names=team_names,
-            season=canonical_season,
-            provider_season=provider_season,
-        ),
+        schedule_base,
         schedule_columns,
     )
     schedule_table["coverage_status"] = coverage_status
@@ -2016,8 +2836,6 @@ def clean_whoscored_season(
     _atomic_csv(shot_zone_season, shot_zone_season_path)
     manifest_rows.append({"table": "team_season/shot_zones", "path": str(shot_zone_season_path), "rows": len(shot_zone_season), "duplicate_keys": int(shot_zone_season.duplicated(["season", "team_id"]).sum()), "sha256": _hash_file(shot_zone_season_path)})
 
-    for column in ("shot_creating_actions", "goal_creating_actions"):
-        team_match[column] = np.nan
     gsc_metrics = TEAM_EXTRA_TABLES["goal_shot_creation"]
     gsc_match = _ordered(team_match.copy(), ID_COLUMNS + gsc_metrics)
     gsc_match_path = output_dir / "team_match" / "goal_shot_creation.csv"
