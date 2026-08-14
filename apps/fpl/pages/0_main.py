@@ -8,13 +8,21 @@ import streamlit as st
 import streamlit_shadcn_ui as ui
 
 from apps.fpl.catalog import (
+    PREDICTIONS_ROOT,
     FPL_ROOT,
     PRICE_CATEGORY_CONFIG_PATH,
     discover_leagues as catalog_discover_leagues,
     discover_seasons as catalog_discover_seasons,
     file_version,
     fpl_gameweeks_path,
+    fpl_player_profiles_path,
     fpl_season_path,
+)
+from fpl_assistant.apps.viewmodels.player_card import (
+    forecast_summary,
+    latest_forecast_path,
+    prepare_player_forecast,
+    profile_dimensions,
 )
 
 
@@ -375,6 +383,35 @@ def load_gameweek_fpl(
     if "player_id" in gameweeks.columns:
         gameweeks["player_id"] = gameweeks["player_id"].astype("string")
     return gameweeks
+
+
+@st.cache_data(show_spinner=False)
+def load_player_profiles(
+    csv_path: str, data_version: tuple[int, int] | None = None
+) -> pd.DataFrame:
+    """Load the published profile artifact without recalculating league scores."""
+    del data_version
+    path = Path(csv_path)
+    if not path.is_file():
+        return pd.DataFrame()
+    profiles = pd.read_csv(path)
+    if "player_id" in profiles:
+        profiles["player_id"] = profiles["player_id"].astype("string")
+    return profiles
+
+
+@st.cache_data(show_spinner=False)
+def load_expected_points(
+    forecast_path: str, data_version: tuple[int, int] | None = None
+) -> pd.DataFrame:
+    """Load one season-specific forecast window."""
+    del data_version
+    path = Path(forecast_path)
+    if not path.is_file():
+        return pd.DataFrame()
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
 
 
 def build_player_gameweek_history(
@@ -754,6 +791,367 @@ def filter_player_pool(
     return pool
 
 
+def render_overview_tab(
+    selected_record: pd.Series,
+    total_record: pd.Series,
+    raw_record: pd.Series,
+    gameweek_history: pd.DataFrame,
+    forecast: pd.DataFrame,
+    profile: pd.Series | None,
+    *,
+    per_90: bool,
+) -> None:
+    """Render the decision-oriented summary for a selected player-season."""
+    position = selected_record["Position"]
+    is_goalkeeper = is_goalkeeper_position(position)
+    metric_suffix = " /90" if per_90 else ""
+    selected_points = pd.to_numeric(selected_record["Points"], errors="coerce")
+    selected_goals = pd.to_numeric(selected_record["Goals"], errors="coerce")
+    selected_assists = pd.to_numeric(selected_record["Assists"], errors="coerce")
+    selected_saves = pd.to_numeric(selected_record.get("Saves"), errors="coerce")
+    selected_defcon = pd.to_numeric(selected_record.get("Def Con"), errors="coerce")
+
+    metrics = st.columns(5)
+    with metrics[0]:
+        render_price_metric_card(
+            selected_record["Price"],
+            selected_record.get("Price Category", "Uncategorized"),
+        )
+    with metrics[1]:
+        # Overview always shows decision-friendly season points, not a rate.
+        total_points = pd.to_numeric(raw_record.get("total_points"), errors="coerce")
+        render_metric_card(
+            f"{selected_record['Season']} points",
+            format_metric_card_value(total_points, False),
+            format_metric_percentile_delta(total_record, "Points"),
+        )
+    with metrics[2]:
+        metric_name = "Saves" if is_goalkeeper else "Goals"
+        metric_value = selected_saves if is_goalkeeper else selected_goals
+        render_metric_card(
+            f"{metric_name}{metric_suffix}",
+            format_metric_card_value(metric_value, per_90),
+            format_metric_percentile_delta(selected_record, metric_name),
+        )
+    with metrics[3]:
+        if is_goalkeeper:
+            save_pct = pd.to_numeric(selected_record.get("Save %"), errors="coerce")
+            render_metric_card(
+                "Save %",
+                format_percentage(save_pct),
+                format_metric_percentile_delta(selected_record, "Save %"),
+            )
+        else:
+            render_metric_card(
+                f"Assists{metric_suffix}",
+                format_metric_card_value(selected_assists, per_90),
+                format_metric_percentile_delta(selected_record, "Assists"),
+            )
+    with metrics[4]:
+        render_metric_card(
+            f"Def Con{metric_suffix}",
+            format_metric_card_value(selected_defcon, per_90),
+            format_metric_percentile_delta(selected_record, "Def Con"),
+        )
+
+    recent_points = pd.to_numeric(
+        gameweek_history.tail(3).get("Total FPL points"), errors="coerce"
+    ).sum(min_count=1) if not gameweek_history.empty else pd.NA
+    summary = forecast_summary(forecast)
+    decision_cards = st.columns(5)
+    decision_cards[0].metric(
+        "Last 3 GWs",
+        "—" if pd.isna(recent_points) else f"{recent_points:.0f} pts",
+    )
+    decision_cards[1].metric(
+        "Forecast window",
+        "—" if not summary else f"{summary['expected_points']:.1f} xPts",
+    )
+    decision_cards[2].metric(
+        "Predicted minutes",
+        "—" if not summary else f"{summary['predicted_minutes']:.0f}",
+    )
+    decision_cards[3].metric(
+        "Next fixture", "—" if not summary else str(summary["next_fixture"])
+    )
+    ownership = pd.to_numeric(raw_record.get("selected_by_percent"), errors="coerce")
+    decision_cards[4].metric(
+        "Ownership", "—" if pd.isna(ownership) else f"{ownership:.1f}%"
+    )
+
+    status = str(raw_record.get("status", ""))
+    news = str(raw_record.get("news", "")).strip()
+    if status and status.lower() not in {"a", "available", "nan"}:
+        st.warning(f"Availability status: {status}. {news}".strip())
+    elif news and news.lower() != "nan":
+        st.info(news)
+
+    if profile is not None and str(profile.get("profile_status")) in {
+        "Established",
+        "Provisional",
+    }:
+        st.caption(
+            f"Profile: {profile.get('production_tier', 'Unrated')} "
+            f"{profile.get('production_archetype', 'profile')} · "
+            f"Primary strength: {profile.get('primary_strength', '—')}"
+        )
+
+
+def render_performance_tab(
+    player_name: str,
+    selected_season: str,
+    gameweek_history: pd.DataFrame,
+    percentile_table: pd.DataFrame,
+) -> None:
+    """Render selected-season performance and gameweek trends."""
+    st.subheader("Selected-season performance")
+    if gameweek_history.empty:
+        st.info(f"No gameweek data is available for {player_name} in {selected_season}.")
+    else:
+        stacked = gameweek_history.melt(
+            id_vars=["GW", "Total FPL points", "Opponent", "Minutes", "Fixtures"],
+            value_vars=GAMEWEEK_POINT_COMPONENTS,
+            var_name="Contribution",
+            value_name="Points",
+        )
+        figure = px.bar(
+            stacked,
+            x="GW",
+            y="Points",
+            color="Contribution",
+            color_discrete_map=GAMEWEEK_COMPONENT_COLORS,
+            barmode="stack",
+            custom_data=[
+                "Contribution",
+                "Total FPL points",
+                "Opponent",
+                "Minutes",
+                "Fixtures",
+            ],
+            title=f"{player_name} points contributions by gameweek — {selected_season}",
+        )
+        figure.update_traces(
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>GW: %{x}<br>Points: %{y:.0f}<br>"
+                "Total FPL points: %{customdata[1]:.0f}<br>"
+                "Opponent: %{customdata[2]}<br>Minutes: %{customdata[3]:.0f}<br>"
+                "Fixtures: %{customdata[4]}<extra></extra>"
+            )
+        )
+        figure.update_layout(
+            height=380,
+            margin=dict(t=50, b=20, l=20, r=20),
+            xaxis_title="Gameweek",
+            yaxis_title="FPL points from selected contributions",
+            legend_title_text="Contribution",
+        )
+        figure.update_xaxes(dtick=1)
+        st.plotly_chart(figure, width="stretch")
+
+    season_percentiles = percentile_table.loc[
+        percentile_table["Season"].eq(selected_season)
+    ] if not percentile_table.empty else percentile_table
+    ui.table(
+        data=season_percentiles,
+        caption=f"Metric values and percentiles for {player_name} in {selected_season}",
+        key=f"performance_{player_name}_{selected_season}",
+        max_height=520,
+    )
+
+
+def render_forecast_tab(
+    player_name: str, selected_season: str, forecast: pd.DataFrame
+) -> None:
+    """Render the latest exact-season forecast window."""
+    st.subheader("Future gameweeks")
+    if forecast.empty:
+        st.info(
+            f"No current forecast artifact is available for {player_name} in "
+            f"{selected_season}. Forecasts never fall back to another season."
+        )
+        return
+
+    chart = forecast.copy()
+    chart["GW"] = chart.get("gw_orig")
+    chart["Expected points"] = pd.to_numeric(chart.get("xPts"), errors="coerce")
+    chart["Fixture"] = (
+        chart.get("opponent", pd.Series("—", index=chart.index)).astype(str)
+        + chart.get("is_home", pd.Series(False, index=chart.index)).map(
+            {True: " (H)", False: " (A)", 1: " (H)", 0: " (A)"}
+        ).fillna("")
+    )
+    figure = px.bar(
+        chart,
+        x="GW",
+        y="Expected points",
+        color="Fixture",
+        text_auto=".1f",
+        title=f"{player_name} expected points by upcoming fixture",
+    )
+    figure.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
+    figure.update_xaxes(dtick=1)
+    st.plotly_chart(figure, width="stretch")
+
+    display_columns = {
+        "gw_orig": "GW",
+        "date_sched": "Date",
+        "opponent": "Opponent",
+        "is_home": "Home",
+        "fdr": "FDR",
+        "pred_minutes": "Predicted minutes",
+        "p_goal": "Goal probability",
+        "p_assist": "Assist probability",
+        "xg_mean": "xG",
+        "xa_mean": "xA",
+        "xPts": "Expected points",
+    }
+    available = [column for column in display_columns if column in forecast]
+    table = forecast[available].rename(columns=display_columns)
+    ui.table(
+        data=table,
+        caption="Latest published season-specific forecast window",
+        key=f"forecast_{player_name}_{selected_season}",
+        max_height=420,
+    )
+
+
+def render_history_tab(
+    player_name: str,
+    player_id: str,
+    history: pd.DataFrame,
+    percentile_table: pd.DataFrame,
+    *,
+    per_90: bool,
+) -> None:
+    """Render prior seasons and historical percentile context."""
+    metric_suffix = " /90" if per_90 else ""
+    chart_data = history.copy()
+    chart_data["Points"] = pd.to_numeric(chart_data["Points"], errors="coerce")
+    chart_data = chart_data.sort_values("Season")
+    figure = px.line(
+        chart_data,
+        x="Season",
+        y="Points",
+        markers=True,
+        title=f"FPL points{metric_suffix} by season",
+    )
+    figure.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
+    st.plotly_chart(figure, width="stretch")
+
+    regular_columns = [
+        label for label in PLAYER_HISTORY_COLUMNS.values() if label in history.columns
+    ]
+    regular_history = history[regular_columns].copy()
+    if per_90:
+        regular_history = regular_history.rename(
+            columns={
+                label: f"{label} /90"
+                for source, label in RANKED_METRICS.items()
+                if source in PER_90_METRICS and label in regular_history.columns
+            }
+        )
+    ui.table(
+        data=regular_history,
+        caption=f"All available FPL seasons for {player_name}",
+        key=f"regular_history_{player_id}",
+        max_height=500,
+    )
+    st.caption(
+        "Percentiles are calculated separately for each season. P100 is best "
+        "for the metric, and per-90 percentiles require at least "
+        f"{MIN_PER_90_MINUTES} minutes."
+    )
+    ui.table(
+        data=percentile_table,
+        caption=f"Metric values and percentiles by season for {player_name}",
+        key=f"history_{player_id}",
+        max_height=500,
+    )
+
+
+def render_profile_tab(
+    player_name: str, selected_season: str, profile: pd.Series | None
+) -> None:
+    """Render archetype, quality tier, confidence and playing characteristics."""
+    st.subheader("Production style")
+    if profile is None:
+        st.info(
+            f"No published player-profile artifact is available for {selected_season}."
+        )
+        return
+
+    status = str(profile.get("profile_status", "Data unavailable"))
+    if status not in {"Established", "Provisional"}:
+        st.info(
+            f"{player_name}: {status}. The app will not infer a style from "
+            "missing provider data or an undersized sample."
+        )
+        return
+
+    reliability = pd.to_numeric(profile.get("reliability"), errors="coerce")
+    cards = st.columns(4)
+    cards[0].metric("Archetype", str(profile.get("production_archetype", "—")))
+    cards[1].metric("Production tier", str(profile.get("production_tier", "—")))
+    cards[2].metric("Primary strength", str(profile.get("primary_strength", "—")))
+    cards[3].metric(
+        "Profile reliability",
+        "—" if pd.isna(reliability) else f"{reliability * 100:.0f}%",
+        status,
+    )
+
+    dimensions = profile_dimensions(profile)
+    if dimensions:
+        with st.container(border=True):
+            st.markdown("#### Production")
+            st.caption("Compared with players in the same FPL position.")
+            for dimension in dimensions:
+                label = str(dimension["Dimension"])
+                percentile = float(dimension["Percentile"])
+                ui.progress(
+                    value=percentile,
+                    label=label,
+                    show_value=True,
+                    width="stretch",
+                    key=(
+                        f"profile_percentile_{selected_season}_"
+                        f"{player_name}_{label}"
+                    ),
+                )
+
+            average_percentile = sum(
+                float(dimension["Percentile"]) for dimension in dimensions
+            ) / len(dimensions)
+            ui.separator(
+                key=f"profile_percentile_separator_{player_name}_{selected_season}"
+            )
+            ui.progress(
+                value=average_percentile,
+                label="Average percentile across all dimensions",
+                show_value=True,
+                width="stretch",
+                key=f"profile_average_percentile_{player_name}_{selected_season}",
+            )
+
+    characteristics = [
+        value.strip()
+        for value in str(profile.get("playing_characteristics", "")).split(";")
+        if value.strip()
+    ]
+    if characteristics:
+        st.markdown("**Playing characteristics**")
+        for characteristic in characteristics:
+            st.markdown(f"- {characteristic}")
+    secondary = str(profile.get("secondary_strength", "")).strip()
+    if secondary:
+        st.caption(f"Secondary strength: {secondary}")
+    st.caption(
+        "Rates are shrunk toward the minutes-weighted positional mean before "
+        "ranking. Established profiles require 900 minutes; 450–899 minutes "
+        "are provisional. Goalkeepers are evaluated on shot stopping, sweeping, "
+        "and distribution."
+    )
+
+
 def main() -> None:
     st.title("Fantasy Premier League Player Dashboard")
 
@@ -984,24 +1382,22 @@ def main() -> None:
     percentile_table = build_metric_percentile_table(history, per_90=per_90)
 
     selected_record = history.loc[history["Season"].eq(selected_season)].iloc[0]
-    selected_points = pd.to_numeric(selected_record["Points"], errors="coerce")
-    selected_goals = pd.to_numeric(selected_record["Goals"], errors="coerce")
-    selected_assists = pd.to_numeric(selected_record["Assists"], errors="coerce")
-    selected_saves = pd.to_numeric(
-        selected_record.get("Saves", pd.NA), errors="coerce"
-    )
-    selected_save_pct = pd.to_numeric(
-        selected_record.get("Save %", pd.NA), errors="coerce"
-    )
-    selected_defcon = pd.to_numeric(
-        selected_record.get("Def Con", pd.NA), errors="coerce"
-    )
-    player_team = selected_record["Team"]
-    player_price = selected_record["Price"]
-    player_position = selected_record["Position"]
-    is_goalkeeper = is_goalkeeper_position(player_position)
-    player_season = selected_record["Season"]
-    metric_suffix = " /90" if per_90 else ""
+    if per_90:
+        total_history = build_player_history(
+            players, selected_player_id, per_90=False
+        )
+        total_record = total_history.loc[
+            total_history["Season"].eq(selected_season)
+        ].iloc[0]
+    else:
+        total_record = selected_record
+    raw_rows = season_players.loc[
+        season_players["player_id"].astype("string").eq(str(selected_player_id))
+    ]
+    if raw_rows.empty:
+        st.warning("The selected player is missing from the season roster.")
+        return
+    raw_record = raw_rows.iloc[0]
 
     st.markdown(
         (
@@ -1009,56 +1405,12 @@ def main() -> None:
             'flex-wrap:wrap;margin-bottom:0.5rem">'
             f'<h3 style="margin:0">{escape(str(player_name))}</h3>'
             '<span style="color:var(--text-color);opacity:0.65;font-size:0.9rem">'
-            f'{escape(str(player_team))} &bull; {escape(str(player_position))}'
+            f'{escape(str(selected_record["Team"]))} &bull; '
+            f'{escape(str(selected_record["Position"]))}'
             "</span></div>"
         ),
         unsafe_allow_html=True,
     )
-
-    metrics = st.columns(5)
-    with metrics[0]:
-        render_price_metric_card(
-            player_price,
-            selected_record.get("Price Category", "Uncategorized"),
-        )
-    with metrics[1]:
-        render_metric_card(
-            f"{player_season} points{metric_suffix}",
-            format_metric_card_value(selected_points, per_90),
-            format_metric_percentile_delta(selected_record, "Points"),
-        )
-    with metrics[2]:
-        if is_goalkeeper:
-            render_metric_card(
-                f"Saves{metric_suffix}",
-                format_metric_card_value(selected_saves, per_90),
-                format_metric_percentile_delta(selected_record, "Saves"),
-            )
-        else:
-            render_metric_card(
-                f"Goals{metric_suffix}",
-                format_metric_card_value(selected_goals, per_90),
-                format_metric_percentile_delta(selected_record, "Goals"),
-            )
-    with metrics[3]:
-        if is_goalkeeper:
-            render_metric_card(
-                "Save %",
-                format_percentage(selected_save_pct),
-                format_metric_percentile_delta(selected_record, "Save %"),
-            )
-        else:
-            render_metric_card(
-                f"Assists{metric_suffix}",
-                format_metric_card_value(selected_assists, per_90),
-                format_metric_percentile_delta(selected_record, "Assists"),
-            )
-    with metrics[4]:
-        render_metric_card(
-            f"Def Con{metric_suffix}",
-            format_metric_card_value(selected_defcon, per_90),
-            format_metric_percentile_delta(selected_record, "Def Con"),
-        )
 
     gameweek_path = fpl_gameweeks_path(league, selected_season)
     gameweeks = load_gameweek_fpl(
@@ -1067,112 +1419,61 @@ def main() -> None:
     gameweek_history = build_player_gameweek_history(
         gameweeks, selected_player_id, player_name
     )
-    if gameweek_history.empty:
-        st.info(
-            f"No gameweek data is available for {player_name} in "
-            f"{selected_season}."
-        )
+
+    forecast_path = (
+        latest_forecast_path(PREDICTIONS_ROOT / "expected_points", selected_season)
+        if selected_season == seasons[0]
+        else None
+    )
+    if forecast_path is None:
+        player_forecast = pd.DataFrame()
     else:
-        stacked_gameweek_history = gameweek_history.melt(
-            id_vars=[
-                "GW",
-                "Total FPL points",
-                "Opponent",
-                "Minutes",
-                "Fixtures",
-            ],
-            value_vars=GAMEWEEK_POINT_COMPONENTS,
-            var_name="Contribution",
-            value_name="Points",
+        forecasts = load_expected_points(
+            str(forecast_path), file_version(forecast_path)
         )
-        gameweek_figure = px.bar(
-            stacked_gameweek_history,
-            x="GW",
-            y="Points",
-            color="Contribution",
-            color_discrete_map=GAMEWEEK_COMPONENT_COLORS,
-            barmode="stack",
-            custom_data=[
-                "Contribution",
-                "Total FPL points",
-                "Opponent",
-                "Minutes",
-                "Fixtures",
-            ],
-            title=(
-                f"{player_name} points contributions by gameweek "
-                f"— {selected_season}"
-            ),
+        player_forecast = prepare_player_forecast(
+            forecasts, selected_player_id, season=selected_season
         )
-        gameweek_figure.update_traces(
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "GW: %{x}<br>"
-                "Points: %{y:.0f}<br>"
-                "Total FPL points: %{customdata[1]:.0f}<br>"
-                "Opponent: %{customdata[2]}<br>"
-                "Minutes: %{customdata[3]:.0f}<br>"
-                "Fixtures: %{customdata[4]}<extra></extra>"
-            )
-        )
-        gameweek_figure.update_layout(
-            height=380,
-            margin=dict(t=50, b=20, l=20, r=20),
-            xaxis_title="Gameweek",
-            yaxis_title="FPL points from selected contributions",
-            legend_title_text="Contribution",
-        )
-        gameweek_figure.update_xaxes(dtick=1)
-        st.plotly_chart(gameweek_figure, width="stretch")
 
-    chart_data = history.copy()
-    chart_data["Points"] = pd.to_numeric(chart_data["Points"], errors="coerce")
-    chart_data = chart_data.sort_values("Season")
+    profile_path = fpl_player_profiles_path(league, selected_season)
+    profiles = load_player_profiles(str(profile_path), file_version(profile_path))
+    if profiles.empty or "player_id" not in profiles:
+        selected_profile = None
+    else:
+        profile_rows = profiles.loc[
+            profiles["player_id"].astype("string").eq(str(selected_player_id))
+        ]
+        selected_profile = None if profile_rows.empty else profile_rows.iloc[0]
 
-    figure = px.line(
-        chart_data,
-        x="Season",
-        y="Points",
-        markers=True,
-        title=f"FPL points{metric_suffix} by season",
+    overview_tab, performance_tab, forecast_tab, history_tab, profile_tab = st.tabs(
+        ["Overview", "Performance", "Forecast", "History", "Profile"]
     )
-    figure.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
-    st.plotly_chart(figure, width="stretch")
-
-    regular_history_columns = [
-        label for label in PLAYER_HISTORY_COLUMNS.values() if label in history.columns
-    ]
-    regular_history = history[regular_history_columns].copy()
-    if per_90:
-        regular_history = regular_history.rename(
-            columns={
-                label: f"{label} /90"
-                for source, label in RANKED_METRICS.items()
-                if source in PER_90_METRICS and label in regular_history.columns
-            }
+    with overview_tab:
+        render_overview_tab(
+            selected_record,
+            total_record,
+            raw_record,
+            gameweek_history,
+            player_forecast,
+            selected_profile,
+            per_90=per_90,
         )
-    ui.table(
-        data=regular_history,
-        caption=(
-            f"All available FPL seasons for {player_name} "
-            f"({'per 90' if per_90 else 'totals'})"
-        ),
-        key=f"regular_history_{selected_player_id}",
-        max_height=500,
-    )
-
-    st.caption(
-        "Percentiles are calculated separately for each season. P100 is best "
-        "for the metric (lower is better for adverse outcomes), and ties share "
-        "their average percentile. Per-90 percentiles require at least "
-        f"{MIN_PER_90_MINUTES} minutes."
-    )
-    ui.table(
-        data=percentile_table,
-        caption=f"Metric values and percentiles by season for {player_name}",
-        key=f"history_{selected_player_id}",
-        max_height=500,
-    )
+    with performance_tab:
+        render_performance_tab(
+            player_name, selected_season, gameweek_history, percentile_table
+        )
+    with forecast_tab:
+        render_forecast_tab(player_name, selected_season, player_forecast)
+    with history_tab:
+        render_history_tab(
+            player_name,
+            selected_player_id,
+            history,
+            percentile_table,
+            per_90=per_90,
+        )
+    with profile_tab:
+        render_profile_tab(player_name, selected_season, selected_profile)
 
 
 if __name__ == "__main__":

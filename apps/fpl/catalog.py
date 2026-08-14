@@ -59,6 +59,14 @@ def fpl_gameweeks_path(league: str, season: str) -> Path:
     return FPL_ROOT / league / season / "gws" / "merged_gws.csv"
 
 
+def fpl_player_profiles_path(league: str, season: str) -> Path:
+    return FPL_ROOT / league / season / "analytics" / "player_profiles.csv"
+
+
+def expected_points_root(season: str) -> Path:
+    return PREDICTIONS_ROOT / "expected_points" / season
+
+
 def understat_team_season_path(league: str, season: str) -> Path:
     return UNDERSTAT_ROOT / league / season / "team_season.csv"
 

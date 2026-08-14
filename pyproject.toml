@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 fpl-canonical = "fpl_assistant.canonical.cli:main"
+fpl-player-profiles = "fpl_assistant.providers.fpl.pipelines.player_profiles:main"
 
 [project.optional-dependencies]
 app = [
