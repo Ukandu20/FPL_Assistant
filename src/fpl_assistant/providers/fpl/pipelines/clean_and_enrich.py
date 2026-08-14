@@ -7,8 +7,9 @@ import logging
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from unidecode import unidecode
 
@@ -78,6 +79,18 @@ GOALKEEPER_PROVENANCE_COLUMNS = [
     "goalkeeper_stats_coverage",
 ]
 MODERN_PLAYER_STATS_START_SEASON = 2025
+PLAYER_BRIDGE_COLUMNS = [
+    "entity_type",
+    "provider",
+    "provider_id",
+    "provider_name",
+    "canonical_id",
+    "valid_from",
+    "valid_to",
+    "match_method",
+    "match_confidence",
+    "review_status",
+]
 
 def canonical(s: str) -> str:
     """Lowercase, accent-fold, treat separators as spaces, strip punctuation, squeeze."""
@@ -138,6 +151,30 @@ def write_json_utf8(p: Path, obj) -> None:
 def write_csv_utf8(p: Path, df: pd.DataFrame) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(p, index=False, encoding="utf-8")
+
+
+def atomic_write_json_utf8(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def atomic_write_csv_utf8(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False, encoding="utf-8")
+    temporary.replace(path)
+
+
+def normalized_provider_code(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return text[:-2] if text.endswith(".0") else text
 
 
 def normalise_fpl_position(value) -> Optional[str]:
@@ -877,6 +914,279 @@ def load_overrides(path: Optional[Path]) -> Dict[str, str]:
     logging.info("Overrides loaded: %d entries", len(out))
     return out
 
+
+def extend_player_name_lookup(
+    key2pid: Dict[str, str],
+    registry_root: Path,
+) -> None:
+    """Add unambiguous canonical names from the other player registries."""
+    candidates: Dict[str, set[str]] = {}
+    for key, player_id in key2pid.items():
+        candidates.setdefault(key, set()).add(str(player_id))
+
+    lookup_path = registry_root / "_id_lookup_players.json"
+    if lookup_path.is_file():
+        for name, player_id in read_json_flex(lookup_path).items():
+            candidates.setdefault(canonical(name), set()).add(str(player_id))
+
+    master_fpl_path = registry_root / "master_fpl.json"
+    if master_fpl_path.is_file():
+        master_fpl = read_json_flex(master_fpl_path)
+        for player_id, record in master_fpl.items():
+            if isinstance(record, Mapping) and record.get("name"):
+                candidates.setdefault(canonical(record["name"]), set()).add(
+                    str(player_id)
+                )
+
+    ambiguous = 0
+    for name_key, player_ids in candidates.items():
+        if len(player_ids) == 1:
+            key2pid[name_key] = next(iter(player_ids))
+        else:
+            ambiguous += 1
+    if ambiguous:
+        logging.warning(
+            "Player registry contains %d ambiguous canonical names; provider "
+            "codes or overrides are required for those names.",
+            ambiguous,
+        )
+
+
+def load_fpl_code_registry(
+    registry_root: Path,
+    processed_fpl_root: Path,
+    *,
+    target_season: str,
+) -> tuple[Dict[str, str], set[str]]:
+    """Load stable FPL-code identities from bridges and earlier seasons.
+
+    The target season is deliberately excluded so a prior erroneous generated
+    ID in that season cannot override the current 8-character policy.
+    """
+    code_to_pid: Dict[str, str] = {}
+    generated_codes: set[str] = set()
+
+    def add(code: Any, player_id: Any, *, generated: bool, source: str) -> None:
+        provider_code = normalized_provider_code(code)
+        canonical_id = "" if pd.isna(player_id) else str(player_id).strip()
+        if not provider_code or not canonical_id:
+            return
+        prior = code_to_pid.get(provider_code)
+        if prior and prior != canonical_id:
+            raise ValueError(
+                f"FPL provider code {provider_code} maps to both {prior} and "
+                f"{canonical_id} ({source})."
+            )
+        code_to_pid[provider_code] = canonical_id
+        if generated:
+            generated_codes.add(provider_code)
+
+    bridge_path = registry_root / "bridges" / "player_ids.csv"
+    if bridge_path.is_file():
+        bridges = pd.read_csv(bridge_path, dtype=str, keep_default_na=False)
+        fpl = (
+            bridges.loc[bridges["provider"].astype(str).str.lower().eq("fpl")]
+            if "provider" in bridges
+            else pd.DataFrame()
+        )
+        for row in fpl.to_dict("records"):
+            add(
+                row.get("provider_id"),
+                row.get("canonical_id"),
+                generated="generated" in str(row.get("match_method", "")).lower(),
+                source=str(bridge_path),
+            )
+
+    target_start = int(season_longform(target_season)[:4])
+    if processed_fpl_root.is_dir():
+        for season_dir in sorted(path for path in processed_fpl_root.iterdir() if path.is_dir()):
+            season_text = season_longform(season_dir.name)
+            if not re.fullmatch(r"\d{4}-\d{4}", season_text):
+                continue
+            if int(season_text[:4]) >= target_start:
+                continue
+            roster_path = season_dir / "season" / "cleaned_players.csv"
+            if not roster_path.is_file():
+                continue
+            roster = pd.read_csv(roster_path, dtype=str, low_memory=False)
+            if not {"fpl_code", "player_id"} <= set(roster.columns):
+                continue
+            for row in roster.to_dict("records"):
+                add(
+                    row.get("fpl_code"),
+                    row.get("player_id"),
+                    generated=str(row.get("player_id_source", "")).startswith(
+                        "generated_from_fpl_code"
+                    ),
+                    source=str(roster_path),
+                )
+    return code_to_pid, generated_codes
+
+
+def register_generated_players(
+    players: pd.DataFrame,
+    registration_mask: pd.Series,
+    *,
+    season: str,
+    league: str,
+    registry_root: Path,
+    compatibility_master_path: Path | None = None,
+    pid2rec: Dict[str, dict] | None = None,
+    key2pid: Dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Promote generated FPL identities into every maintained player registry."""
+    audit_columns = [
+        "player_id", "name", "fpl_code", "fpl_element_id", "team", "team_id",
+        "fpl_pos", "season", "registry_status",
+    ]
+    selected = players.loc[registration_mask].copy()
+    if selected.empty:
+        return pd.DataFrame(columns=audit_columns)
+    required = {"player_id", "name", "fpl_code", "team", "team_id", "fpl_pos"}
+    missing = sorted(required - set(selected.columns))
+    if missing:
+        raise ValueError(f"Generated player registration lacks columns: {missing}")
+    selected["fpl_code"] = selected["fpl_code"].map(normalized_provider_code)
+    selected = selected.drop_duplicates(["player_id", "fpl_code"])
+    if selected["player_id"].duplicated().any():
+        raise ValueError("A generated player ID is associated with multiple FPL codes.")
+    if selected["fpl_code"].duplicated().any():
+        raise ValueError("An FPL code is associated with multiple generated player IDs.")
+
+    master_path = registry_root / "master_players.json"
+    lookup_path = registry_root / "_id_lookup_players.json"
+    master_fpl_path = registry_root / "master_fpl.json"
+    bridge_path = registry_root / "bridges" / "player_ids.csv"
+    master = read_json_flex(master_path) if master_path.is_file() else {}
+    lookup = read_json_flex(lookup_path) if lookup_path.is_file() else {}
+    master_fpl = read_json_flex(master_fpl_path) if master_fpl_path.is_file() else {}
+    compatibility_master = (
+        read_json_flex(compatibility_master_path)
+        if compatibility_master_path and compatibility_master_path.is_file()
+        else None
+    )
+    bridges = (
+        pd.read_csv(bridge_path, dtype=str, keep_default_na=False)
+        if bridge_path.is_file()
+        else pd.DataFrame(columns=PLAYER_BRIDGE_COLUMNS)
+    )
+    for column in PLAYER_BRIDGE_COLUMNS:
+        if column not in bridges:
+            bridges[column] = ""
+    bridges = bridges[PLAYER_BRIDGE_COLUMNS].copy()
+
+    long_season = season_longform(season)
+    short_season = season_shortform(long_season)
+    audit_rows: list[dict[str, Any]] = []
+    for row in selected.to_dict("records"):
+        player_id = str(row["player_id"]).strip()
+        name = str(row["name"]).strip()
+        name_key = canonical(name)
+        fpl_code = normalized_provider_code(row["fpl_code"])
+        existing_record = master.get(player_id)
+        if existing_record and canonical(existing_record.get("name", "")) not in {"", name_key}:
+            raise ValueError(
+                f"Generated ID collision: {player_id} belongs to "
+                f"{existing_record.get('name')!r}, not {name!r}."
+            )
+        existing_lookup_id = lookup.get(name_key)
+        if existing_lookup_id and str(existing_lookup_id) != player_id:
+            raise ValueError(
+                f"Generated name collision: {name!r} already maps to "
+                f"{existing_lookup_id}, not {player_id}."
+            )
+        provider_rows = bridges.loc[
+            bridges["provider"].str.lower().eq("fpl")
+            & bridges["provider_id"].eq(fpl_code)
+        ]
+        if not provider_rows.empty and provider_rows["canonical_id"].ne(player_id).any():
+            raise ValueError(
+                f"FPL code {fpl_code} already maps to another canonical player ID."
+            )
+
+        fpl_pos = str(row.get("fpl_pos", "") or "").strip().upper()
+        team = str(row.get("team", "") or "").strip().upper()
+        team_id = str(row.get("team_id", "") or "").strip()
+        season_record = {
+            "team": team,
+            "team_id": team_id,
+            "position": fpl_pos,
+            "fpl_position": fpl_pos,
+            "position_detail": "UNK",
+            "league": league,
+        }
+        record = dict(existing_record or {})
+        record["name"] = record.get("name") or name
+        record.setdefault("nation", None)
+        record.setdefault("born", None)
+        record.setdefault("career", {})[long_season] = season_record
+        master[player_id] = record
+        lookup[name_key] = player_id
+
+        fpl_record = dict(master_fpl.get(player_id) or {})
+        fpl_record.update(
+            {
+                "first_name": row.get("first_name") if pd.notna(row.get("first_name")) else None,
+                "second_name": row.get("second_name") if pd.notna(row.get("second_name")) else None,
+                "name": fpl_record.get("name") or name,
+                "player_id": player_id,
+                "nation": fpl_record.get("nation"),
+                "born": fpl_record.get("born"),
+            }
+        )
+        fpl_record.setdefault("career", {})[short_season] = season_record
+        master_fpl[player_id] = fpl_record
+        if isinstance(compatibility_master, dict):
+            compatibility_master[player_id] = dict(fpl_record)
+
+        if provider_rows.empty:
+            bridges.loc[len(bridges)] = {
+                "entity_type": "player",
+                "provider": "fpl",
+                "provider_id": fpl_code,
+                "provider_name": name,
+                "canonical_id": player_id,
+                "valid_from": long_season,
+                "valid_to": "",
+                "match_method": "generated_from_fpl_code",
+                "match_confidence": "1.0",
+                "review_status": "needs_review",
+            }
+        audit_rows.append(
+            {
+                "player_id": player_id,
+                "name": name,
+                "fpl_code": fpl_code,
+                "fpl_element_id": row.get("fpl_element_id"),
+                "team": team,
+                "team_id": team_id,
+                "fpl_pos": fpl_pos,
+                "season": long_season,
+                "registry_status": "registered",
+            }
+        )
+
+    bridge_conflicts = bridges.groupby(["provider", "provider_id"])["canonical_id"].nunique()
+    if (bridge_conflicts > 1).any():
+        raise ValueError("Player provider bridge contains conflicting canonical IDs.")
+    atomic_write_json_utf8(master_path, master)
+    atomic_write_json_utf8(lookup_path, lookup)
+    atomic_write_json_utf8(master_fpl_path, master_fpl)
+    atomic_write_csv_utf8(
+        bridge_path,
+        bridges.sort_values(["provider", "provider_id"], kind="stable"),
+    )
+    if compatibility_master_path and isinstance(compatibility_master, dict):
+        atomic_write_json_utf8(compatibility_master_path, compatibility_master)
+
+    if pid2rec is not None:
+        for row in audit_rows:
+            pid2rec[row["player_id"]] = master[row["player_id"]]
+    if key2pid is not None:
+        for row in audit_rows:
+            key2pid[canonical(row["name"])] = row["player_id"]
+    return pd.DataFrame(audit_rows, columns=audit_columns)
+
 # ───────────────────────── Matching ─────────────────────────
 
 def _token_variants(key: str) -> List[str]:
@@ -984,7 +1294,11 @@ def enrich_season(season_dir: Path,
                   league: str = DEFAULT_FPL_LEAGUE,
                   fbref_root: Optional[Path] = None,
                   whoscored_root: Optional[Path] = None,
-                  understat_root: Optional[Path] = None) -> None:
+                  understat_root: Optional[Path] = None,
+                  registry_root: Optional[Path] = None,
+                  fpl_code_to_pid: Optional[Mapping[str, str]] = None,
+                  historically_generated_codes: Optional[set[str]] = None,
+                  compatibility_master_path: Optional[Path] = None) -> None:
     season = season_dir.name
     season_full = season_longform(season)
 
@@ -1013,11 +1327,31 @@ def enrich_season(season_dir: Path,
     else:
         df["name"] = df["name"].astype(str)
 
-    # Resolve player_id
-    df["player_id"] = df["name"].apply(lambda nm: resolve_player_id(nm, key2pid, overrides, threshold))
-    df["player_id_source"] = df["player_id"].map(
-        lambda value: "master_or_override" if pd.notna(value) else None
+    # Approved provider bridges are stronger identity evidence than names.
+    # Historical generated IDs are only fallbacks: a player may subsequently
+    # have acquired an established canonical identity in the main registry.
+    code_registry = dict(fpl_code_to_pid or {})
+    generated_code_registry = set(historically_generated_codes or set())
+    provider_codes = df.get(
+        "fpl_code", pd.Series("", index=df.index, dtype="string")
+    ).map(normalized_provider_code)
+    approved_code_registry = {
+        code: player_id
+        for code, player_id in code_registry.items()
+        if code not in generated_code_registry
+    }
+    df["player_id"] = provider_codes.map(approved_code_registry).astype("object")
+    df["player_id_source"] = pd.Series(
+        np.where(df["player_id"].notna(), "registry_fpl_code_bridge", None),
+        index=df.index,
+        dtype="object",
     )
+    unresolved = df["player_id"].isna()
+    df.loc[unresolved, "player_id"] = df.loc[unresolved, "name"].apply(
+        lambda name: resolve_player_id(name, key2pid, overrides, threshold)
+    )
+    name_resolved = unresolved & df["player_id"].notna()
+    df.loc[name_resolved, "player_id_source"] = "master_or_override"
 
     if "web_name" in df.columns:
         for idx in df.index[df["player_id"].isna()]:
@@ -1030,14 +1364,30 @@ def enrich_season(season_dir: Path,
                 df.at[idx, "player_id"] = player_id
                 df.at[idx, "player_id_source"] = "master_or_override_web_name"
 
-    generated_mask = pd.Series(False, index=df.index)
+    unresolved = df["player_id"].isna()
+    historical_ids = provider_codes.map(
+        {
+            code: player_id
+            for code, player_id in code_registry.items()
+            if code in generated_code_registry
+        }
+    )
+    historical_resolved = unresolved & historical_ids.notna()
+    df.loc[historical_resolved, "player_id"] = historical_ids.loc[
+        historical_resolved
+    ]
+    df.loc[historical_resolved, "player_id_source"] = (
+        "historical_generated_fpl_code"
+    )
+
+    generated_mask = df["player_id_source"].eq("historical_generated_fpl_code")
     if generate_missing_ids and "fpl_code" in df.columns:
         for idx in df.index[df["player_id"].isna()]:
             provider_code = df.at[idx, "fpl_code"]
             if pd.isna(provider_code) or not str(provider_code).strip():
                 continue
             df.at[idx, "player_id"] = stable_canonical_id(
-                "player", "fpl", str(provider_code), length=12
+                "player", "fpl", str(provider_code), length=8
             )
             df.at[idx, "player_id_source"] = "generated_from_fpl_code"
             generated_mask.at[idx] = True
@@ -1074,10 +1424,22 @@ def enrich_season(season_dir: Path,
                 continue
             provider_code = df.at[idx, "fpl_code"]
             df.at[idx, "player_id"] = stable_canonical_id(
-                "player", "fpl", str(provider_code), length=12
+                "player", "fpl", str(provider_code), length=8
             )
             df.at[idx, "player_id_source"] = "generated_from_fpl_code_duplicate"
             generated_mask.at[idx] = True
+
+    if df.loc[df["player_id"].notna(), "player_id"].duplicated().any():
+        duplicates = sorted(
+            df.loc[
+                df["player_id"].notna() & df["player_id"].duplicated(keep=False),
+                "player_id",
+            ].astype(str).unique()
+        )
+        raise ValueError(
+            "Player IDs remain duplicated after FPL-code resolution; possible "
+            f"8-character hash collision or ambiguous identity: {duplicates}"
+        )
 
     # Join FBref truth
     nations, borns, fb_positions, fb_teams, fplpos_from_master, master_names, has_career = [], [], [], [], [], [], []
@@ -1165,10 +1527,27 @@ def enrich_season(season_dir: Path,
         understat_root=understat_root,
     )
 
+    registry_audit = pd.DataFrame()
+    if registry_root is not None and generated_mask.any():
+        registry_audit = register_generated_players(
+            df,
+            generated_mask,
+            season=season_full,
+            league=league,
+            registry_root=registry_root,
+            compatibility_master_path=compatibility_master_path,
+            pid2rec=pid2rec,
+            key2pid=key2pid,
+        )
+
     # Review partitions
     unmatched_ids = df[df["player_id"].isna()].copy()
     # "no season entry" = player_id matched but FBref has no career record for this season
-    no_season_mask = df["player_id"].notna() & (~pd.Series(has_career, index=df.index))
+    no_season_mask = (
+        df["player_id"].notna()
+        & (~pd.Series(has_career, index=df.index))
+        & ~generated_mask
+    )
     no_season_rows = df[no_season_mask].copy()
 
     # Write enriched file (keep all rows; downstream can filter if needed)
@@ -1236,6 +1615,15 @@ def enrich_season(season_dir: Path,
             int(generated_mask.sum()),
             generated_csv,
         )
+        if not registry_audit.empty:
+            registry_csv = review_dir / f"registered_generated_ids_{season}.csv"
+            write_csv_utf8(registry_csv, registry_audit)
+            logging.warning(
+                "[%s] registered generated IDs=%d -> %s",
+                season,
+                len(registry_audit),
+                registry_csv,
+            )
 
     # Guardrail for unmatched percentage
     total = len(df)
@@ -1305,6 +1693,21 @@ def main() -> None:
                     help="Manual overrides JSON (e.g., 'first | last': 'pid')")
     ap.add_argument("--team-map", type=Path, default=None,
                     help="Optional team-code to canonical team_id JSON")
+    ap.add_argument(
+        "--registry-root",
+        type=Path,
+        default=None,
+        help=(
+            "Player registry root. Defaults to the parent of --fbref-master; "
+            "generated FPL identities are promoted here."
+        ),
+    )
+    ap.add_argument(
+        "--register-generated-players",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Promote generated FPL identities into canonical player registries.",
+    )
     ap.add_argument("--generate-missing-ids", action="store_true",
                     help="Generate deterministic canonical IDs from stable FPL codes")
     ap.add_argument("--threshold", type=int, default=85,
@@ -1374,8 +1777,15 @@ def main() -> None:
     pid2rec, key2pid = load_fbref_master(args.fbref_master)
     overrides = load_overrides(args.overrides)
     team_ids = load_team_id_lookup(args.team_map)
+    registry_root = args.registry_root or args.fbref_master.parent
+    extend_player_name_lookup(key2pid, registry_root)
 
     for season_dir in seasons:
+        fpl_code_to_pid, historically_generated_codes = load_fpl_code_registry(
+            registry_root,
+            args.proc_root,
+            target_season=season_dir.name,
+        )
         logging.info("Season %s …", season_dir.name)
         enrich_season(
             season_dir=season_dir,
@@ -1391,6 +1801,10 @@ def main() -> None:
             fbref_root=args.fbref_root,
             whoscored_root=args.whoscored_root,
             understat_root=args.understat_root,
+            registry_root=(registry_root if args.register_generated_players else None),
+            fpl_code_to_pid=fpl_code_to_pid,
+            historically_generated_codes=historically_generated_codes,
+            compatibility_master_path=args.proc_root / "master_fpl_players.json",
         )
 
 if __name__ == "__main__":

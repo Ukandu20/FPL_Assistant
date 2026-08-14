@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+import pytest
 
 from fpl_assistant.providers.fpl.pipelines.clean_and_enrich import (
     attach_fpl_context,
     enrich_season,
+    load_fpl_code_registry,
+    register_generated_players,
     reset_preseason_carryover,
 )
+from fpl_assistant.canonical.identity import stable_canonical_id
 from fpl_assistant.providers.fpl.pipelines.prices_from_merged import process_season
 from fpl_assistant.providers.fpl.paths import league_scoped_root
 from fpl_assistant.testing.paths import get_test_run_dir
@@ -134,6 +138,204 @@ def test_enrichment_generates_unique_preseason_ids_and_team_fallback():
     assert result.loc[result["team"] == "COV", "team_id_source"].item() == (
         "generated_from_fpl_code"
     )
+    generated = result[result["player_id_source"].eq("generated_from_fpl_code_duplicate")]
+    assert generated["player_id"].str.len().eq(8).all()
+    assert generated["player_id"].item() == stable_canonical_id(
+        "player", "fpl", "1002", length=8
+    )
+
+
+def test_canonical_name_identity_wins_over_historical_generated_fallback():
+    tmp_path = _case_dir("historical_generated_reconciliation")
+    raw_root = tmp_path / "raw"
+    proc_root = tmp_path / "processed"
+    season_dir = raw_root / "2026-2027"
+    (season_dir / "season").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"first_name": "Kostas", "second_name": "Tsimikas"}]
+    ).to_csv(season_dir / "season" / "cleaned_players.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "first_name": "Kostas",
+                "second_name": "Tsimikas",
+                "id": 1,
+                "team": 1,
+                "element_type": 2,
+                "web_name": "Tsimikas",
+                "code": 12345,
+            }
+        ]
+    ).to_csv(season_dir / "players_raw.csv", index=False)
+    pd.DataFrame([{"id": 1, "short_name": "LIV"}]).to_csv(
+        season_dir / "season" / "teams.csv", index=False
+    )
+
+    enrich_season(
+        season_dir=season_dir,
+        out_root=proc_root,
+        pid2rec={"6285d4dc": {"name": "Kostas Tsimikas", "career": {}}},
+        key2pid={"kostas tsimikas": "6285d4dc"},
+        overrides={},
+        team_ids={"LIV": "team-liv"},
+        generate_missing_ids=True,
+        threshold=85,
+        fail_if_unmatched_pct=0,
+        fpl_code_to_pid={"12345": "historical12"},
+        historically_generated_codes={"12345"},
+    )
+
+    result = pd.read_csv(
+        proc_root / "2026-2027" / "season" / "cleaned_players.csv"
+    )
+    assert result.loc[0, "player_id"] == "6285d4dc"
+    assert result.loc[0, "player_id_source"] == "master_or_override"
+
+
+def test_generated_players_are_promoted_to_all_player_registries():
+    tmp_path = _case_dir("registry_promotion")
+    registry = tmp_path / "registry"
+    bridge_dir = registry / "bridges"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    compatibility_master = tmp_path / "master_fpl_players.json"
+    (registry / "master_players.json").write_text(
+        json.dumps({"known": {"name": "Known Player", "career": {}}}),
+        encoding="utf-8",
+    )
+    (registry / "_id_lookup_players.json").write_text(
+        json.dumps({"known player": "known"}), encoding="utf-8"
+    )
+    (registry / "master_fpl.json").write_text(
+        json.dumps({"known": {"player_id": "known", "name": "Known Player", "career": {}}}),
+        encoding="utf-8",
+    )
+    compatibility_master.write_text("{}", encoding="utf-8")
+    pd.DataFrame(
+        [
+            {
+                "entity_type": "player",
+                "provider": "whoscored",
+                "provider_id": "1",
+                "provider_name": "Known Player",
+                "canonical_id": "known",
+                "valid_from": "",
+                "valid_to": "",
+                "match_method": "exact",
+                "match_confidence": 1.0,
+                "review_status": "approved",
+            }
+        ]
+    ).to_csv(bridge_dir / "player_ids.csv", index=False)
+    players = pd.DataFrame(
+        [
+            {
+                "player_id": "abc12345",
+                "name": "New Player",
+                "first_name": "New",
+                "second_name": "Player",
+                "fpl_code": "98765",
+                "fpl_element_id": 55,
+                "team": "COV",
+                "team_id": "team-cov",
+                "fpl_pos": "MID",
+            }
+        ]
+    )
+
+    audit = register_generated_players(
+        players,
+        pd.Series([True]),
+        season="2026-2027",
+        league="ENG-Premier League",
+        registry_root=registry,
+        compatibility_master_path=compatibility_master,
+    )
+    # Registration is idempotent and must not duplicate the provider bridge.
+    register_generated_players(
+        players,
+        pd.Series([True]),
+        season="2026-2027",
+        league="ENG-Premier League",
+        registry_root=registry,
+        compatibility_master_path=compatibility_master,
+    )
+
+    master = json.loads((registry / "master_players.json").read_text(encoding="utf-8"))
+    lookup = json.loads((registry / "_id_lookup_players.json").read_text(encoding="utf-8"))
+    master_fpl = json.loads((registry / "master_fpl.json").read_text(encoding="utf-8"))
+    compatibility = json.loads(compatibility_master.read_text(encoding="utf-8"))
+    bridges = pd.read_csv(bridge_dir / "player_ids.csv", dtype=str)
+    fpl_bridge = bridges[bridges["provider"].eq("fpl")]
+
+    assert audit.loc[0, "registry_status"] == "registered"
+    assert master["abc12345"]["career"]["2026-2027"]["team_id"] == "team-cov"
+    assert lookup["new player"] == "abc12345"
+    assert master_fpl["abc12345"]["career"]["2026-27"]["fpl_position"] == "MID"
+    assert compatibility["abc12345"]["player_id"] == "abc12345"
+    assert len(fpl_bridge) == 1
+    assert fpl_bridge.iloc[0]["provider_id"] == "98765"
+    assert fpl_bridge.iloc[0]["canonical_id"] == "abc12345"
+
+
+def test_fpl_code_registry_reuses_prior_season_id_but_excludes_target_output():
+    tmp_path = _case_dir("fpl_code_history")
+    registry = tmp_path / "registry"
+    (registry / "bridges").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=["provider", "provider_id", "canonical_id", "match_method"]).to_csv(
+        registry / "bridges" / "player_ids.csv", index=False
+    )
+    processed = tmp_path / "processed"
+    for season, player_id in (("2025-2026", "legacy12char"), ("2026-2027", "wrong12char")):
+        path = processed / season / "season"
+        path.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "fpl_code": "519440",
+                    "player_id": player_id,
+                    "player_id_source": "generated_from_fpl_code",
+                }
+            ]
+        ).to_csv(path / "cleaned_players.csv", index=False)
+
+    mapping, generated = load_fpl_code_registry(
+        registry, processed, target_season="2026-2027"
+    )
+
+    assert mapping["519440"] == "legacy12char"
+    assert "519440" in generated
+
+
+def test_generated_registration_refuses_name_collision():
+    tmp_path = _case_dir("registry_collision")
+    registry = tmp_path / "registry"
+    (registry / "bridges").mkdir(parents=True, exist_ok=True)
+    (registry / "master_players.json").write_text("{}", encoding="utf-8")
+    (registry / "master_fpl.json").write_text("{}", encoding="utf-8")
+    (registry / "_id_lookup_players.json").write_text(
+        json.dumps({"new player": "different-id"}), encoding="utf-8"
+    )
+    players = pd.DataFrame(
+        [
+            {
+                "player_id": "abc12345",
+                "name": "New Player",
+                "fpl_code": "98765",
+                "team": "COV",
+                "team_id": "team-cov",
+                "fpl_pos": "MID",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Generated name collision"):
+        register_generated_players(
+            players,
+            pd.Series([True]),
+            season="2026-2027",
+            league="ENG-Premier League",
+            registry_root=registry,
+        )
 
 
 def test_price_export_uses_preseason_roster_as_opening_gw1():
