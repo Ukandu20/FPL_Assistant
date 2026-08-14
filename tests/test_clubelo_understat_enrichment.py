@@ -12,8 +12,44 @@ from scripts.clubelo_pipeline.clean.clubelo_understat_enricher import (
     clean_clubelo_history,
     enrich_understat_match_df,
     find_elo_pair,
+    enrich_fixture_schedule_with_elo,
     run_pipeline,
 )
+
+
+def test_fixture_schedule_gets_dynamic_and_frozen_preseason_elo():
+    history = pd.DataFrame(
+        [
+            {"league": "ENG-Premier League", "team_code": "ARS", "from": pd.Timestamp("2025-08-01"), "to": pd.Timestamp("2025-08-17"), "elo": 1500.0},
+            {"league": "ENG-Premier League", "team_code": "ARS", "from": pd.Timestamp("2025-08-18"), "to": pd.Timestamp("2026-05-31"), "elo": 1510.0},
+            {"league": "ENG-Premier League", "team_code": "MUN", "from": pd.Timestamp("2025-08-01"), "to": pd.Timestamp("2025-08-17"), "elo": 1600.0},
+            {"league": "ENG-Premier League", "team_code": "MUN", "from": pd.Timestamp("2025-08-18"), "to": pd.Timestamp("2026-05-31"), "elo": 1590.0},
+        ]
+    )
+    fixtures = pd.DataFrame(
+        [
+            {"match_id": "m1", "team_id": "ars-id", "opponent_id": "mun-id", "team": "ARS", "home": "ARS", "away": "MUN", "is_home": 1, "date_sched": "2025-08-17", "date_played": "2025-08-17", "status": "finished", "result": "W"},
+            {"match_id": "m1", "team_id": "mun-id", "opponent_id": "ars-id", "team": "MUN", "home": "ARS", "away": "MUN", "is_home": 0, "date_sched": "2025-08-17", "date_played": "2025-08-17", "status": "finished", "result": "L"},
+            {"match_id": "m2", "team_id": "ars-id", "opponent_id": "mun-id", "team": "ARS", "home": "MUN", "away": "ARS", "is_home": 0, "date_sched": "2025-08-24", "date_played": "2025-08-24", "status": "finished", "result": "D"},
+            {"match_id": "m2", "team_id": "mun-id", "opponent_id": "ars-id", "team": "MUN", "home": "MUN", "away": "ARS", "is_home": 1, "date_sched": "2025-08-24", "date_played": "2025-08-24", "status": "finished", "result": "D"},
+        ]
+    )
+
+    out, missing, coverage = enrich_fixture_schedule_with_elo(
+        fixtures,
+        build_elo_lookup(history),
+        league="ENG-Premier League",
+        season="2025-2026",
+    )
+
+    arsenal = out[out["team"].eq("ARS")].reset_index(drop=True)
+    assert arsenal["elo_pre_match"].tolist() == [1500.0, 1510.0]
+    assert arsenal["elo_preseason"].tolist() == [1500.0, 1500.0]
+    assert arsenal["opponent_elo_preseason"].tolist() == [1600.0, 1600.0]
+    assert arsenal["elo_preseason_as_of"].eq("2025-08-16").all()
+    assert arsenal["elo_provider"].eq("clubelo").all()
+    assert missing.empty
+    assert coverage["coverage"] == 1.0
 
 
 def test_clean_clubelo_history_standardizes_dates_league_and_team_codes():

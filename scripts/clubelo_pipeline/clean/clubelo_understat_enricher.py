@@ -21,6 +21,7 @@ LOG = logging.getLogger("clubelo_understat")
 
 DEFAULT_RAW_CLUBELO_DIR = Path("data/raw/clubelo/team_history")
 DEFAULT_UNDERSTAT_ROOT = Path("data/processed/understat")
+DEFAULT_FIXTURE_ROOT = Path("data/processed/registry/fixtures")
 DEFAULT_OUT_ROOT = Path("data/processed/clubelo")
 DEFAULT_TEAMS_CONFIG = Path("data/config/teams.json")
 DEFAULT_ALIASES = Path("data/config/clubelo_team_aliases.json")
@@ -43,6 +44,16 @@ ELO_COLUMNS = [
     "opp_end_elo",
     "elo_diff_start",
     "elo_diff_end",
+]
+SCHEDULE_ELO_COLUMNS = [
+    "elo_pre_match",
+    "opponent_elo_pre_match",
+    "elo_diff_pre_match",
+    "elo_preseason",
+    "opponent_elo_preseason",
+    "elo_diff_preseason",
+    "elo_preseason_as_of",
+    "elo_provider",
 ]
 
 DEFAULT_TEAM_ALIASES: Dict[str, str] = {
@@ -353,6 +364,58 @@ def discover_understat_seasons(
     return out
 
 
+def discover_fixture_seasons(
+    fixture_root: Path,
+    *,
+    league: str = "ENG-Premier League",
+    leagues: Optional[Iterable[str]] = None,
+    seasons: Optional[Iterable[str]] = None,
+) -> list[SeasonInfo]:
+    """Discover canonical fixture calendars independently of match providers."""
+    if league not in LEAGUE_TO_CLUBELO:
+        return []
+    if leagues and league not in set(leagues):
+        return []
+    season_filter = set(seasons or [])
+    out: list[SeasonInfo] = []
+    if not fixture_root.exists():
+        return out
+    for season_dir in sorted(p for p in fixture_root.iterdir() if p.is_dir() and not p.name.startswith("_")):
+        if season_filter and season_dir.name not in season_filter:
+            continue
+        fixture_path = season_dir / "fixture_calendar.csv"
+        if not fixture_path.is_file():
+            continue
+        frame = pd.read_csv(fixture_path, dtype=str, keep_default_na=False)
+        date_col = next((c for c in ("date_sched", "game_date", "date_played") if c in frame), None)
+        dates = pd.to_datetime(frame[date_col], errors="coerce").dropna() if date_col else pd.Series(dtype="datetime64[ns]")
+        if dates.empty:
+            start_date, end_date = season_fallback_window(season_dir.name)
+        else:
+            start_date, end_date = dates.min().normalize(), dates.max().normalize()
+        out.append(SeasonInfo(league, season_dir.name, season_dir, start_date, end_date))
+    return out
+
+
+def merge_season_infos(*groups: Iterable[SeasonInfo]) -> list[SeasonInfo]:
+    merged: dict[tuple[str, str], SeasonInfo] = {}
+    for group in groups:
+        for info in group:
+            key = (info.league, info.season)
+            prior = merged.get(key)
+            if prior is None:
+                merged[key] = info
+            else:
+                merged[key] = SeasonInfo(
+                    info.league,
+                    info.season,
+                    prior.path,
+                    min(prior.start_date, info.start_date),
+                    max(prior.end_date, info.end_date),
+                )
+    return [merged[key] for key in sorted(merged)]
+
+
 def clean_clubelo_history(df: pd.DataFrame, *, source_file: str, resolver: TeamResolver) -> pd.DataFrame:
     out = standardize_colnames(df).copy()
     if "club" in out.columns and "team" not in out.columns:
@@ -516,6 +579,163 @@ def find_elo_pair(hist: Optional[pd.DataFrame], match_date: Any, *, is_result: b
     return EloPair(_active_start_elo(hist, date), None)
 
 
+def enrich_fixture_schedule_with_elo(
+    fixtures: pd.DataFrame,
+    elo_lookup: Dict[tuple[str, str], pd.DataFrame],
+    *,
+    league: str,
+    season: str,
+    source_path: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Attach dynamic pre-match and frozen preseason ClubElo features."""
+    out = fixtures.copy()
+    out = out.drop(columns=[c for c in SCHEDULE_ELO_COLUMNS if c in out], errors="ignore")
+    required = {"team", "team_id", "opponent_id", "home", "away", "date_sched"}
+    missing = sorted(required - set(out.columns))
+    if missing:
+        raise ValueError(f"Fixture calendar {source_path} lacks required columns: {missing}")
+    match_id_col = "match_id" if "match_id" in out else "fbref_id" if "fbref_id" in out else None
+    if match_id_col is None:
+        raise ValueError(f"Fixture calendar {source_path} lacks match_id/fbref_id")
+    if out.duplicated([match_id_col, "team_id"]).any():
+        raise ValueError(f"Fixture calendar {source_path} has duplicate ({match_id_col}, team_id) rows")
+
+    scheduled = pd.to_datetime(out["date_sched"], errors="coerce").dt.normalize()
+    if scheduled.notna().sum() == 0:
+        raise ValueError(f"Fixture calendar {source_path} has no valid scheduled dates")
+    preseason_as_of = scheduled.min() - pd.Timedelta(days=1)
+    played = (
+        pd.to_datetime(out["date_played"], errors="coerce").dt.normalize()
+        if "date_played" in out
+        else pd.Series(pd.NaT, index=out.index, dtype="datetime64[ns]")
+    )
+    match_dates = played.fillna(scheduled)
+    is_finished = (
+        out.get("status", pd.Series("", index=out.index))
+        .astype(str)
+        .str.lower()
+        .isin({"finished", "complete", "completed", "played"})
+    )
+    if "result" in out:
+        is_finished = is_finished | out["result"].astype(str).str.strip().ne("")
+
+    preseason: dict[str, Optional[float]] = {}
+    for code in sorted(out["team"].astype(str).str.upper().unique()):
+        pair = find_elo_pair(elo_lookup.get((league, code)), preseason_as_of, is_result=False)
+        preseason[code] = pair.start_elo
+
+    audit_rows: list[dict[str, Any]] = []
+    pre_match_values: list[Optional[float]] = []
+    opponent_pre_match_values: list[Optional[float]] = []
+    team_preseason_values: list[Optional[float]] = []
+    opponent_preseason_values: list[Optional[float]] = []
+    for position, (_, row) in enumerate(out.iterrows()):
+        team = str(row.get("team", "")).strip().upper()
+        is_home = bool(_to_bool(row.get("is_home", False)))
+        opponent = str(row.get("away" if is_home else "home", "")).strip().upper()
+        match_date = match_dates.iloc[position]
+        team_pair = find_elo_pair(
+            elo_lookup.get((league, team)), match_date, is_result=bool(is_finished.iloc[position])
+        )
+        opponent_pair = find_elo_pair(
+            elo_lookup.get((league, opponent)), match_date, is_result=bool(is_finished.iloc[position])
+        )
+        team_pre = preseason.get(team)
+        opponent_pre = preseason.get(opponent)
+        pre_match_values.append(team_pair.start_elo)
+        opponent_pre_match_values.append(opponent_pair.start_elo)
+        team_preseason_values.append(team_pre)
+        opponent_preseason_values.append(opponent_pre)
+        for side, code, value, reason in (
+            ("team_pre_match", team, team_pair.start_elo, team_pair.reason),
+            ("opponent_pre_match", opponent, opponent_pair.start_elo, opponent_pair.reason),
+            ("team_preseason", team, team_pre, "missing_preseason_elo" if team_pre is None else ""),
+            ("opponent_preseason", opponent, opponent_pre, "missing_preseason_elo" if opponent_pre is None else ""),
+        ):
+            if value is None:
+                audit_rows.append(
+                    {
+                        "source_path": source_path,
+                        "league": league,
+                        "season": season,
+                        "match_id": row.get(match_id_col, ""),
+                        "team": team,
+                        "side": side,
+                        "clubelo_team": code,
+                        "game_date": "" if pd.isna(match_date) else match_date.strftime("%Y-%m-%d"),
+                        "reason": reason or "missing_elo",
+                    }
+                )
+
+    out["elo_pre_match"] = pre_match_values
+    out["opponent_elo_pre_match"] = opponent_pre_match_values
+    out["elo_diff_pre_match"] = out["elo_pre_match"] - out["opponent_elo_pre_match"]
+    out["elo_preseason"] = team_preseason_values
+    out["opponent_elo_preseason"] = opponent_preseason_values
+    out["elo_diff_preseason"] = out["elo_preseason"] - out["opponent_elo_preseason"]
+    out["elo_preseason_as_of"] = preseason_as_of.strftime("%Y-%m-%d")
+    out["elo_provider"] = "clubelo"
+
+    missing_audit = pd.DataFrame(
+        audit_rows,
+        columns=[
+            "source_path", "league", "season", "match_id", "team", "side",
+            "clubelo_team", "game_date", "reason",
+        ],
+    )
+    elo_fields = [
+        "elo_pre_match", "opponent_elo_pre_match", "elo_preseason", "opponent_elo_preseason"
+    ]
+    complete_rows = out[elo_fields].notna().all(axis=1)
+    coverage = {
+        "league": league,
+        "season": season,
+        "source_path": source_path,
+        "rows": int(len(out)),
+        "matches": int(out[match_id_col].nunique()),
+        "teams": int(out["team_id"].nunique()),
+        "complete_rows": int(complete_rows.sum()),
+        "missing_rows": int((~complete_rows).sum()),
+        "coverage": float(complete_rows.mean()) if len(out) else 0.0,
+        "preseason_as_of": preseason_as_of.strftime("%Y-%m-%d"),
+    }
+    return out, missing_audit, coverage
+
+
+def write_clubelo_fixture_schedules(
+    fixture_seasons: list[SeasonInfo],
+    elo_lookup: Dict[tuple[str, str], pd.DataFrame],
+    *,
+    out_root: Path,
+) -> tuple[int, pd.DataFrame, Dict[str, Dict[str, Any]]]:
+    files_written = 0
+    audit_parts: list[pd.DataFrame] = []
+    coverage: Dict[str, Dict[str, Any]] = {}
+    for info in fixture_seasons:
+        source = info.path / "fixture_calendar.csv"
+        fixtures = pd.read_csv(source, dtype=str, keep_default_na=False)
+        enriched, missing, season_coverage = enrich_fixture_schedule_with_elo(
+            fixtures,
+            elo_lookup,
+            league=info.league,
+            season=info.season,
+            source_path=str(source),
+        )
+        destination = out_root / info.league / info.season / "schedule.csv"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        enriched.to_csv(destination, index=False)
+        audit_dir = destination.parent / "audits"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([season_coverage]).to_csv(audit_dir / "schedule_elo_coverage.csv", index=False)
+        missing.to_csv(audit_dir / "missing_schedule_elo.csv", index=False)
+        files_written += 1
+        if not missing.empty:
+            audit_parts.append(missing)
+        coverage[f"{info.league}/{info.season}"] = season_coverage
+    combined = pd.concat(audit_parts, ignore_index=True) if audit_parts else pd.DataFrame()
+    return files_written, combined, coverage
+
+
 def _first_existing_col(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
     for name in names:
         if name in df.columns:
@@ -658,6 +878,8 @@ def run_pipeline(
     *,
     raw_clubelo_dir: Path = DEFAULT_RAW_CLUBELO_DIR,
     understat_root: Path = DEFAULT_UNDERSTAT_ROOT,
+    fixture_root: Optional[Path] = None,
+    fixture_league: str = "ENG-Premier League",
     out_root: Path = DEFAULT_OUT_ROOT,
     teams_config_path: Path = DEFAULT_TEAMS_CONFIG,
     aliases_path: Path = DEFAULT_ALIASES,
@@ -678,7 +900,18 @@ def run_pipeline(
     if enriched_understat_root is None:
         enriched_understat_root = out_root / "understat"
     resolver = load_team_resolver(teams_config_path, aliases_path)
-    season_infos = discover_understat_seasons(understat_root, leagues=leagues, seasons=seasons)
+    understat_season_infos = discover_understat_seasons(understat_root, leagues=leagues, seasons=seasons)
+    fixture_season_infos = (
+        discover_fixture_seasons(
+            fixture_root,
+            league=fixture_league,
+            leagues=leagues,
+            seasons=seasons,
+        )
+        if fixture_root is not None
+        else []
+    )
+    season_infos = merge_season_infos(understat_season_infos, fixture_season_infos)
     clubelo_leagues = sorted({info.clubelo_league for info in season_infos})
 
     history, missing_mappings = load_clean_clubelo_histories(
@@ -689,9 +922,14 @@ def run_pipeline(
     processed_files = write_processed_clubelo_by_season(history, season_infos, out_root)
     elo_lookup = build_elo_lookup(history)
     enriched_files, missing_elo, coverage_counts = enrich_understat_files(
-        season_infos,
+        understat_season_infos,
         elo_lookup,
         enriched_root=enriched_understat_root,
+    )
+    schedule_files, missing_schedule_elo, schedule_coverage = write_clubelo_fixture_schedules(
+        fixture_season_infos,
+        elo_lookup,
+        out_root=out_root,
     )
     league_coverage: Dict[str, Dict[str, Any]] = {}
     failed_leagues: list[str] = []
@@ -708,22 +946,31 @@ def run_pipeline(
         }
         if coverage < min_coverage:
             failed_leagues.append(league)
+    for key, counts in sorted(schedule_coverage.items()):
+        if counts["coverage"] < min_coverage:
+            failed_leagues.append(key)
 
     summary = {
         "run_utc": datetime.now(timezone.utc).isoformat(),
         "raw_clubelo_dir": str(raw_clubelo_dir),
         "understat_root": str(understat_root),
+        "fixture_root": "" if fixture_root is None else str(fixture_root),
         "out_root": str(out_root),
         "source_files_modified": False,
         "enriched_understat_root": str(enriched_understat_root),
         "min_coverage": min_coverage,
         "league_coverage": league_coverage,
         "seasons_discovered": len(season_infos),
+        "understat_seasons_discovered": len(understat_season_infos),
+        "fixture_seasons_discovered": len(fixture_season_infos),
         "clubelo_rows_cleaned": int(len(history)),
         "clubelo_processed_files_written": int(processed_files),
         "understat_match_files_written": int(enriched_files),
+        "clubelo_schedule_files_written": int(schedule_files),
+        "schedule_coverage": schedule_coverage,
         "missing_team_mapping_groups": int(len(missing_mappings)),
         "missing_understat_elo_rows": int(len(missing_elo)),
+        "missing_schedule_elo_rows": int(len(missing_schedule_elo)),
     }
     write_audits(out_root, missing_mappings=missing_mappings, missing_elo=missing_elo, summary=summary)
     if failed_leagues and not allow_partial:
@@ -737,6 +984,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Clean ClubElo histories and enrich processed Understat match files")
     parser.add_argument("--raw-clubelo-dir", type=Path, default=DEFAULT_RAW_CLUBELO_DIR)
     parser.add_argument("--understat-root", type=Path, default=DEFAULT_UNDERSTAT_ROOT)
+    parser.add_argument("--fixture-root", type=Path, default=DEFAULT_FIXTURE_ROOT)
+    parser.add_argument("--fixture-league", default="ENG-Premier League")
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
     parser.add_argument("--teams-config", type=Path, default=DEFAULT_TEAMS_CONFIG)
     parser.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES)
@@ -760,6 +1009,8 @@ def main() -> int:
     summary = run_pipeline(
         raw_clubelo_dir=args.raw_clubelo_dir,
         understat_root=args.understat_root,
+        fixture_root=args.fixture_root,
+        fixture_league=args.fixture_league,
         out_root=args.out_root,
         teams_config_path=args.teams_config,
         aliases_path=args.aliases,

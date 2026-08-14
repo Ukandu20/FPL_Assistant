@@ -32,6 +32,8 @@ import pandas as pd
 from pandas.api.types import is_bool_dtype, is_numeric_dtype
 import numpy as np
 
+from fpl_assistant.canonical.identity import stable_canonical_id
+
 
 # ───────────────────── helpers ──────────────────────────────────────────────
 
@@ -88,6 +90,148 @@ def _naeq(a: pd.Series, b: pd.Series) -> pd.Series:
 def read_fixture_calendar(out_dir: Path, season: str) -> pd.DataFrame:
     fp = out_dir / season / "fixture_calendar.csv"
     return pd.read_csv(fp, parse_dates=["date_sched", "date_played"])
+
+
+def build_bootstrap_fixture_calendar(
+    *,
+    season: str,
+    league: str,
+    fpl_csv: Path,
+    teams_csv: Path,
+    team_map_fp: Path,
+    short_map_fp: Path,
+    out_dir: Path,
+    force: bool = False,
+) -> bool:
+    """Publish a schedule-only canonical calendar from official FPL fixtures.
+
+    This is deliberately independent of WhoScored, Understat, and FBref so
+    provider cleaners can resolve match identities before any match is played.
+    Domestic league home/away pairings are unique within a season, therefore
+    the stable ID intentionally excludes the mutable kickoff date.
+    """
+    dst_dir = out_dir / season
+    out_csv = dst_dir / "fixture_calendar.csv"
+    if out_csv.exists() and not force:
+        logging.info("%s • bootstrap calendar already exists – skip (use --force)", season)
+        return False
+    if not fpl_csv.is_file():
+        raise FileNotFoundError(fpl_csv)
+    if not teams_csv.is_file():
+        raise FileNotFoundError(teams_csv)
+
+    _, _, code2hex = build_maps(load_json(team_map_fp), load_json(short_map_fp))
+    fixtures = pd.read_csv(fpl_csv, parse_dates=["kickoff_time"])
+    teams = pd.read_csv(teams_csv)
+    required_fixtures = {"id", "event", "kickoff_time", "team_h", "team_a"}
+    required_teams = {"id", "name", "short_name"}
+    if missing := sorted(required_fixtures - set(fixtures.columns)):
+        raise ValueError(f"{fpl_csv} lacks required columns: {missing}")
+    if missing := sorted(required_teams - set(teams.columns)):
+        raise ValueError(f"{teams_csv} lacks required columns: {missing}")
+
+    team_rows = teams[["id", "name", "short_name"]].copy()
+    team_rows["short_name"] = team_rows["short_name"].astype("string").str.upper()
+    numeric_to_code = dict(zip(team_rows["id"], team_rows["short_name"]))
+    numeric_to_name = dict(zip(team_rows["id"], team_rows["name"]))
+    generated_codes: list[str] = []
+    for code in sorted(set(numeric_to_code.values())):
+        if code and code not in code2hex:
+            code2hex[code] = stable_canonical_id(
+                "team", "fpl", code, length=12
+            )
+            generated_codes.append(code)
+    if generated_codes:
+        logging.warning(
+            "%s • generated canonical team IDs from FPL codes absent from the "
+            "registry: %s",
+            season,
+            ", ".join(generated_codes),
+        )
+
+    records: list[dict] = []
+    for fixture in fixtures.itertuples(index=False):
+        home = str(numeric_to_code.get(fixture.team_h, "")).upper()
+        away = str(numeric_to_code.get(fixture.team_a, "")).upper()
+        home_id = code2hex.get(home)
+        away_id = code2hex.get(away)
+        if not home or not away or not home_id or not away_id:
+            raise ValueError(
+                f"Unable to resolve canonical teams for FPL fixture {fixture.id}: "
+                f"home={home!r}/{home_id!r}, away={away!r}/{away_id!r}"
+            )
+        match_id = stable_canonical_id(
+            "match", league, season, home_id, away_id, length=16
+        )
+        kickoff = pd.to_datetime(fixture.kickoff_time, utc=True, errors="coerce")
+        date_sched = kickoff.tz_convert(None).floor("D") if pd.notna(kickoff) else pd.NaT
+        status = "finished" if bool(getattr(fixture, "finished", False)) else "scheduled"
+        base = {
+            "fpl_id": fixture.id,
+            "match_id": match_id,
+            # Compatibility alias for downstream code that predates canonical
+            # match IDs. It is not evidence that FBref supplied this identity.
+            "fbref_id": match_id,
+            "gw_orig": fixture.event,
+            "gw_played": fixture.event if status == "finished" else pd.NA,
+            "date_sched": date_sched,
+            "date_played": date_sched if status == "finished" else pd.NaT,
+            "days_since_last_game": pd.NA,
+            "home": home,
+            "away": away,
+            "home_id": home_id,
+            "away_id": away_id,
+            "status": status,
+            "sched_missing": 0,
+            "venue": pd.NA,
+            "gf": getattr(fixture, "team_h_score", pd.NA),
+            "ga": getattr(fixture, "team_a_score", pd.NA),
+            "xga": pd.NA,
+            "xg": pd.NA,
+            "poss": pd.NA,
+            "result": pd.NA,
+            "is_promoted": pd.NA,
+            "is_relegated": pd.NA,
+            "home_name": numeric_to_name.get(fixture.team_h, home),
+            "away_name": numeric_to_name.get(fixture.team_a, away),
+        }
+        for is_home in (True, False):
+            row = dict(base)
+            row.update(
+                {
+                    "team": home if is_home else away,
+                    "team_id": home_id if is_home else away_id,
+                    "opponent_id": away_id if is_home else home_id,
+                    "is_home": int(is_home),
+                }
+            )
+            if not is_home:
+                row["gf"], row["ga"] = base["ga"], base["gf"]
+            records.append(row)
+
+    out = pd.DataFrame(records)
+    key = ["match_id", "team_id"]
+    if out.duplicated(key).any():
+        raise ValueError("Bootstrap calendar contains duplicate (match_id, team_id) rows")
+    expected_rows = 2 * len(fixtures)
+    if len(out) != expected_rows:
+        raise ValueError(f"Bootstrap calendar has {len(out)} rows; expected {expected_rows}")
+
+    ordered = [
+        "fpl_id", "match_id", "fbref_id", "gw_orig", "gw_played",
+        "date_sched", "date_played", "days_since_last_game", "team",
+        "team_id", "opponent_id", "is_home", "home", "away", "home_id",
+        "away_id", "status", "sched_missing", "venue", "gf", "ga", "xga",
+        "xg", "poss", "result", "is_promoted", "is_relegated",
+    ]
+    out = out[ordered].sort_values(["date_sched", "fpl_id", "is_home"], ascending=[True, True, False])
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    csv_out = out.copy()
+    for column in ("date_sched", "date_played"):
+        csv_out[column] = pd.to_datetime(csv_out[column], errors="coerce").dt.strftime("%Y-%m-%d")
+    csv_out.to_csv(out_csv, index=False)
+    logging.info("%s • bootstrap fixture_calendar.csv (%d rows)", season, len(out))
+    return True
 
 # ──────────────── NEW: sticky locking of schedule fields ─────────────────────
 
@@ -618,15 +762,31 @@ def run_batch(
     features_root: Path,
     views_subdir: str,
     match_tolerance_days: int,
-    force: bool
+    force: bool,
+    bootstrap: bool = False,
+    league: str = "ENG-Premier League",
 ):
     for season in seasons:
         fpl_csv = fpl_root / season / "season" / "fixtures.csv"
         fb_csv = fbref_league / season / "team_match" / "schedule.csv"
         ws_csv = whoscored_league / season / "team_match" / "schedule.csv"
         und_csv = understat_league / season / "schedule.csv"
-        teams_csv = fpl_root / season / "teams.csv"
+        teams_csv = fpl_root / season / "season" / "teams.csv"
+        if not teams_csv.is_file():
+            teams_csv = fpl_root / season / "teams.csv"
         try:
+            if bootstrap:
+                build_bootstrap_fixture_calendar(
+                    season=season,
+                    league=league,
+                    fpl_csv=fpl_csv,
+                    teams_csv=teams_csv,
+                    team_map_fp=team_map,
+                    short_map_fp=short_map,
+                    out_dir=out_dir,
+                    force=force,
+                )
+                continue
             build_fixture_calendar(
                 season=season,
                 fpl_csv=fpl_csv,
@@ -652,6 +812,15 @@ def run_batch(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season")
+    ap.add_argument("--league", default="ENG-Premier League")
+    ap.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help=(
+            "Build a schedule-only canonical fixture calendar from FPL fixtures. "
+            "Does not require cleaned WhoScored, Understat, or FBref data."
+        ),
+    )
     ap.add_argument("--fpl-root", type=Path, default=Path("data/raw/fpl/ENG-Premier League"))
     ap.add_argument("--fbref-league-dir", type=Path, default=Path("data/processed/fbref/ENG-Premier League"))
     ap.add_argument("--whoscored-league-dir", type=Path, default=Path("data/processed/whoscored/ENG-Premier League"))
@@ -697,6 +866,8 @@ def main():
         views_subdir=args.views_subdir,
         match_tolerance_days=args.match_tolerance_days,
         force=args.force,
+        bootstrap=args.bootstrap,
+        league=args.league,
     )
 
 if __name__ == "__main__":
