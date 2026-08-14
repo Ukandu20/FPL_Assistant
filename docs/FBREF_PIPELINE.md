@@ -220,8 +220,23 @@ the accepted surface above.
 
 ## 7. Build the canonical fixture calendar
 
-Build the calendar first without FDR. FBref `game_id` is the canonical match
-identifier; FPL supplies fixture IDs, gameweeks, and the scheduled calendar.
+For a new season, first bootstrap the calendar from FPL alone. This can run
+before WhoScored, Understat, or FBref has published match data and gives their
+cleaners a stable canonical `match_id` to resolve against.
+
+```powershell
+python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+  --bootstrap `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --fpl-root "data/raw/fpl/ENG-Premier League" `
+  --out-dir "data/processed/registry/fixtures" `
+  --force `
+  --log-level INFO
+```
+
+For a season with cleaned provider match data, build the full calendar without
+FDR. FPL supplies fixture IDs, gameweeks, and the scheduled calendar.
 
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `

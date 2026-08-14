@@ -138,3 +138,112 @@ Outputs are written below
 team, and match bridges are stored below `data/processed/registry/bridges/`.
 Use `--rebuild-provider-bridges` when deliberately re-evaluating WhoScored
 matches after changing identity rules; rows for other providers are preserved.
+
+Processing version `1.6.0` publishes the event feed's direct chance-quality and
+context signals throughout the player-match, player-season, team-match, and
+team-season table families. These include big chances created and taken, big
+chance conversion, error severity, completed crosses and pass-subtype success,
+assisted/first-touch/one-on-one/transition/set-piece shot splits, last-man and
+spatial defensive actions, high possessions won, defensive-third possessions
+lost, box entries by pass or inferred carry, carries, progressive carries,
+team big chances conceded, corners won, and offsides provoked. Season success
+rates are recomputed from summed numerators and denominators rather than
+averaging match percentages.
+
+The same contract also publishes penalty wins/concessions, completed corners
+and throw-ins with recomputed success rates, average team age,
+player height/weight, pass distance and direction, intentional/shot assists,
+shot body-part/technique/placement splits, goalkeeper save-location and
+distribution splits, shielding/overrun/good-skill actions, native dribbles
+lost, disallowed goals, and formation-change counts. Team schedules preserve
+the provider manager and country metadata when supplied.
+
+The raw field named `possession` is a minute-indexed activity map flattened by
+the scraper, not a team possession percentage, so version 1.6 deliberately
+does not publish it as possession share.
+
+Spatial definitions use WhoScored's team-relative 0-100 pitch coordinates.
+The attacking third begins at `x >= 66.7`; the defensive third is `x < 33.3`;
+and the own penalty area is `x <= 17` with `y` between 21 and 79. A high
+possession win is a recovery, interception, or successful tackle in the
+attacking third. A defensive-third loss is an unsuccessful pass or take-on,
+an error, or a dispossession there. A box entry by pass must start outside and
+finish inside the opponent penalty area. `big_chances_created` and
+`key_passes` honor the provider qualifier on any creating action, including a
+touch or rebound shot, rather than incorrectly restricting creation to passes.
+`shots_from_set_piece` is the complement of `open_play_shots` and includes
+corner, free-kick, and penalty contexts; the narrower context columns remain
+available separately.
+
+`shot_creating_actions` and `goal_creating_actions` count the direct player
+identified by WhoScored's assisted-shot `related_player_id`. They do not infer
+a second preceding action or a possession chain. Carries are conservatively
+inferred between consecutive same-team on-ball events separated by 1-10
+seconds and 3-60 metres; progressive carries advance at least 10 WhoScored
+x-coordinate units. A carry box entry starts outside and ends inside the
+opponent penalty area. Advanced modelling such as xT, passing networks, and
+broader possession-chain attribution is not part of this cleaning contract.
+
+Processing version `1.7.0` adds team defensive exposure by reversing the
+opponent's match row. It publishes total, on-target, off-target, blocked,
+post, box, outside-box, headed, open-play, set-piece, corner, direct-free-kick,
+penalty, and big-chance shots against. `shots_conceded` is an alias of
+`shots_against`. Box-entry exposure is split into pass and inferred-carry
+entries; `box_entries_against`, `box_entries_allowed`, and
+`box_entries_conceded` are definitionally identical aliases, with corresponding
+`*_by_pass_allowed` and `*_by_carry_allowed` aliases.
+
+The cleaner also writes
+`data/processed/whoscored/<league>/<season>/player_season/roles.csv`. This is an
+observed, season-specific set-piece hierarchy derived only from that season's
+events. Supported roles are `corner`, `penalty`, `direct_free_kick`,
+`free_kick`, `indirect_free_kick`, and `long_throw`. Corners always retain the
+single `corner` role; `side` identifies `left` or `right`. Rankings use recent
+events, attempts, and team opportunities in matches where the player recorded
+minutes. The artifact includes primary/secondary/backup ranks, confidence and
+provenance. It is never seeded from a prior season, so a preseason with no
+events publishes a schema-valid, zero-row `roles.csv`.
+
+### Bootstrap a new season and publish ClubElo fixtures
+
+At preseason, build the canonical fixture calendar directly from the official
+FPL schedule. This removes the circular dependency between the fixture calendar
+and cleaned WhoScored data:
+
+```powershell
+python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+  --bootstrap `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --fpl-root "data/raw/fpl/ENG-Premier League" `
+  --force
+```
+
+The bootstrap calendar has two team-perspective rows per match and stable
+`match_id` values based on league, season, home team, and away team. Kickoff
+changes therefore do not change match identity. With no matches played yet,
+publish WhoScored's schedule as an explicitly partial dataset:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.clean.whoscored_cleaner `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --allow-partial `
+  --force
+```
+
+Then publish the ClubElo-owned fixture schedule:
+
+```powershell
+python -m fpl_assistant.providers.clubelo.clean.clubelo_understat_enricher `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --fixture-root "data/processed/registry/fixtures"
+```
+
+This writes `data/processed/clubelo/<league>/<season>/schedule.csv` with dynamic
+`elo_pre_match` values and season-frozen `elo_preseason` values for both the
+team and opponent, their differences, `elo_preseason_as_of`, and
+`elo_provider`. The preseason cutoff is the day before the season's earliest
+scheduled fixture. Coverage and missing-rating audits are written beside the
+schedule under `audits/`.
