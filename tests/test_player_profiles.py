@@ -6,10 +6,19 @@ import pandas as pd
 import pytest
 
 from fpl_assistant.apps.viewmodels.player_card import (
+    comparable_players,
+    decision_factors,
     forecast_summary,
     latest_forecast_path,
     prepare_player_forecast,
+    prepare_player_fixtures,
+    player_placeholder_url,
+    player_photo_urls,
     profile_dimensions,
+    profile_trend,
+    recent_form_summary,
+    select_profile_snapshot,
+    team_badge_url,
 )
 from fpl_assistant.domain.player_profiles import build_player_profiles
 from fpl_assistant.providers.fpl.pipelines.player_profiles import (
@@ -229,3 +238,205 @@ def test_player_forecast_filters_season_and_deduplicates_fixture() -> None:
     assert result.iloc[0]["pred_minutes"] == 85
     assert summary["expected_points"] == pytest.approx(7.5)
     assert summary["next_fixture"] == "AAA (H)"
+
+
+def test_factual_fixtures_survive_missing_forecast() -> None:
+    schedule = pd.DataFrame(
+        {
+            "fpl_id": [1, 2, 3],
+            "gw_orig": [1, 2, 1],
+            "team": [10, 10, 20],
+            "opponent": ["AAA", "BBB", "CCC"],
+            "is_home": [True, False, True],
+            "date_sched": ["2026-08-21", "2026-08-29", "2026-08-22"],
+            "fdr": [2, 4, 3],
+        }
+    )
+
+    fixtures = prepare_player_fixtures(schedule, 10, forecast=pd.DataFrame())
+
+    assert fixtures["opponent"].tolist() == ["AAA", "BBB"]
+    assert fixtures.iloc[0]["fdr"] == 2
+    assert "xPts" not in fixtures
+
+
+def test_fixtures_are_enriched_when_forecast_is_available() -> None:
+    schedule = pd.DataFrame(
+        {
+            "fpl_id": [1],
+            "gw_orig": [1],
+            "team": [10],
+            "opponent": ["AAA"],
+            "is_home": [True],
+            "date_sched": ["2026-08-21"],
+            "fdr": [2],
+        }
+    )
+    forecast = pd.DataFrame(
+        {
+            "gw_orig": [1],
+            "opponent": ["AAA"],
+            "is_home": [True],
+            "pred_minutes": [82],
+            "xPts": [5.4],
+        }
+    )
+
+    fixtures = prepare_player_fixtures(schedule, 10, forecast=forecast)
+
+    assert fixtures.iloc[0]["pred_minutes"] == 82
+    assert fixtures.iloc[0]["xPts"] == pytest.approx(5.4)
+
+
+def test_profile_snapshot_uses_labelled_prior_baseline_when_current_is_empty() -> None:
+    current = pd.DataFrame(
+        {
+            "player_id": ["p1"],
+            "profile_status": ["Data unavailable"],
+            "production_archetype": ["Data Unavailable"],
+        }
+    )
+    previous = pd.DataFrame(
+        {
+            "player_id": ["p1"],
+            "profile_status": ["Established"],
+            "production_archetype": ["Playmaker"],
+        }
+    )
+
+    profile, season, is_carryover = select_profile_snapshot(
+        current,
+        previous,
+        "p1",
+        current_season="2026-2027",
+        previous_season="2025-2026",
+    )
+
+    assert profile is not None and profile["production_archetype"] == "Playmaker"
+    assert season == "2025-2026"
+    assert is_carryover is True
+
+
+def test_recent_form_and_comparable_players_are_decision_ready() -> None:
+    history = pd.DataFrame(
+        {
+            "GW": [1, 2, 3],
+            "Total FPL points": [2, 8, 6],
+            "Minutes": [90, 70, 25],
+            "Starts": [1, 1, 0],
+            "Returns": [0, 1, 1],
+        }
+    )
+    summary = recent_form_summary(history)
+    assert summary == {
+        "gameweeks": 3,
+        "points": 16.0,
+        "minutes": 185.0,
+        "appearances": 3,
+        "starts": 2,
+        "returns": 2,
+    }
+
+    players = pd.DataFrame(
+        {
+            "player_id": ["p1", "p2", "p3", "p4"],
+            "name": ["Selected", "Popular", "Scorer", "Too expensive"],
+            "team": ["AAA", "BBB", "CCC", "DDD"],
+            "fpl_pos": ["MID", "MID", "MID", "MID"],
+            "now_cost": [75, 76, 72, 90],
+            "total_points": [5, 4, 8, 20],
+            "selected_by_percent": [10, 20, 5, 30],
+        }
+    )
+    alternatives = comparable_players(players, "p1")
+    assert alternatives["Player"].tolist() == ["Scorer", "Popular"]
+
+
+def test_decision_factors_surface_fixture_profile_and_uncertainty() -> None:
+    fixtures = pd.DataFrame(
+        {
+            "opponent": ["AAA"],
+            "is_home": [True],
+            "fdr": [2],
+            "pred_minutes": [pd.NA],
+        }
+    )
+    profile = pd.Series(
+        {
+            "profile_status": "Established",
+            "goal_threat_percentile": 82,
+            "creativity_percentile": 65,
+            "defensive_threat_percentile": 40,
+            "fpl_pos": "MID",
+        }
+    )
+    positives, risks = decision_factors(
+        fixtures,
+        {},
+        profile,
+        None,
+        profile_is_carryover=True,
+    )
+
+    assert any("Favourable next fixture" in reason for reason in positives)
+    assert any("P82" in reason for reason in positives)
+    assert any("not been published" in risk for risk in risks)
+    assert any("previous-season baseline" in risk for risk in risks)
+
+
+def test_profile_trend_requires_compatible_reliable_seasons() -> None:
+    previous = pd.DataFrame(
+        {
+            "player_id": ["p1"],
+            "fpl_pos": ["MID"],
+            "profile_status": ["Established"],
+            "goal_threat_percentile": [60],
+            "creativity_percentile": [70],
+            "defensive_threat_percentile": [50],
+        }
+    )
+    current = previous.copy()
+    current["goal_threat_percentile"] = 80
+    current["creativity_percentile"] = 90
+    current["defensive_threat_percentile"] = 70
+
+    assert profile_trend(current, previous, "p1") == {
+        "label": "Rising",
+        "delta": 20.0,
+    }
+
+    current["profile_status"] = "Insufficient data"
+    assert profile_trend(current, previous, "p1") == {}
+
+
+def test_player_photo_urls_use_versioned_collection_without_legacy_prefix() -> None:
+    urls = player_photo_urls("223340.jpg", asset_version="25")
+
+    assert urls["current"] == (
+        "https://resources.premierleague.com/premierleague25/"
+        "photos/players/110x140/223340.png"
+    )
+    assert urls["legacy"] == (
+        "https://resources.premierleague.com/premierleague/"
+        "photos/players/110x140/p223340.png"
+    )
+    assert player_photo_urls("../../unsafe", asset_version="25") == {}
+    assert player_photo_urls("223340.jpg", asset_version="latest") == {}
+
+
+def test_player_placeholder_url_uses_versioned_collection() -> None:
+    assert player_placeholder_url(asset_version="25") == (
+        "https://resources.premierleague.com/premierleague25/"
+        "photos/players/110x140/placeholder.png"
+    )
+    assert player_placeholder_url(asset_version="latest") is None
+
+
+def test_team_badge_url_uses_validated_raw_fpl_code() -> None:
+    assert team_badge_url(3, asset_version="25") == (
+        "https://resources.premierleague.com/"
+        "premierleague25/badges-alt/3.svg"
+    )
+    assert team_badge_url("91", asset_version="25").endswith("/91.svg")
+    assert team_badge_url("../3", asset_version="25") is None
+    assert team_badge_url(3.5, asset_version="25") is None

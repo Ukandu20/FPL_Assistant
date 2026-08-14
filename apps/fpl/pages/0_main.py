@@ -1,3 +1,4 @@
+import importlib
 import json
 from html import escape
 from pathlib import Path
@@ -10,20 +11,39 @@ import streamlit_shadcn_ui as ui
 from apps.fpl.catalog import (
     PREDICTIONS_ROOT,
     FPL_ROOT,
+    PLAYER_IMAGE_CONFIG_PATH,
     PRICE_CATEGORY_CONFIG_PATH,
     discover_leagues as catalog_discover_leagues,
     discover_seasons as catalog_discover_seasons,
     file_version,
+    fpl_fixture_metadata_path,
     fpl_gameweeks_path,
     fpl_player_profiles_path,
+    fpl_raw_fixtures_path,
+    fpl_raw_players_path,
+    fpl_raw_teams_path,
     fpl_season_path,
 )
-from fpl_assistant.apps.viewmodels.player_card import (
-    forecast_summary,
-    latest_forecast_path,
-    prepare_player_forecast,
-    profile_dimensions,
-)
+from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
+
+
+# Streamlit reruns page modules without necessarily reloading their imported
+# dependencies. Reload this small, pure presentation module so newly added
+# helpers cannot remain missing in a long-running development server.
+player_card_viewmodels = importlib.reload(player_card_viewmodels)
+comparable_players = player_card_viewmodels.comparable_players
+decision_factors = player_card_viewmodels.decision_factors
+forecast_summary = player_card_viewmodels.forecast_summary
+latest_forecast_path = player_card_viewmodels.latest_forecast_path
+prepare_player_forecast = player_card_viewmodels.prepare_player_forecast
+prepare_player_fixtures = player_card_viewmodels.prepare_player_fixtures
+player_photo_urls = player_card_viewmodels.player_photo_urls
+player_placeholder_url = player_card_viewmodels.player_placeholder_url
+profile_dimensions = player_card_viewmodels.profile_dimensions
+profile_trend = player_card_viewmodels.profile_trend
+recent_form_summary = player_card_viewmodels.recent_form_summary
+select_profile_snapshot = player_card_viewmodels.select_profile_snapshot
+team_badge_url = player_card_viewmodels.team_badge_url
 
 
 st.set_page_config(page_title="Fantasy Premier League dashboard", layout="wide")
@@ -153,6 +173,18 @@ def load_price_category_config(
     if not PRICE_CATEGORY_CONFIG_PATH.is_file():
         return {}
     with PRICE_CATEGORY_CONFIG_PATH.open(encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+@st.cache_data(show_spinner=False)
+def load_player_image_config(
+    data_version: tuple[int, int] | None = None,
+) -> dict:
+    """Load the configurable official portrait collection version."""
+    del data_version
+    if not PLAYER_IMAGE_CONFIG_PATH.is_file():
+        return {"asset_version": "25"}
+    with PLAYER_IMAGE_CONFIG_PATH.open(encoding="utf-8") as config_file:
         return json.load(config_file)
 
 
@@ -401,6 +433,114 @@ def load_player_profiles(
 
 
 @st.cache_data(show_spinner=False)
+def load_raw_player_details(
+    csv_path: str, data_version: tuple[int, int] | None = None
+) -> pd.DataFrame:
+    """Load current FPL market, availability, set-piece and image metadata."""
+    del data_version
+    path = Path(csv_path)
+    if not path.is_file():
+        return pd.DataFrame()
+    details = pd.read_csv(path)
+    if "id" in details:
+        details["id"] = pd.to_numeric(details["id"], errors="coerce")
+    return details
+
+
+@st.cache_data(show_spinner=False)
+def load_raw_teams(
+    csv_path: str, data_version: tuple[int, int] | None = None
+) -> pd.DataFrame:
+    """Load the raw FPL team IDs and official badge codes."""
+    del data_version
+    path = Path(csv_path)
+    if not path.is_file():
+        return pd.DataFrame()
+    teams = pd.read_csv(path)
+    for column in ["id", "code"]:
+        if column in teams:
+            teams[column] = pd.to_numeric(teams[column], errors="coerce")
+    return teams
+
+
+@st.cache_data(show_spinner=False)
+def load_fixture_schedule(
+    metadata_path: str,
+    fixtures_path: str,
+    metadata_version: tuple[int, int] | None = None,
+    fixtures_version: tuple[int, int] | None = None,
+) -> pd.DataFrame:
+    """Build one factual upcoming-fixture row per team, independent of models."""
+    del metadata_version, fixtures_version
+    metadata_file = Path(metadata_path)
+    fixtures_file = Path(fixtures_path)
+    if not metadata_file.is_file() or not fixtures_file.is_file():
+        return pd.DataFrame()
+
+    metadata = pd.read_csv(metadata_file)
+    fixtures = pd.read_csv(fixtures_file)
+    required_metadata = {
+        "fpl_id", "team", "opp", "opp_short", "venue", "date_sched"
+    }
+    required_fixtures = {"id", "event", "team_h_difficulty", "team_a_difficulty"}
+    if not required_metadata.issubset(metadata) or not required_fixtures.issubset(fixtures):
+        return pd.DataFrame()
+
+    if "finished" in fixtures:
+        finished = fixtures["finished"].astype("string").str.lower().eq("true")
+        fixtures = fixtures.loc[~finished].copy()
+    fixture_columns = [
+        column
+        for column in [
+            "id",
+            "event",
+            "kickoff_time",
+            "team_h_difficulty",
+            "team_a_difficulty",
+        ]
+        if column in fixtures
+    ]
+    fixture_data = fixtures[fixture_columns].rename(
+        columns={"id": "fpl_id", "event": "gw_orig"}
+    )
+    schedule = metadata.merge(
+        fixture_data, on="fpl_id", how="inner", validate="many_to_one"
+    )
+    schedule["is_home"] = schedule["venue"].astype("string").str.lower().eq("home")
+    schedule["fdr"] = schedule["team_a_difficulty"]
+    schedule.loc[schedule["is_home"], "fdr"] = schedule.loc[
+        schedule["is_home"], "team_h_difficulty"
+    ]
+    schedule = schedule.rename(
+        columns={
+            "opp_short": "opponent",
+            "opp_name": "opponent_name",
+            "opp": "opponent_team_id",
+            "team_short": "team_code",
+        }
+    )
+    return schedule[
+        [
+            column
+            for column in [
+                "fpl_id",
+                "gw_orig",
+                "kickoff_time",
+                "date_sched",
+                "team",
+                "team_code",
+                "opponent",
+                "opponent_name",
+                "opponent_team_id",
+                "is_home",
+                "fdr",
+            ]
+            if column in schedule
+        ]
+    ].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
 def load_expected_points(
     forecast_path: str, data_version: tuple[int, int] | None = None
 ) -> pd.DataFrame:
@@ -459,6 +599,9 @@ def build_player_gameweek_history(
         numeric_column("goals_scored") * goal_multiplier.fillna(0)
     )
     player_gameweeks["assist_points"] = numeric_column("assists") * 3
+    player_gameweeks["returns"] = (
+        numeric_column("goals_scored") + numeric_column("assists")
+    )
     player_gameweeks["bonus_points"] = numeric_column("bonus")
     defensive_contribution = numeric_column("defensive_contribution")
     earned_defensive_points = (
@@ -526,6 +669,8 @@ def build_player_gameweek_history(
             Save_Points=("save_points", "sum"),
             Card_Points=("card_points", "sum"),
             Minutes=("minutes", "sum"),
+            Starts=("minutes", lambda values: int((values >= 60).sum())),
+            Returns=("returns", "sum"),
             Opponent=(opponent_column, combine_opponents),
             Fixtures=("round", "size"),
         )
@@ -791,7 +936,7 @@ def filter_player_pool(
     return pool
 
 
-def render_overview_tab(
+def _render_legacy_overview_tab(
     selected_record: pd.Series,
     total_record: pd.Series,
     raw_record: pd.Series,
@@ -895,6 +1040,401 @@ def render_overview_tab(
             f"{profile.get('production_archetype', 'profile')} · "
             f"Primary strength: {profile.get('primary_strength', '—')}"
         )
+
+
+def render_overview_tab(
+    player_name: str,
+    selected_season: str,
+    selected_record: pd.Series,
+    raw_record: pd.Series,
+    gameweek_history: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    forecast: pd.DataFrame,
+    profile: pd.Series | None,
+    profile_season: str | None,
+    profile_is_carryover: bool,
+    profile_trend_data: dict[str, float | str],
+    player_details: pd.Series | None,
+    team_badges: dict[int, str],
+    alternatives: pd.DataFrame,
+    data_freshness: dict[str, str],
+) -> None:
+    """Render a player-first, decision-oriented landing page."""
+
+    def number(value: object) -> float:
+        return pd.to_numeric(value, errors="coerce")
+
+    position = str(selected_record["Position"])
+    team = str(selected_record["Team"])
+    status_code = str(raw_record.get("status", "a")).strip().lower()
+    availability = {
+        "a": "Available",
+        "d": "Doubtful",
+        "i": "Injured",
+        "s": "Suspended",
+        "u": "Unavailable",
+        "n": "Unavailable",
+    }.get(status_code, "Status unknown")
+    status_color = "#16A34A" if availability == "Available" else "#D97706"
+    news = str(raw_record.get("news", "")).strip()
+    if news.lower() == "nan":
+        news = ""
+    ownership = number(raw_record.get("selected_by_percent"))
+    if player_details is not None:
+        ownership = number(player_details.get("selected_by_percent"))
+    selected_team_id = number(raw_record.get("fpl_team_numeric_id"))
+    selected_team_badge = (
+        None if pd.isna(selected_team_id) else team_badges.get(int(selected_team_id))
+    )
+    image_config = load_player_image_config(
+        file_version(PLAYER_IMAGE_CONFIG_PATH)
+    )
+    image_asset_version = str(image_config.get("asset_version", "25"))
+    placeholder_url = player_placeholder_url(asset_version=image_asset_version)
+
+    image_column, identity_column, market_column = st.columns([1, 4, 2])
+    with image_column:
+        photo = "" if player_details is None else str(player_details.get("photo", "")).strip()
+        photo_urls = player_photo_urls(
+            photo, asset_version=image_asset_version
+        )
+        initials = "".join(part[0] for part in player_name.split()[:2]).upper()
+        if photo_urls and placeholder_url:
+            st.markdown(
+                '<object type="image/png" width="110" height="140" '
+                f'data="{escape(photo_urls["current"])}" '
+                f'aria-label="{escape(player_name)} portrait">'
+                '<object type="image/png" width="110" height="140" '
+                f'data="{escape(photo_urls["legacy"])}" '
+                f'aria-label="{escape(player_name)} legacy portrait">'
+                f'<img src="{escape(placeholder_url)}" '
+                f'alt="{escape(player_name)} portrait unavailable" '
+                'width="110" height="140" style="object-fit:contain" />'
+                '</object>'
+                '</object>',
+                unsafe_allow_html=True,
+            )
+        elif placeholder_url:
+            st.markdown(
+                f'<img src="{escape(placeholder_url)}" '
+                f'alt="{escape(player_name)} portrait unavailable" '
+                'width="110" height="140" style="object-fit:contain" />',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="width:96px;height:96px;border-radius:50%;display:flex;'
+                'align-items:center;justify-content:center;background:#334155;color:white;'
+                f'font-size:1.75rem;font-weight:700">{escape(initials)}</div>',
+                unsafe_allow_html=True,
+            )
+    with identity_column:
+        st.markdown(f"## {player_name}")
+        badge_column, team_column = st.columns(
+            [1, 9], vertical_alignment="center"
+        )
+        if selected_team_badge:
+            badge_column.image(selected_team_badge, width=34)
+        team_column.markdown(f"**{team}** · {position} · {selected_season}")
+        st.markdown(
+            '<span style="display:inline-block;padding:.2rem .6rem;border-radius:999px;'
+            f'background:{status_color};color:white;font-size:.8rem;font-weight:600">'
+            f'{escape(availability)}</span>',
+            unsafe_allow_html=True,
+        )
+        if news:
+            st.caption(news)
+    with market_column:
+        market_metrics = st.columns(2)
+        market_metrics[0].metric("Price", str(selected_record["Price"]))
+        market_metrics[1].metric(
+            "Ownership", "—" if pd.isna(ownership) else f"{ownership:.1f}%"
+        )
+        st.caption(str(selected_record.get("Price Category", "Uncategorized")).replace(" Â· ", " · "))
+
+    st.markdown("### Next fixture")
+    with st.container(border=True):
+        if fixtures.empty:
+            st.info("No upcoming fixture is currently published for this team.")
+        else:
+            next_fixture = fixtures.iloc[0]
+            opponent = next_fixture.get("opponent_name", next_fixture.get("opponent", "—"))
+            opponent = str(opponent) if pd.notna(opponent) else str(next_fixture.get("opponent", "—"))
+            venue = "H" if bool(next_fixture.get("is_home")) else "A"
+            gw = number(next_fixture.get("gw_orig"))
+            fdr = number(next_fixture.get("fdr"))
+            predicted_minutes = number(next_fixture.get("pred_minutes"))
+            expected_points = number(next_fixture.get("xPts"))
+            date_value = pd.to_datetime(
+                next_fixture.get("kickoff_time", next_fixture.get("date_sched")),
+                errors="coerce",
+                utc=True,
+            )
+            date_label = (
+                "Date not confirmed"
+                if pd.isna(date_value)
+                else date_value.strftime("%a %d %b · %H:%M UTC")
+            )
+            opponent_team_id = number(next_fixture.get("opponent_team_id"))
+            opponent_badge = (
+                None
+                if pd.isna(opponent_team_id)
+                else team_badges.get(int(opponent_team_id))
+            )
+            fixture_metrics = st.columns(
+                [1, 2, 2, 1, 1, 1], vertical_alignment="center"
+            )
+            if opponent_badge:
+                fixture_metrics[0].image(opponent_badge, width=48)
+            fixture_metrics[1].metric("Opponent", f"{opponent} ({venue})")
+            fixture_metrics[2].metric("Kick-off", date_label)
+            fixture_metrics[3].metric("Gameweek", "—" if pd.isna(gw) else f"GW{gw:.0f}")
+            fixture_metrics[4].metric("FDR", "—" if pd.isna(fdr) else f"{fdr:.0f}/5")
+            fixture_metrics[5].metric(
+                "Next xPts",
+                "Not published" if pd.isna(expected_points) else f"{expected_points:.1f}",
+            )
+            st.caption(
+                "Predicted minutes: "
+                + ("not published" if pd.isna(predicted_minutes) else f"{predicted_minutes:.0f}")
+                + ". Fixture facts remain visible independently of model availability."
+            )
+
+    recent = recent_form_summary(gameweek_history)
+    st.markdown("### Decision snapshot")
+    snapshot = st.columns(4)
+    snapshot[0].metric(
+        "Recent form",
+        "Preseason / no games"
+        if not recent
+        else f"{recent['points']:.0f} pts · last {recent['gameweeks']} GWs",
+    )
+    next_minutes = pd.NA if fixtures.empty else number(fixtures.iloc[0].get("pred_minutes"))
+    snapshot[1].metric(
+        "Minutes security",
+        "Forecast not published" if pd.isna(next_minutes) else f"{next_minutes:.0f} next match",
+        None if not recent else f"{recent['starts']} starts · last {recent['gameweeks']} GWs",
+    )
+    if player_details is None:
+        snapshot[2].metric("Market movement", "Unavailable")
+        snapshot[3].metric("FPL next estimate", "Unavailable")
+    else:
+        net_transfers = number(player_details.get("transfers_in_event")) - number(
+            player_details.get("transfers_out_event")
+        )
+        price_change = number(player_details.get("cost_change_event"))
+        snapshot[2].metric(
+            "Net transfers this GW",
+            "—" if pd.isna(net_transfers) else f"{net_transfers:+,.0f}",
+            None if pd.isna(price_change) else f"{price_change / 10:+.1f}m price change",
+        )
+        ep_next = number(player_details.get("ep_next"))
+        snapshot[3].metric(
+            "FPL next estimate", "—" if pd.isna(ep_next) else f"{ep_next:.1f} pts"
+        )
+
+    st.markdown("#### Current-season snapshot")
+    season_minutes = number(raw_record.get("minutes"))
+    season_points = number(raw_record.get("total_points"))
+    price_tenths = number(raw_record.get("now_cost"))
+    points_per_million = (
+        pd.NA
+        if pd.isna(season_points) or pd.isna(price_tenths) or price_tenths <= 0
+        else season_points / (price_tenths / 10)
+    )
+    season_metrics = st.columns(5)
+    season_metrics[0].metric(
+        "FPL points", "—" if pd.isna(season_points) else f"{season_points:.0f}"
+    )
+    if is_goalkeeper_position(position):
+        season_metrics[1].metric(
+            "Saves", "—" if pd.isna(number(raw_record.get("saves"))) else f"{number(raw_record.get('saves')):.0f}"
+        )
+        save_pct = number(raw_record.get("save_pct"))
+        season_metrics[2].metric("Save %", "—" if pd.isna(save_pct) else f"{save_pct:.1f}%")
+    else:
+        goals = number(raw_record.get("goals_scored"))
+        assists = number(raw_record.get("assists"))
+        season_metrics[1].metric("Goals", "—" if pd.isna(goals) else f"{goals:.0f}")
+        season_metrics[2].metric("Assists", "—" if pd.isna(assists) else f"{assists:.0f}")
+    expected_involvement = number(raw_record.get("xg")) + number(raw_record.get("xa"))
+    season_metrics[3].metric(
+        "xGI", "—" if pd.isna(expected_involvement) else f"{expected_involvement:.2f}"
+    )
+    season_metrics[4].metric(
+        "Points / £m",
+        "—" if pd.isna(points_per_million) else f"{points_per_million:.1f}",
+    )
+    if pd.isna(season_minutes) or season_minutes == 0:
+        st.caption(
+            "Preseason state: current-season production is shown as zero; use the "
+            "labelled prior profile and upcoming fixtures for context."
+        )
+
+    profile_column, fixture_column = st.columns([3, 2])
+    with profile_column:
+        st.markdown("### Player DNA")
+        with st.container(border=True):
+            if profile is None or str(profile.get("profile_status")) not in {
+                "Established", "Provisional"
+            }:
+                st.info("No reliable current or prior-season production profile is available.")
+            else:
+                provenance = (
+                    f"Previous-season baseline ({profile_season})"
+                    if profile_is_carryover
+                    else f"Current-season evidence ({profile_season})"
+                )
+                reliability = number(profile.get("reliability"))
+                st.markdown(
+                    f"#### {profile.get('production_tier', 'Unrated')} "
+                    f"{profile.get('production_archetype', 'profile')}"
+                )
+                st.caption(
+                    f"{provenance} · {profile.get('profile_status', 'Unknown')}"
+                    + ("" if pd.isna(reliability) else f" · {reliability * 100:.0f}% reliability")
+                )
+                for dimension in profile_dimensions(profile):
+                    percentile = float(dimension["Percentile"])
+                    st.markdown(
+                        f"**{dimension['Dimension']}** · P{percentile:.0f}"
+                    )
+                    st.progress(percentile / 100)
+                characteristics = [
+                    item.strip()
+                    for item in str(profile.get("playing_characteristics", "")).split(";")
+                    if item.strip()
+                ]
+                set_piece_roles = []
+                if player_details is not None:
+                    for column, label in [
+                        ("penalties_order", "First-choice penalties"),
+                        ("corners_and_indirect_freekicks_order", "First-choice corners"),
+                        ("direct_freekicks_order", "First-choice direct free-kicks"),
+                    ]:
+                        if number(player_details.get(column)) == 1:
+                            set_piece_roles.append(label)
+                for characteristic in [*characteristics[:3], *set_piece_roles]:
+                    st.markdown(f"- {characteristic}")
+                if profile_trend_data:
+                    trend_delta = float(profile_trend_data["delta"])
+                    st.caption(
+                        f"Season-over-season profile trend: {profile_trend_data['label']} "
+                        f"({trend_delta:+.1f} average percentile points)."
+                    )
+                else:
+                    st.caption(
+                        "Profile trend requires compatible, reliable profiles in "
+                        "both the current and previous seasons."
+                    )
+
+    with fixture_column:
+        st.markdown("### Fixture run")
+        if fixtures.empty:
+            st.info("Fixture schedule unavailable.")
+        else:
+            fixture_table = fixtures.copy()
+            fixture_table["GW"] = pd.to_numeric(
+                fixture_table["gw_orig"], errors="coerce"
+            ).map(lambda value: f"GW{value:.0f}" if pd.notna(value) else "—")
+            fixture_table["Fixture"] = fixture_table["opponent"].astype(str) + fixture_table[
+                "is_home"
+            ].map({True: " (H)", False: " (A)"})
+            fixture_table["Badge"] = pd.to_numeric(
+                fixture_table.get("opponent_team_id"), errors="coerce"
+            ).map(
+                lambda value: (
+                    team_badges.get(int(value), "") if pd.notna(value) else ""
+                )
+            )
+            fixture_table["Date"] = pd.to_datetime(
+                fixture_table["date_sched"], errors="coerce"
+            ).dt.strftime("%d %b")
+            fixture_table["FDR"] = pd.to_numeric(fixture_table.get("fdr"), errors="coerce")
+            fixture_table["xPts"] = pd.to_numeric(fixtures.get("xPts"), errors="coerce")
+            fixture_table["Pred mins"] = pd.to_numeric(
+                fixtures.get("pred_minutes"), errors="coerce"
+            )
+            st.dataframe(
+                fixture_table[
+                    ["Badge", "GW", "Fixture", "Date", "FDR", "xPts", "Pred mins"]
+                ],
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Badge": st.column_config.ImageColumn("", width="small")
+                },
+            )
+            summary = forecast_summary(forecast)
+            if summary:
+                forecast_gws = pd.to_numeric(forecast["gw_orig"], errors="coerce")
+                st.caption(
+                    f"GW{forecast_gws.min():.0f}–GW{forecast_gws.max():.0f}: "
+                    f"{summary['expected_points']:.1f} xPts and "
+                    f"{summary['predicted_minutes']:.0f} projected minutes."
+                )
+            else:
+                st.caption("Forecast values will appear here when the model publishes them.")
+
+    if not gameweek_history.empty:
+        st.markdown("### Recent evidence")
+        trend = gameweek_history.tail(5).copy()
+        trend["GW label"] = "GW" + trend["GW"].astype(str)
+        figure = px.bar(
+            trend,
+            x="GW label",
+            y="Total FPL points",
+            text_auto=".0f",
+            custom_data=["Minutes", "Opponent", "Starts", "Returns"],
+            title="Points and playing time across the last five gameweeks",
+        )
+        figure.update_traces(
+            hovertemplate=(
+                "<b>%{x}</b><br>Points: %{y:.0f}<br>Minutes: %{customdata[0]:.0f}"
+                "<br>Opponent: %{customdata[1]}<br>Starts: %{customdata[2]:.0f}"
+                "<br>Returns: %{customdata[3]:.0f}<extra></extra>"
+            )
+        )
+        figure.update_layout(height=280, margin=dict(t=45, b=15, l=15, r=15))
+        st.plotly_chart(figure, width="stretch")
+
+    positives, risks = decision_factors(
+        fixtures,
+        recent,
+        profile,
+        player_details,
+        profile_is_carryover=profile_is_carryover,
+    )
+    positive_column, risk_column = st.columns(2)
+    with positive_column:
+        st.markdown("### Case for")
+        with st.container(border=True):
+            if positives:
+                for reason in positives:
+                    st.markdown(f"- {reason}")
+            else:
+                st.caption("No strong positive signal is supported by the available data yet.")
+    with risk_column:
+        st.markdown("### Risks and uncertainty")
+        with st.container(border=True):
+            if risks:
+                for risk in risks:
+                    st.markdown(f"- {risk}")
+            else:
+                st.caption("No material risk flag is present in the available data.")
+
+    st.markdown("### Comparable alternatives")
+    st.caption("Same-position players within £0.5m, ranked by current points then ownership.")
+    if alternatives.empty:
+        st.info("No comparable alternatives are available in the selected player pool.")
+    else:
+        st.dataframe(alternatives, hide_index=True, width="stretch")
+
+    freshness = " · ".join(
+        f"{label}: {value}" for label, value in data_freshness.items()
+    )
+    if freshness:
+        st.caption(f"Data provenance — {freshness}")
 
 
 def render_performance_tab(
@@ -1174,8 +1714,12 @@ def main() -> None:
     if saved_season not in seasons:
         saved_season = seasons[0]
 
-    st.subheader("Filters")
-    with st.container(border=True):
+    with st.expander(
+        "Find or switch player",
+        expanded=not bool(
+            st.session_state.get(f"historical_player_{reset_version}")
+        ),
+    ):
         season_column, team_column, category_column, price_column = st.columns(4)
 
         with season_column:
@@ -1328,7 +1872,7 @@ def main() -> None:
         with mode_column:
             per_90 = ui.switch(
                 "Per 90",
-                value=bool(saved_filters.get("per_90", True)),
+                value=bool(saved_filters.get("per_90", False)),
                 key=f"player_metric_mode_{reset_version}",
             )
             st.caption("Per-90 metrics" if per_90 else "Total metrics")
@@ -1382,15 +1926,6 @@ def main() -> None:
     percentile_table = build_metric_percentile_table(history, per_90=per_90)
 
     selected_record = history.loc[history["Season"].eq(selected_season)].iloc[0]
-    if per_90:
-        total_history = build_player_history(
-            players, selected_player_id, per_90=False
-        )
-        total_record = total_history.loc[
-            total_history["Season"].eq(selected_season)
-        ].iloc[0]
-    else:
-        total_record = selected_record
     raw_rows = season_players.loc[
         season_players["player_id"].astype("string").eq(str(selected_player_id))
     ]
@@ -1398,19 +1933,6 @@ def main() -> None:
         st.warning("The selected player is missing from the season roster.")
         return
     raw_record = raw_rows.iloc[0]
-
-    st.markdown(
-        (
-            '<div style="display:flex;align-items:baseline;gap:0.75rem;'
-            'flex-wrap:wrap;margin-bottom:0.5rem">'
-            f'<h3 style="margin:0">{escape(str(player_name))}</h3>'
-            '<span style="color:var(--text-color);opacity:0.65;font-size:0.9rem">'
-            f'{escape(str(selected_record["Team"]))} &bull; '
-            f'{escape(str(selected_record["Position"]))}'
-            "</span></div>"
-        ),
-        unsafe_allow_html=True,
-    )
 
     gameweek_path = fpl_gameweeks_path(league, selected_season)
     gameweeks = load_gameweek_fpl(
@@ -1437,26 +1959,108 @@ def main() -> None:
 
     profile_path = fpl_player_profiles_path(league, selected_season)
     profiles = load_player_profiles(str(profile_path), file_version(profile_path))
-    if profiles.empty or "player_id" not in profiles:
-        selected_profile = None
+    season_index = seasons.index(selected_season)
+    previous_season = (
+        seasons[season_index + 1] if season_index + 1 < len(seasons) else None
+    )
+    if previous_season is None:
+        previous_profile_path = None
+        previous_profiles = pd.DataFrame()
     else:
-        profile_rows = profiles.loc[
-            profiles["player_id"].astype("string").eq(str(selected_player_id))
-        ]
-        selected_profile = None if profile_rows.empty else profile_rows.iloc[0]
+        previous_profile_path = fpl_player_profiles_path(league, previous_season)
+        previous_profiles = load_player_profiles(
+            str(previous_profile_path), file_version(previous_profile_path)
+        )
+    selected_profile, selected_profile_season, profile_is_carryover = (
+        select_profile_snapshot(
+            profiles,
+            previous_profiles,
+            str(selected_player_id),
+            current_season=selected_season,
+            previous_season=previous_season,
+        )
+    )
+    selected_profile_trend = profile_trend(
+        profiles, previous_profiles, str(selected_player_id)
+    )
+
+    details_path = fpl_raw_players_path(league, selected_season)
+    raw_details = load_raw_player_details(
+        str(details_path), file_version(details_path)
+    )
+    fpl_element_id = pd.to_numeric(raw_record.get("fpl_element_id"), errors="coerce")
+    if raw_details.empty or "id" not in raw_details or pd.isna(fpl_element_id):
+        selected_details = None
+    else:
+        detail_rows = raw_details.loc[raw_details["id"].eq(fpl_element_id)]
+        selected_details = None if detail_rows.empty else detail_rows.iloc[0]
+
+    teams_path = fpl_raw_teams_path(league, selected_season)
+    raw_teams = load_raw_teams(str(teams_path), file_version(teams_path))
+    image_config = load_player_image_config(
+        file_version(PLAYER_IMAGE_CONFIG_PATH)
+    )
+    asset_version = str(image_config.get("asset_version", "25"))
+    team_badges: dict[int, str] = {}
+    if {"id", "code"}.issubset(raw_teams.columns):
+        for team_row in raw_teams[["id", "code"]].dropna().itertuples(index=False):
+            badge = team_badge_url(team_row.code, asset_version=asset_version)
+            if badge:
+                team_badges[int(team_row.id)] = badge
+
+    metadata_path = fpl_fixture_metadata_path(league, selected_season)
+    raw_fixtures_path = fpl_raw_fixtures_path(league, selected_season)
+    fixture_schedule = load_fixture_schedule(
+        str(metadata_path),
+        str(raw_fixtures_path),
+        file_version(metadata_path),
+        file_version(raw_fixtures_path),
+    )
+    player_fixtures = prepare_player_fixtures(
+        fixture_schedule,
+        raw_record.get("fpl_team_numeric_id"),
+        forecast=player_forecast,
+        limit=5,
+    )
+    alternatives = comparable_players(
+        season_players, str(selected_player_id), price_tolerance=5, limit=3
+    )
+
+    def updated_label(path: Path | None) -> str:
+        if path is None or not path.is_file():
+            return "unavailable"
+        return pd.Timestamp(path.stat().st_mtime, unit="s").strftime("%d %b %Y %H:%M")
+
+    profile_freshness_path = (
+        previous_profile_path if profile_is_carryover else profile_path
+    )
+    data_freshness = {
+        "roster": updated_label(fpl_season_path(league, selected_season)),
+        "fixtures": updated_label(raw_fixtures_path),
+        "profile": updated_label(profile_freshness_path),
+        "forecast": updated_label(forecast_path),
+    }
 
     overview_tab, performance_tab, forecast_tab, history_tab, profile_tab = st.tabs(
         ["Overview", "Performance", "Forecast", "History", "Profile"]
     )
     with overview_tab:
         render_overview_tab(
+            player_name,
+            selected_season,
             selected_record,
-            total_record,
             raw_record,
             gameweek_history,
+            player_fixtures,
             player_forecast,
             selected_profile,
-            per_90=per_90,
+            selected_profile_season,
+            profile_is_carryover,
+            selected_profile_trend,
+            selected_details,
+            team_badges,
+            alternatives,
+            data_freshness,
         )
     with performance_tab:
         render_performance_tab(
@@ -1473,7 +2077,16 @@ def main() -> None:
             per_90=per_90,
         )
     with profile_tab:
-        render_profile_tab(player_name, selected_season, selected_profile)
+        if profile_is_carryover:
+            st.info(
+                f"Showing the {selected_profile_season} profile as a preseason "
+                "baseline because current-season evidence is not yet sufficient."
+            )
+        render_profile_tab(
+            player_name,
+            selected_profile_season or selected_season,
+            selected_profile,
+        )
 
 
 if __name__ == "__main__":

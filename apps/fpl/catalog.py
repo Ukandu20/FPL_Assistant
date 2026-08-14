@@ -7,10 +7,14 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
+RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 FPL_ROOT = PROCESSED_ROOT / "fpl"
+RAW_FPL_ROOT = RAW_ROOT / "fpl"
 UNDERSTAT_ROOT = PROCESSED_ROOT / "understat"
 PREDICTIONS_ROOT = PROJECT_ROOT / "data" / "predictions"
+FIXTURE_REGISTRY_ROOT = PROCESSED_ROOT / "registry" / "fixtures"
 PRICE_CATEGORY_CONFIG_PATH = PROJECT_ROOT / "config" / "fpl_price_categories.json"
+PLAYER_IMAGE_CONFIG_PATH = PROJECT_ROOT / "config" / "fpl_image_assets.json"
 
 
 def discover_leagues(root: Path = FPL_ROOT) -> list[str]:
@@ -61,6 +65,32 @@ def fpl_gameweeks_path(league: str, season: str) -> Path:
 
 def fpl_player_profiles_path(league: str, season: str) -> Path:
     return FPL_ROOT / league / season / "analytics" / "player_profiles.csv"
+
+
+def fpl_raw_players_path(league: str, season: str) -> Path:
+    return RAW_FPL_ROOT / league / season / "players_raw.csv"
+
+
+def fpl_raw_fixtures_path(league: str, season: str) -> Path:
+    return RAW_FPL_ROOT / league / season / "season" / "fixtures.csv"
+
+
+def fpl_raw_teams_path(league: str, season: str) -> Path:
+    return RAW_FPL_ROOT / league / season / "season" / "teams.csv"
+
+
+def fpl_fixture_metadata_path(league: str, season: str) -> Path:
+    return (
+        RAW_FPL_ROOT
+        / league
+        / season
+        / "season"
+        / "fixture_metadata_per_team_resolved.csv"
+    )
+
+
+def fixture_calendar_path(season: str) -> Path:
+    return FIXTURE_REGISTRY_ROOT / season / "fixture_calendar.csv"
 
 
 def expected_points_root(season: str) -> Path:

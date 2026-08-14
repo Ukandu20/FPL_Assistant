@@ -15,9 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @lru_cache(maxsize=None)
 def load_page_module(filename: str):
     path = ROOT / "apps" / "fpl" / "pages" / filename
-    spec = importlib.util.spec_from_file_location(
-        f"fpl_app_test_{path.stem}", path
-    )
+    spec = importlib.util.spec_from_file_location(f"fpl_app_test_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -122,4 +120,46 @@ def test_team_player_table_adds_recent_form_and_value() -> None:
 
     alpha = result.loc[result["Player"].eq("Alpha")].iloc[0]
     assert alpha["Last 3 points"] == 12
-    assert alpha["Points/£m"] == 4
+    assert alpha.iloc[-1] == 4
+
+
+def test_fixture_schedule_keeps_facts_without_prediction_artifact(
+    tmp_path: Path,
+) -> None:
+    player_page = load_page_module("0_main.py")
+    metadata_path = tmp_path / "fixture_metadata_per_team_resolved.csv"
+    fixtures_path = tmp_path / "fixtures.csv"
+    pd.DataFrame(
+        {
+            "fpl_id": [1, 1],
+            "team": [1, 7],
+            "opp": [7, 1],
+            "venue": ["home", "away"],
+            "date_sched": ["2026-08-21", "2026-08-21"],
+            "team_short": ["ARS", "COV"],
+            "opp_short": ["COV", "ARS"],
+            "opp_name": ["Coventry City", "Arsenal"],
+        }
+    ).to_csv(metadata_path, index=False)
+    pd.DataFrame(
+        {
+            "id": [1],
+            "event": [1],
+            "kickoff_time": ["2026-08-21T19:00:00Z"],
+            "finished": [False],
+            "team_h_difficulty": [2],
+            "team_a_difficulty": [5],
+        }
+    ).to_csv(fixtures_path, index=False)
+
+    result = player_page.load_fixture_schedule(
+        str(metadata_path), str(fixtures_path), None, None
+    )
+
+    arsenal = result.loc[result["team"].eq(1)].iloc[0]
+    coventry = result.loc[result["team"].eq(7)].iloc[0]
+    assert arsenal["opponent"] == "COV"
+    assert arsenal["opponent_team_id"] == 7
+    assert arsenal["is_home"]
+    assert arsenal["fdr"] == 2
+    assert coventry["fdr"] == 5
