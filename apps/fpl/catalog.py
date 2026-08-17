@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -12,6 +13,7 @@ FPL_ROOT = PROCESSED_ROOT / "fpl"
 RAW_FPL_ROOT = RAW_ROOT / "fpl"
 UNDERSTAT_ROOT = PROCESSED_ROOT / "understat"
 PREDICTIONS_ROOT = PROJECT_ROOT / "data" / "predictions"
+ARCHETYPE_ROOT = PROCESSED_ROOT / "archetypes"
 FIXTURE_REGISTRY_ROOT = PROCESSED_ROOT / "registry" / "fixtures"
 PRICE_CATEGORY_CONFIG_PATH = PROJECT_ROOT / "config" / "fpl_price_categories.json"
 PLAYER_IMAGE_CONFIG_PATH = PROJECT_ROOT / "config" / "fpl_image_assets.json"
@@ -95,6 +97,34 @@ def fixture_calendar_path(season: str) -> Path:
 
 def expected_points_root(season: str) -> Path:
     return PREDICTIONS_ROOT / "expected_points" / season
+
+
+def latest_archetype_snapshot(
+    season: str | None = None, *, root: Path = ARCHETYPE_ROOT
+) -> Path | None:
+    """Return the newest complete immutable archetype snapshot for a season."""
+    candidates: list[tuple[datetime, Path]] = []
+    for path in root.glob("model_version=*/snapshot=*") if root.is_dir() else ():
+        if not (path / "archetypes.jsonl").is_file():
+            continue
+        stamp = path.name.removeprefix("snapshot=")
+        try:
+            snapshot = datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if season is not None:
+            try:
+                start_year, end_year = (int(value) for value in season.split("-"))
+            except (TypeError, ValueError):
+                continue
+            season_start = datetime(start_year, 7, 1, tzinfo=timezone.utc)
+            season_end = datetime(end_year, 7, 1, tzinfo=timezone.utc)
+            if not season_start <= snapshot < season_end:
+                continue
+        candidates.append((snapshot, path))
+    return max(candidates, default=(None, None), key=lambda item: item[0])[1]
 
 
 def understat_team_season_path(league: str, season: str) -> Path:

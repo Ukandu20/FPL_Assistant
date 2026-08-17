@@ -23,6 +23,7 @@ from apps.fpl.catalog import (
     fpl_raw_players_path,
     fpl_raw_teams_path,
     fpl_season_path,
+    latest_archetype_snapshot,
 )
 from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
 
@@ -430,6 +431,24 @@ def load_player_profiles(
     if "player_id" in profiles:
         profiles["player_id"] = profiles["player_id"].astype("string")
     return profiles
+
+
+@st.cache_data(show_spinner=False)
+def load_archetype_artifact(
+    artifact_path: str, data_version: tuple[int, int] | None = None
+) -> pd.DataFrame:
+    """Load one immutable V1 JSONL artifact without recalculating scores."""
+    del data_version
+    path = Path(artifact_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        artifact = pd.read_json(path, lines=True)
+    except ValueError:
+        return pd.DataFrame()
+    if "player_id" in artifact:
+        artifact["player_id"] = artifact["player_id"].astype("string")
+    return artifact
 
 
 @st.cache_data(show_spinner=False)
@@ -1380,15 +1399,18 @@ def render_overview_tab(
         st.markdown("### Recent evidence")
         trend = gameweek_history.tail(5).copy()
         trend["GW label"] = "GW" + trend["GW"].astype(str)
-        figure = px.bar(
+        figure = px.line(
             trend,
             x="GW label",
             y="Total FPL points",
-            text_auto=".0f",
+            text="Total FPL points",
+            markers=True,
             custom_data=["Minutes", "Opponent", "Starts", "Returns"],
             title="Points and playing time across the last five gameweeks",
         )
         figure.update_traces(
+            texttemplate="%{text:.0f}",
+            textposition="top center",
             hovertemplate=(
                 "<b>%{x}</b><br>Points: %{y:.0f}<br>Minutes: %{customdata[0]:.0f}"
                 "<br>Opponent: %{customdata[1]}<br>Starts: %{customdata[2]:.0f}"
@@ -1692,6 +1714,161 @@ def render_profile_tab(
     )
 
 
+def _format_trace_values(value: object) -> str:
+    """Format a stored calculation-stage JSON object for compact display."""
+    if value is None or (
+        not isinstance(value, (dict, list)) and bool(pd.isna(value))
+    ):
+        return "—"
+    try:
+        parsed = json.loads(str(value)) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(value)
+    if not isinstance(parsed, dict):
+        return str(parsed)
+    return ", ".join(
+        f"{key}: {'—' if metric is None else f'{float(metric):.3f}'}"
+        for key, metric in parsed.items()
+    )
+
+
+def render_v1_archetype_profile(
+    player_name: str,
+    archetypes: pd.DataFrame,
+    component_evidence: pd.DataFrame,
+    family_evidence: pd.DataFrame,
+    match_evidence: pd.DataFrame,
+) -> None:
+    """Render the catalogue-driven V1 profile and its saved calculation trail."""
+    st.subheader("V1 archetype profile")
+    if archetypes.empty:
+        st.info(f"No V1 archetype snapshot is available for {player_name}.")
+        return
+
+    active = archetypes.loc[archetypes["active_label"].fillna(False)].copy()
+    composite_rows = active.loc[active["family"].eq("Production Composite")]
+    usage_rows = active.loc[active["family"].eq("Usage")]
+    composite = None if composite_rows.empty else composite_rows.iloc[0]
+    usage = None if usage_rows.empty else usage_rows.iloc[0]
+    representative = composite if composite is not None else archetypes.iloc[0]
+    confidence = pd.to_numeric(
+        representative.get("confidence_0_1"), errors="coerce"
+    )
+
+    cards = st.columns(4)
+    cards[0].metric(
+        "Production profile",
+        "No active composite" if composite is None else composite["display_name"],
+    )
+    cards[1].metric(
+        "Usage",
+        "Unavailable" if usage is None else usage["display_name"],
+    )
+    cards[2].metric(
+        "Confidence",
+        "—" if pd.isna(confidence) else f"{float(confidence) * 100:.0f}%",
+        str(representative.get("confidence_band", "")),
+    )
+    cards[3].metric(
+        "Model",
+        str(representative.get("model_version", "—")),
+        str(representative.get("status", "")),
+    )
+
+    production = archetypes.loc[archetypes["family"].eq("Production Style")].copy()
+    if not production.empty:
+        st.markdown("#### Production components")
+        production = production.sort_values("score_0_100", ascending=False)
+        for row in production.to_dict("records"):
+            score = pd.to_numeric(row.get("score_0_100"), errors="coerce")
+            if pd.isna(score):
+                st.caption(
+                    f"{row['display_name']}: no score · {row.get('status', '')}"
+                )
+                continue
+            ui.progress(
+                value=float(score),
+                label=str(row["display_name"]),
+                show_value=True,
+                width="stretch",
+                key=f"v1_component_{player_name}_{row['archetype_id']}",
+            )
+
+    state_rows = archetypes.loc[
+        ~archetypes["family"].isin(["Production Style", "Production Composite"])
+    ].copy()
+    if not state_rows.empty:
+        st.markdown("#### Behaviour, value and risk")
+        display = state_rows[
+            [
+                "family", "display_name", "score_0_100", "active_label",
+                "confidence_band", "trend", "status",
+            ]
+        ].rename(
+            columns={
+                "family": "Family", "display_name": "Profile",
+                "score_0_100": "Score", "active_label": "Active",
+                "confidence_band": "Confidence", "trend": "Trend",
+                "status": "Status",
+            }
+        )
+        st.dataframe(display, hide_index=True, width="stretch")
+
+    with st.expander("How this profile was calculated"):
+        st.caption(
+            "These are the persisted values used by the model; the app does not "
+            "recalculate them. Each row is one component and evidence window."
+        )
+        if component_evidence.empty:
+            st.info("No production calculation ledger was stored for this player.")
+        else:
+            trace = component_evidence.copy()
+            trace["Raw rates"] = trace["metric_values"].map(_format_trace_values)
+            trace["Transformed"] = trace["transformed_values"].map(
+                _format_trace_values
+            )
+            trace["Winsorized"] = trace["winsorized_values"].map(
+                _format_trace_values
+            )
+            trace["Position z-scores"] = trace["position_z_scores"].map(
+                _format_trace_values
+            )
+            trace = trace.rename(
+                columns={
+                    "archetype_id": "Component",
+                    "evidence_window": "Window",
+                    "window_minutes": "Minutes",
+                    "window_appearances": "Apps",
+                    "window_raw_score": "Window raw",
+                    "window_percentile": "Window percentile",
+                    "temporal_combined_raw": "Temporal raw",
+                    "shrunk_raw": "Shrunk raw",
+                    "final_score_0_100": "Final score",
+                }
+            )
+            st.dataframe(
+                trace[
+                    [
+                        "Component", "Window", "Minutes", "Apps", "Raw rates",
+                        "Transformed", "Winsorized", "Position z-scores",
+                        "Window raw", "Window percentile", "Temporal raw",
+                        "Shrunk raw", "Final score",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        if not family_evidence.empty:
+            st.markdown("##### Other family calculations")
+            st.dataframe(family_evidence, hide_index=True, width="stretch")
+        st.caption(
+            f"{len(match_evidence):,} canonical pre-snapshot player-match rows "
+            "are stored for this player."
+        )
+        if not match_evidence.empty:
+            st.dataframe(match_evidence, hide_index=True, width="stretch")
+
+
 def main() -> None:
     st.title("Fantasy Premier League Player Dashboard")
 
@@ -1984,6 +2161,63 @@ def main() -> None:
         profiles, previous_profiles, str(selected_player_id)
     )
 
+    archetype_snapshot_dir = latest_archetype_snapshot(selected_season)
+    if archetype_snapshot_dir is None:
+        archetype_path = None
+        selected_v1_archetypes = pd.DataFrame()
+        selected_component_evidence = pd.DataFrame()
+        selected_family_evidence = pd.DataFrame()
+        selected_match_evidence = pd.DataFrame()
+    else:
+        archetype_path = archetype_snapshot_dir / "archetypes.jsonl"
+        component_evidence_path = (
+            archetype_snapshot_dir / "production_component_evidence.jsonl"
+        )
+        family_evidence_path = (
+            archetype_snapshot_dir / "family_calculation_evidence.jsonl"
+        )
+        match_evidence_path = archetype_snapshot_dir / "player_match_evidence.jsonl"
+        v1_archetypes = load_archetype_artifact(
+            str(archetype_path), file_version(archetype_path)
+        )
+        component_evidence = load_archetype_artifact(
+            str(component_evidence_path), file_version(component_evidence_path)
+        )
+        family_evidence = load_archetype_artifact(
+            str(family_evidence_path), file_version(family_evidence_path)
+        )
+        match_evidence = load_archetype_artifact(
+            str(match_evidence_path), file_version(match_evidence_path)
+        )
+        selected_v1_archetypes = (
+            v1_archetypes.loc[
+                v1_archetypes["player_id"].eq(str(selected_player_id))
+            ].copy()
+            if "player_id" in v1_archetypes
+            else pd.DataFrame()
+        )
+        selected_component_evidence = (
+            component_evidence.loc[
+                component_evidence["player_id"].eq(str(selected_player_id))
+            ].copy()
+            if "player_id" in component_evidence
+            else pd.DataFrame()
+        )
+        selected_family_evidence = (
+            family_evidence.loc[
+                family_evidence["player_id"].eq(str(selected_player_id))
+            ].copy()
+            if "player_id" in family_evidence
+            else pd.DataFrame()
+        )
+        selected_match_evidence = (
+            match_evidence.loc[
+                match_evidence["player_id"].eq(str(selected_player_id))
+            ].copy()
+            if "player_id" in match_evidence
+            else pd.DataFrame()
+        )
+
     details_path = fpl_raw_players_path(league, selected_season)
     raw_details = load_raw_player_details(
         str(details_path), file_version(details_path)
@@ -2037,7 +2271,11 @@ def main() -> None:
     data_freshness = {
         "roster": updated_label(fpl_season_path(league, selected_season)),
         "fixtures": updated_label(raw_fixtures_path),
-        "profile": updated_label(profile_freshness_path),
+        "profile": updated_label(
+            archetype_path
+            if not selected_v1_archetypes.empty
+            else profile_freshness_path
+        ),
         "forecast": updated_label(forecast_path),
     }
 
@@ -2077,16 +2315,25 @@ def main() -> None:
             per_90=per_90,
         )
     with profile_tab:
-        if profile_is_carryover:
-            st.info(
-                f"Showing the {selected_profile_season} profile as a preseason "
-                "baseline because current-season evidence is not yet sufficient."
+        if not selected_v1_archetypes.empty:
+            render_v1_archetype_profile(
+                player_name,
+                selected_v1_archetypes,
+                selected_component_evidence,
+                selected_family_evidence,
+                selected_match_evidence,
             )
-        render_profile_tab(
-            player_name,
-            selected_profile_season or selected_season,
-            selected_profile,
-        )
+        else:
+            if profile_is_carryover:
+                st.info(
+                    f"Showing the {selected_profile_season} profile as a preseason "
+                    "baseline because current-season evidence is not yet sufficient."
+                )
+            render_profile_tab(
+                player_name,
+                selected_profile_season or selected_season,
+                selected_profile,
+            )
 
 
 if __name__ == "__main__":

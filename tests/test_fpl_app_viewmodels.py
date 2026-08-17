@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from apps.fpl.catalog import current_season, discover_seasons
+from apps.fpl.catalog import current_season, discover_seasons, latest_archetype_snapshot
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +35,19 @@ def test_catalog_returns_newest_valid_season(tmp_path: Path) -> None:
     assert current_season(
         "Premier League", root=tmp_path, required_path="season/players.csv"
     ) == "2026-2027"
+
+
+def test_catalog_selects_latest_archetype_snapshot_within_season(
+    tmp_path: Path,
+) -> None:
+    older = tmp_path / "model_version=1.0.0" / "snapshot=2026-01-01T00-00-00Z"
+    latest = tmp_path / "model_version=1.0.0" / "snapshot=2026-05-01T00-00-00Z"
+    outside = tmp_path / "model_version=1.0.0" / "snapshot=2026-08-01T00-00-00Z"
+    for path in (older, latest, outside):
+        path.mkdir(parents=True)
+        (path / "archetypes.jsonl").touch()
+
+    assert latest_archetype_snapshot("2025-2026", root=tmp_path) == latest
 
 
 def test_player_season_duplicates_keep_best_supported_row() -> None:
