@@ -1,0 +1,132 @@
+{
+  "model_version": "1.0.0",
+  "eligible_appearance_minutes": 30,
+  "temporal_weights": {
+    "previous_season": 0.25,
+    "earlier_current": 0.30,
+    "recent": 0.45
+  },
+  "recent_appearances": 10,
+  "provisional_minutes": 450,
+  "established_minutes": 900,
+  "required_appearances": 10,
+  "entry_percentile": 80.0,
+  "exit_percentile": 75.0,
+  "exit_updates": 2,
+  "secondary_weight_floor": 0.70,
+  "shrinkage_prior_minutes": 900,
+  "shrinkage_prior_minutes_grid": [450, 900, 1350, 1800],
+  "winsor_limits": [0.01, 0.99],
+  "confidence": {
+    "minutes_weight": 0.30,
+    "appearances_weight": 0.15,
+    "context_weight": 0.20,
+    "precision_weight": 0.20,
+    "data_quality_weight": 0.15,
+    "bands": {
+      "insufficient": [0.0, 0.35],
+      "low": [0.35, 0.55],
+      "medium": [0.55, 0.75],
+      "high": [0.75, 1.0000001]
+    }
+  },
+  "usage": {
+    "recent_team_matches": 6,
+    "half_life_matches": 3.0,
+    "provisional_observations": 3,
+    "full_observations": 8,
+    "full_minutes": 450,
+    "nailed_start_probability": 0.90,
+    "nailed_expected_minutes": 75.0,
+    "regular_start_probability": 0.70,
+    "regular_expected_minutes": 55.0,
+    "rotation_start_probability": 0.35,
+    "rotation_expected_minutes": 30.0,
+    "impact_cameo_probability": 0.35,
+    "state_change_updates": 2
+  },
+  "team_ratings": {
+    "season_retention": 0.70,
+    "season_retention_grid": [0.60, 0.70, 0.80],
+    "promoted_initial_rating": 0.0,
+    "prior_equivalent_matches": 8,
+    "prior_equivalent_matches_grid": [4, 8, 12, 16],
+    "xg_weight": 0.70,
+    "xg_weight_grid": [0.50, 0.70, 0.85, 1.0],
+    "elo_update_k": 20.0,
+    "elo_update_k_grid": [10.0, 20.0, 30.0, 40.0],
+    "elo_home_advantage_points": 36.0,
+    "elo_home_advantage_points_grid": [36.0, 40.0, 60.0, 80.0],
+    "home_log_effect": 0.15,
+    "home_log_effect_grid": [0.05, 0.10, 0.15, 0.20, 0.25],
+    "information_floor": 0.000001,
+    "loss_floor": 0.00000001
+  },
+  "components": {
+    "GOAL_THREAT": {
+      "positions": ["DEF", "MID", "FWD"],
+      "core_fields": ["minutes", "npxg", "shots_in_box", "shots_on_target", "non_penalty_goals"],
+      "weights": {"npxg": 0.45, "shots_in_box": 0.25, "shots_on_target": 0.20, "non_penalty_goals": 0.10}
+    },
+    "CREATOR": {
+      "positions": ["DEF", "MID", "FWD"],
+      "core_fields": ["minutes", "xa", "key_passes", "big_chances_created", "shot_creating_actions"],
+      "weights": {"xa": 0.50, "key_passes": 0.25, "big_chances_created": 0.15, "shot_creating_actions": 0.10},
+      "log1p_fields": ["key_passes", "big_chances_created", "shot_creating_actions"]
+    },
+    "DEFENSIVE_ENGINE": {
+      "positions": ["DEF", "MID", "FWD"],
+      "core_fields": ["minutes", "tackles_won", "interceptions", "clearances", "blocks"],
+      "secondary_fields": ["recoveries"],
+      "weights_by_position": {
+        "DEF": {"tackles_won": 0.1875, "interceptions": 0.1875, "clearances": 0.1875, "blocks": 0.1875, "defcon_hit": 0.25},
+        "MID": {"tackles_won": 0.15, "interceptions": 0.15, "clearances": 0.15, "blocks": 0.15, "recoveries": 0.15, "defcon_hit": 0.25},
+        "FWD": {"tackles_won": 0.15, "interceptions": 0.15, "clearances": 0.15, "blocks": 0.15, "recoveries": 0.15, "defcon_hit": 0.25}
+      },
+      "log1p_fields": ["tackles_won", "interceptions", "clearances", "blocks", "recoveries"]
+    },
+    "SAVES_MACHINE": {
+      "positions": ["GKP"],
+      "core_fields": ["minutes", "saves", "shots_on_target_faced", "goals_conceded"],
+      "secondary_fields": ["post_shot_xg", "penalties_saved", "penalties_faced"],
+      "weights": {"saves": 0.45, "goals_prevented": 0.30, "shots_on_target_faced": 0.15, "penalty_save_rate": 0.10}
+    }
+  },
+  "provider_fields": {
+    "minutes": "fpl",
+    "starts": "fpl",
+    "availability": "fpl",
+    "fpl_points": "fpl",
+    "price": "fpl",
+    "npxg": "understat",
+    "non_penalty_goals": "understat",
+    "xa": "understat",
+    "shots_on_target": "whoscored",
+    "shots_in_box": "whoscored",
+    "key_passes": "whoscored",
+    "big_chances_created": "whoscored",
+    "shot_creating_actions": "whoscored",
+    "tackles_won": "whoscored",
+    "interceptions": "whoscored",
+    "clearances": "whoscored",
+    "blocks": "whoscored",
+    "recoveries": "whoscored",
+    "clean_sheet": "fpl",
+    "goals_conceded": "fpl",
+    "xga": "fpl",
+    "saves": "whoscored",
+    "shots_on_target_faced": "whoscored",
+    "post_shot_xg": "whoscored",
+    "penalties_saved": "fpl",
+    "penalties_faced": "whoscored",
+    "yellow_cards": "fpl",
+    "red_cards": "fpl"
+  },
+  "deferred_components": ["SWEEPER", "DISTRIBUTOR"],
+  "validation": {
+    "minimum_improvement": 0.02,
+    "minimum_fold_win_rate": 0.70,
+    "maximum_calibration_degradation": 0.01,
+    "minimum_training_seasons": 2
+  }
+}

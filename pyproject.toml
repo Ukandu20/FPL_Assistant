@@ -16,6 +16,9 @@ dependencies = [
 [project.scripts]
 fpl-canonical = "fpl_assistant.canonical.cli:main"
 fpl-player-profiles = "fpl_assistant.providers.fpl.pipelines.player_profiles:main"
+fpl-archetypes = "fpl_assistant.archetypes.cli:main"
+fpl-archetype-publish = "fpl_assistant.archetypes.publish_cli:main"
+fpl-archetype-validate = "fpl_assistant.archetypes.validation_cli:main"
 
 [project.optional-dependencies]
 app = [

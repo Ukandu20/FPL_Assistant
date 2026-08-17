@@ -1,0 +1,55 @@
+{
+  "model_version": "1.0.0",
+  "as_of": "2026-08-17",
+  "release_status": "blocked",
+  "processed_provider_intersection": {
+    "fpl": ["2024-2025", "2025-2026"],
+    "understat": ["2024-2025", "2025-2026"],
+    "whoscored": ["2024-2025", "2025-2026"],
+    "complete_joinable_seasons": ["2024-2025", "2025-2026"],
+    "minimum_training_seasons": 2,
+    "required_additional_holdout_seasons": 1
+  },
+  "team_ratings": {
+    "status": "tested_failed_release",
+    "held_out_season": "2025-2026",
+    "xg_improvement": -0.027502161073493438,
+    "xg_fold_win_rate": 0.2631578947368421,
+    "goals_improvement": 0.01713602626205095,
+    "goals_fold_win_rate": 0.631578947368421
+  },
+  "player_archetypes": [
+    {"id": "GOAL_THREAT", "target": "next-10-appearance npxG/90 and goal-return probability", "status": "blocked_insufficient_seasons"},
+    {"id": "CREATOR", "target": "next-10-appearance xA/90 and assist-return probability", "status": "blocked_insufficient_seasons"},
+    {"id": "DEFENSIVE_ENGINE", "target": "next-10-appearance defensive-contribution points/returns", "status": "blocked_insufficient_seasons"},
+    {"id": "CLEAN_SHEET_SPECIALIST", "target": "next-10-start clean-sheet probability and FPL clean-sheet points", "status": "blocked_insufficient_seasons"},
+    {"id": "SAVES_MACHINE", "target": "next-10-start save points and saves/90", "status": "blocked_insufficient_seasons"},
+    {"id": "USAGE_STATES", "target": "next-match start and minutes", "status": "blocked_availability_history_and_insufficient_seasons"},
+    {"id": "FODDER_HUNTER", "target": "future adjusted performance by matchup difficulty", "status": "blocked_insufficient_context_seasons"},
+    {"id": "MATCHUP_PROOF", "target": "future adjusted performance equivalence across matchup difficulty", "status": "blocked_insufficient_context_seasons"},
+    {"id": "HOME_FAVORITE", "target": "future adjusted home-away performance", "status": "blocked_insufficient_context_seasons"},
+    {"id": "ROAD_WARRIOR", "target": "future adjusted away-home performance", "status": "blocked_insufficient_context_seasons"},
+    {"id": "ANYWHERE_THREAT", "target": "future adjusted venue equivalence", "status": "blocked_insufficient_context_seasons"},
+    {"id": "EXPLOSIVE_RETURNER", "target": "future 10+ point haul probability", "status": "blocked_insufficient_seasons"},
+    {"id": "STEADY_RETURNER", "target": "future return rate, blank rate, and downside variability", "status": "blocked_insufficient_seasons"},
+    {"id": "HIDDEN_GEM", "target": "future five-GW points over replacement", "status": "blocked_missing_historical_expected_value_snapshots"},
+    {"id": "PREMIUM_PICK", "target": "future five-GW points over replacement", "status": "blocked_missing_historical_expected_value_snapshots"},
+    {"id": "HIGH_MAINTENANCE", "target": "future five-GW points over replacement", "status": "blocked_missing_historical_expected_value_snapshots"},
+    {"id": "BENCH_AUTOFILL", "target": "future five-GW points over replacement", "status": "blocked_missing_historical_expected_value_snapshots"},
+    {"id": "POINTS_HAZARD", "target": "future card deductions and suspension-caused minutes lost", "status": "blocked_suspension_history_and_insufficient_seasons"}
+  ],
+  "deferred_not_evaluated": [
+    "SWEEPER_KEEPER",
+    "DISTRIBUTOR",
+    "PRODSTYLE_GKP_S_W",
+    "PRODSTYLE_GKP_S_P",
+    "PRODSTYLE_GKP_W_P",
+    "PRODSTYLE_GKP_S_W_P",
+    "BIG_GAME_PERFORMER"
+  ],
+  "unblock_requirements": [
+    "Process and canonically join at least one additional complete Premier League season across FPL, Understat, and WhoScored.",
+    "Backfill reason-coded availability and suspension histories for usage and Points Hazard validation.",
+    "Backfill immutable historical next-five-gameweek expected-points/value snapshots for value-state validation."
+  ]
+}

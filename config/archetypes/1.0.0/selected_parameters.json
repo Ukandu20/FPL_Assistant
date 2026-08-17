@@ -1,0 +1,29 @@
+{
+  "model_version": "1.0.0",
+  "selection_status": "validation_failed_not_released",
+  "provider": "understat",
+  "training_seasons": ["2024-2025"],
+  "held_out_season": "2025-2026",
+  "parameters": {
+    "season_retention": 0.70,
+    "prior_equivalent_matches": 16,
+    "xg_weight": 0.70,
+    "elo_update_k": 20,
+    "elo_home_advantage_points": 36,
+    "home_log_effect": 0.15,
+    "information_floor": 0.000001,
+    "loss_floor": 0.00000001
+  },
+  "release_results": {
+    "xg_improvement": -0.027502161073493438,
+    "xg_fold_win_rate": 0.2631578947368421,
+    "goals_improvement": 0.01713602626205095,
+    "goals_fold_win_rate": 0.631578947368421,
+    "minimum_improvement": 0.02,
+    "minimum_fold_win_rate": 0.70
+  },
+  "release_blockers": [
+    "The candidate did not meet the xG or goals release criteria on the held-out season.",
+    "Only one complete training season was available after holding out 2025-2026; two are required."
+  ]
+}
