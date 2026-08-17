@@ -1,0 +1,46 @@
+[
+  {
+    "player_id": "sample-fwd-5",
+    "fpl_position": "FWD",
+    "archetype_id": "PRODSTYLE_FWD_G_C_D",
+    "display_name": "Complete Two-Way Forward",
+    "score_0_100": 100.0,
+    "confidence_0_1": 0.941176,
+    "confidence_band": "High",
+    "status": "Established",
+    "model_version": "1.0.0"
+  },
+  {
+    "player_id": "sample-mid-5",
+    "fpl_position": "MID",
+    "archetype_id": "PRODSTYLE_MID_G_C_D",
+    "display_name": "Complete Midfielder",
+    "score_0_100": 100.0,
+    "confidence_0_1": 0.941176,
+    "confidence_band": "High",
+    "status": "Established",
+    "model_version": "1.0.0"
+  },
+  {
+    "player_id": "sample-def-5",
+    "fpl_position": "DEF",
+    "archetype_id": "PRODSTYLE_DEF_G_C_D",
+    "display_name": "Complete Defender",
+    "score_0_100": 100.0,
+    "confidence_0_1": 0.941176,
+    "confidence_band": "High",
+    "status": "Established",
+    "model_version": "1.0.0"
+  },
+  {
+    "player_id": "sample-gkp-5",
+    "fpl_position": "GKP",
+    "archetype_id": "PRODSTYLE_GKP_S",
+    "display_name": "Shot Stopper",
+    "score_0_100": 100.0,
+    "confidence_0_1": 0.941176,
+    "confidence_band": "High",
+    "status": "Established",
+    "model_version": "1.0.0"
+  }
+]

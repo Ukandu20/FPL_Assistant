@@ -193,6 +193,12 @@ entries; `box_entries_against`, `box_entries_allowed`, and
 `box_entries_conceded` are definitionally identical aliases, with corresponding
 `*_by_pass_allowed` and `*_by_carry_allowed` aliases.
 
+Processing version `1.8.0` adds team `clean_sheets`, derived from completed
+WhoScored schedule scorelines. The match value is `1` when the opponent scored
+zero and `0` otherwise; unfinished fixtures or fixtures without both scores
+remain null. The metric is published in team match schedule, summary, defense,
+and keeper tables, and summed in the corresponding team-season tables.
+
 The cleaner also writes
 `data/processed/whoscored/<league>/<season>/player_season/roles.csv`. This is an
 observed, season-specific set-piece hierarchy derived only from that season's
@@ -247,3 +253,17 @@ team and opponent, their differences, `elo_preseason_as_of`, and
 `elo_provider`. The preseason cutoff is the day before the season's earliest
 scheduled fixture. Coverage and missing-rating audits are written beside the
 schedule under `audits/`.
+
+### V1 player archetypes
+
+The catalogue-driven historical archetype layer is documented in
+[`docs/FPL_ARCHETYPE_V1.md`](docs/FPL_ARCHETYPE_V1.md). Build immutable
+gameweek/date snapshots with `fpl-archetypes` and run chronological team-rating
+validation with `fpl-archetype-validate`. The implementation intentionally
+keeps archetypes separate from the final expected-points model and suppresses
+all deferred goalkeeper components. Each immutable snapshot also stores its
+canonical source rows and complete calculation evidence. The Streamlit player
+dashboard reads the newest season-appropriate V1 snapshot in its **Profile**
+tab and falls back to the legacy profile when no V1 snapshot has been published.
+Generate the complete canonical join and app-visible snapshot with
+`fpl-archetype-publish --current-season <season> --as-of <UTC timestamp>`.
