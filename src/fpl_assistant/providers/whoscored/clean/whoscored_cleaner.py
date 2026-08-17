@@ -27,7 +27,8 @@ from fpl_assistant.canonical.identity import normalize_identity_text, stable_can
 
 LOG = logging.getLogger("whoscored.clean")
 PROVIDER = "whoscored"
-PROCESSING_VERSION = "1.7.0"
+PROCESSING_VERSION = "1.8.0"
+EVENT_AGGREGATION_BATCH_SIZE = 16
 
 ROLE_COLUMNS = [
     "league",
@@ -305,6 +306,7 @@ PLAYER_TABLES: dict[str, list[str]] = {
 # PLAYER_TABLES avoids publishing a team exposure metric on every player row.
 TEAM_ONLY_TABLES: dict[str, list[str]] = {
     "defense": [
+        "clean_sheets",
         "shots_against", "shots_conceded", "shots_on_target_against", "shots_off_target_against",
         "shots_blocked_against", "shots_blocked_defensively",
         "shots_on_post_against", "shots_box_against", "shots_outside_box_against",
@@ -317,6 +319,7 @@ TEAM_ONLY_TABLES: dict[str, list[str]] = {
         "box_entries_allowed", "box_entries_conceded",
     ],
     "keepers": [
+        "clean_sheets",
         "shots_against", "shots_conceded", "shots_on_target_against", "shots_off_target_against",
         "shots_blocked_against", "shots_on_post_against", "shots_box_against",
         "shots_outside_box_against", "big_chances_conceded",
@@ -331,14 +334,14 @@ TEAM_ONLY_TABLES: dict[str, list[str]] = {
         "box_entries_by_pass_allowed", "box_entries_by_carry_allowed",
         "box_entries_against", "box_entries_allowed", "box_entries_conceded",
     ],
-    "summary": ["average_age", "formation_changes"],
+    "summary": ["clean_sheets", "average_age", "formation_changes"],
     "misc": ["formation_changes"],
 }
 
 TEAM_EXTRA_TABLES: dict[str, list[str]] = {
     "schedule": [
         "home_team_id", "away_team_id", "status", "home_score", "away_score",
-        "score", "venue", "referee", "attendance", "formation", "opponent_formation",
+        "score", "clean_sheets", "venue", "referee", "attendance", "formation", "opponent_formation",
         "manager_name", "country_name",
     ],
     "shot_zones": [],
@@ -1003,6 +1006,55 @@ def _normalize_events(
     return work
 
 
+def _aggregate_event_flags(
+    work: pd.DataFrame,
+    *,
+    keys: list[str],
+    flags: Mapping[str, pd.Series],
+    batch_size: int = EVENT_AGGREGATION_BATCH_SIZE,
+) -> pd.DataFrame:
+    """Sum event flags without widening the complete metric matrix at once.
+
+    Pandas widens boolean/integer inputs to int64 during ``GroupBy.sum``. At a
+    full Premier League event volume, aggregating every flag together can
+    require more than 700 MiB for that temporary array alone. Small batches
+    keep peak memory bounded while producing the same group-level columns.
+    """
+    if batch_size < 1:
+        raise ValueError("Event aggregation batch size must be positive.")
+
+    metric_names = list(flags)
+    grouped: pd.DataFrame | None = None
+    groupers = [work[column] for column in keys]
+    for start in range(0, len(metric_names), batch_size):
+        batch_names = metric_names[start : start + batch_size]
+        batch = pd.DataFrame(
+            {
+                name: flags[name].fillna(False).astype("uint8")
+                for name in batch_names
+            },
+            index=work.index,
+        )
+        batch_grouped = (
+            batch.groupby(groupers, dropna=False, sort=False)
+            .sum()
+            .reset_index()
+        )
+        if grouped is None:
+            grouped = batch_grouped
+        else:
+            grouped = grouped.merge(
+                batch_grouped,
+                on=keys,
+                how="outer",
+                validate="one_to_one",
+            )
+
+    if grouped is not None:
+        return grouped
+    return work.groupby(keys, dropna=False, sort=False).size().reset_index()[keys]
+
+
 def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     work = events.copy()
     keys = ["provider_match_id", "provider_player_id", "provider_team_id"]
@@ -1296,17 +1348,7 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         "forward_passes": pass_event & outcome & ((end_x - x) > 1),
         "backward_passes": pass_event & outcome & ((end_x - x) < -1),
     }
-    metric_frame = pd.DataFrame(
-        {
-            f"_m_{name}": values.fillna(False).astype("int16")
-            for name, values in flags.items()
-        },
-        index=work.index,
-    )
-    work = pd.concat([work, metric_frame], axis=1)
-    metric_columns = [f"_m_{name}" for name in flags]
-    grouped = work.groupby(keys, dropna=False)[metric_columns].sum().reset_index()
-    grouped = grouped.rename(columns={f"_m_{name}": name for name in flags})
+    grouped = _aggregate_event_flags(work, keys=keys, flags=flags)
     distances = work.dropna(subset=["_shot_distance"]).groupby(keys, dropna=False)["_shot_distance"].mean().rename("average_shot_distance").reset_index()
     grouped = grouped.merge(distances, on=keys, how="left")
     pass_distance = np.sqrt(
@@ -2269,8 +2311,11 @@ def _build_team_match(
     work["is_home"] = work["team_id"].eq(work["home_team_id"])
     work["formation"] = np.where(work["is_home"], work.get("home_formation"), work.get("away_formation"))
     work["opponent_formation"] = np.where(work["is_home"], work.get("away_formation"), work.get("home_formation"))
-    work["goals"] = np.where(work["is_home"], work.get("home_score"), work.get("away_score"))
-    work["goals_against"] = np.where(work["is_home"], work.get("away_score"), work.get("home_score"))
+    home_score = pd.to_numeric(work.get("home_score"), errors="coerce")
+    away_score = pd.to_numeric(work.get("away_score"), errors="coerce")
+    work["goals"] = np.where(work["is_home"], home_score, away_score)
+    work["goals_against"] = np.where(work["is_home"], away_score, home_score)
+    work["clean_sheets"] = _team_clean_sheets(work)
     opponent_index = pd.MultiIndex.from_frame(
         work[["provider_match_id", "opponent_id"]].rename(
             columns={"opponent_id": "team_id"}
@@ -2321,6 +2366,39 @@ def _build_team_match(
     return _derive_rates(work)
 
 
+def _completed_fixture_mask(frame: pd.DataFrame) -> pd.Series:
+    """Return fixtures whose WhoScored status represents a finished match."""
+    status = frame.get("status", pd.Series(pd.NA, index=frame.index, dtype="object"))
+    numeric_status = pd.to_numeric(status, errors="coerce")
+    text_status = (
+        status.astype("string")
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[\s_-]+", " ", regex=True)
+    )
+    completed_labels = {
+        "complete", "completed", "final", "full time", "ft",
+        "after extra time", "aet", "after penalties", "penalties",
+    }
+    return numeric_status.eq(6) | text_status.isin(completed_labels)
+
+
+def _team_clean_sheets(frame: pd.DataFrame) -> pd.Series:
+    """Derive a nullable 0/1 team clean-sheet flag from completed scorelines."""
+    home_score = pd.to_numeric(frame.get("home_score"), errors="coerce")
+    away_score = pd.to_numeric(frame.get("away_score"), errors="coerce")
+    is_home = frame.get("is_home", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
+    goals_against = pd.Series(
+        np.where(is_home, away_score, home_score),
+        index=frame.index,
+        dtype="float64",
+    )
+    eligible = _completed_fixture_mask(frame) & home_score.notna() & away_score.notna()
+    clean_sheets = pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    clean_sheets.loc[eligible] = goals_against.loc[eligible].eq(0).astype("int64")
+    return clean_sheets
+
+
 def _build_schedule_table(
     context: pd.DataFrame,
     *,
@@ -2358,6 +2436,7 @@ def _build_schedule_table(
     out["opponent"] = out["opponent_id"].map(team_names)
     out["home"] = out["home_team_id"].map(team_names)
     out["away"] = out["away_team_id"].map(team_names)
+    out["clean_sheets"] = _team_clean_sheets(out)
     out["season"] = season
     out["provider_season"] = provider_season
     out["provider"] = PROVIDER

@@ -5,7 +5,9 @@ from pathlib import Path
 import pandas as pd
 
 from fpl_assistant.providers.whoscored.clean.whoscored_cleaner import (
+    _aggregate_event_flags,
     _authoritative_fpl_positions,
+    _build_schedule_table,
     _build_team_match,
     _event_aggregates,
     _match_resolution,
@@ -358,6 +360,35 @@ def test_event_aggregation_keeps_action_families_separate():
     assert player["fouls_drawn"] == 1
 
 
+def test_event_flag_aggregation_batches_preserve_grouped_sums():
+    work = pd.DataFrame(
+        {
+            "provider_match_id": ["m1", "m1", "m1", "m2"],
+            "provider_player_id": ["p1", "p1", "p2", "p1"],
+            "provider_team_id": ["t1", "t1", "t1", "t2"],
+        }
+    )
+    flags = {
+        f"metric_{index}": pd.Series(
+            [True, index % 2 == 0, index % 3 == 0, False]
+        )
+        for index in range(7)
+    }
+
+    result = _aggregate_event_flags(
+        work,
+        keys=["provider_match_id", "provider_player_id", "provider_team_id"],
+        flags=flags,
+        batch_size=2,
+    ).set_index(["provider_match_id", "provider_player_id", "provider_team_id"])
+
+    for index in range(7):
+        assert result.loc[("m1", "p1", "t1"), f"metric_{index}"] == (
+            2 if index % 2 == 0 else 1
+        )
+        assert result.loc[("m1", "p2", "t1"), f"metric_{index}"] == int(index % 3 == 0)
+
+
 def test_event_aggregation_accepts_empty_preseason_event_set():
     events = pd.DataFrame(
         columns=[
@@ -604,6 +635,7 @@ def test_season_rates_are_recomputed_from_summed_event_counts():
                 "throw_ins": 4, "throw_ins_completed": 3,
                 "corners": 2, "corners_completed": 1,
                 "big_chance_shots": 1, "big_chances_scored": 1,
+                "clean_sheets": 1,
             },
             {
                 "league": "ENG-Premier League", "season": "2025-2026",
@@ -612,6 +644,7 @@ def test_season_rates_are_recomputed_from_summed_event_counts():
                 "throw_ins": 6, "throw_ins_completed": 5,
                 "corners": 3, "corners_completed": 1,
                 "big_chance_shots": 3, "big_chances_scored": 0,
+                "clean_sheets": 0,
             },
         ]
     )
@@ -624,6 +657,7 @@ def test_season_rates_are_recomputed_from_summed_event_counts():
             "throw_ins", "throw_ins_completed", "throw_in_completion_pct",
             "corners", "corners_completed", "corner_completion_pct",
             "big_chance_shots", "big_chances_scored", "big_chance_conversion_pct",
+            "clean_sheets",
         ],
     )
 
@@ -631,6 +665,7 @@ def test_season_rates_are_recomputed_from_summed_event_counts():
     assert result.loc[0, "throw_in_completion_pct"] == 80.0
     assert result.loc[0, "corner_completion_pct"] == 40.0
     assert result.loc[0, "big_chance_conversion_pct"] == 25.0
+    assert result.loc[0, "clean_sheets"] == 1
 
 
 def test_team_metrics_include_events_without_player_attribution():
@@ -759,6 +794,51 @@ def test_team_big_chances_conceded_comes_from_opponent_shots():
     assert result.loc["ars", "box_entries_by_carry_allowed"] == 6
     assert result.loc["che", "shots_against"] == 10
     assert result.loc["che", "box_entries_allowed"] == 13
+    assert result.loc["ars", "clean_sheets"] == 1
+    assert result.loc["che", "clean_sheets"] == 0
+
+
+def test_schedule_clean_sheets_require_completed_scores():
+    context = pd.DataFrame(
+        [
+            {
+                "provider_match_id": "m1", "league": "ENG-Premier League",
+                "game": "ARS-CHE", "status": 6, "home_team_id": "ars",
+                "away_team_id": "che", "provider_home_team_id": "13",
+                "provider_away_team_id": "14", "home_team": "Arsenal",
+                "away_team": "Chelsea", "home_score": 0, "away_score": 0,
+            },
+            {
+                "provider_match_id": "m2", "league": "ENG-Premier League",
+                "game": "ARS-CHE", "status": "complete", "home_team_id": "ars",
+                "away_team_id": "che", "provider_home_team_id": "13",
+                "provider_away_team_id": "14", "home_team": "Arsenal",
+                "away_team": "Chelsea", "home_score": 2, "away_score": 0,
+            },
+            {
+                "provider_match_id": "m3", "league": "ENG-Premier League",
+                "game": "ARS-CHE", "status": 1, "home_team_id": "ars",
+                "away_team_id": "che", "provider_home_team_id": "13",
+                "provider_away_team_id": "14", "home_team": "Arsenal",
+                "away_team": "Chelsea", "home_score": pd.NA, "away_score": pd.NA,
+            },
+        ]
+    )
+
+    result = _build_schedule_table(
+        context,
+        match_map={"m1": "cm1", "m2": "cm2", "m3": "cm3"},
+        team_names={"ars": "Arsenal", "che": "Chelsea"},
+        season="2025-2026",
+        provider_season="2025",
+    ).set_index(["provider_match_id", "team_id"])
+
+    assert result.loc[("m1", "ars"), "clean_sheets"] == 1
+    assert result.loc[("m1", "che"), "clean_sheets"] == 1
+    assert result.loc[("m2", "ars"), "clean_sheets"] == 1
+    assert result.loc[("m2", "che"), "clean_sheets"] == 0
+    assert pd.isna(result.loc[("m3", "ars"), "clean_sheets"])
+    assert pd.isna(result.loc[("m3", "che"), "clean_sheets"])
 
 
 def test_set_piece_roles_rank_observed_takers_and_keep_corner_side_separate():
