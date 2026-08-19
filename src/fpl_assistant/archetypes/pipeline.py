@@ -523,6 +523,24 @@ def build_archetype_snapshot(
         )
         archetypes = pd.concat([transitioned, pending], ignore_index=True)
         archetypes = archetypes.drop(columns=["_transitions_complete"], errors="ignore")
+        name_frames = [
+            frame[["player_id", "player_name"]]
+            for frame in (work, player_values)
+            if frame is not None
+            and {"player_id", "player_name"}.issubset(frame)
+        ]
+        if name_frames:
+            player_names = (
+                pd.concat(name_frames, ignore_index=True)
+                .dropna(subset=["player_name"])
+                .drop_duplicates("player_id", keep="last")
+                .set_index("player_id")["player_name"]
+            )
+            archetypes.insert(
+                1,
+                "player_name",
+                archetypes["player_id"].map(player_names).astype("string"),
+            )
         archetypes = archetypes.sort_values(["player_id", "family", "archetype_id"], kind="stable").reset_index(drop=True)
     value_evidence = pd.DataFrame()
     if player_values is not None and not player_values.empty:

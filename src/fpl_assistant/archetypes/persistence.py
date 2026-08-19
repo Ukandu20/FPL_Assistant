@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path
@@ -65,56 +66,125 @@ def persist_snapshot(
         / f"model_version={model_version}"
         / f"snapshot={_safe_snapshot_name(snapshot_date)}"
     )
-    target.mkdir(parents=True, exist_ok=True)
+    # Build every representation before touching the immutable snapshot directory.
+    # In particular, this prevents a missing Parquet engine or a serialization
+    # error from leaving a partially published snapshot behind.
     artifact_frames = {
-        "archetypes.jsonl": archetypes,
-        "team_ratings.jsonl": team_ratings,
+        "archetypes": archetypes,
+        "team_ratings": team_ratings,
     }
     for name, frame in (evidence_tables or {}).items():
         if not name.replace("_", "").isalnum():
             raise ValueError(f"Invalid evidence artifact name: {name!r}")
-        artifact_frames[f"{name}.jsonl"] = frame
+        artifact_frames[name] = frame
+
+    name_parts = [
+        frame[["player_id", "player_name"]]
+        for frame in artifact_frames.values()
+        if {"player_id", "player_name"}.issubset(frame)
+    ]
+    if name_parts:
+        player_names = (
+            pd.concat(name_parts, ignore_index=True)
+            .dropna(subset=["player_id", "player_name"])
+            .assign(player_id=lambda frame: frame["player_id"].astype("string"))
+            .drop_duplicates("player_id", keep="first")
+            .set_index("player_id")["player_name"]
+        )
+    else:
+        player_names = pd.Series(dtype="string")
+
+    for name, frame in artifact_frames.items():
+        if "player_id" not in frame:
+            continue
+        enriched = frame.copy()
+        mapped_names = enriched["player_id"].astype("string").map(player_names)
+        if "player_name" in enriched:
+            enriched["player_name"] = enriched["player_name"].fillna(mapped_names)
+        else:
+            enriched.insert(1, "player_name", mapped_names.astype("string"))
+        artifact_frames[name] = enriched
 
     sort_preferences = (
         "kickoff_utc", "match_id", "team_id", "player_id", "archetype_id",
         "evidence_window",
     )
-    normalized_frames = {
-        name: _stable_frame(frame) for name, frame in artifact_frames.items()
-    }
-    artifacts = {
-        name: frame.sort_values(
-            [column for column in sort_preferences if column in frame],
-            kind="stable",
-        ).to_json(
-            orient="records", lines=True, date_format="iso", double_precision=12
+    normalized_frames: dict[str, pd.DataFrame] = {}
+    for name, frame in artifact_frames.items():
+        stable = _stable_frame(frame)
+        sort_columns = [column for column in sort_preferences if column in stable]
+        normalized_frames[name] = (
+            stable.sort_values(sort_columns, kind="stable")
+            if sort_columns
+            else stable
         )
-        for name, frame in normalized_frames.items()
+
+    artifacts: dict[str, bytes] = {}
+    artifact_metadata: dict[str, dict[str, object]] = {}
+    for logical_name, frame in normalized_frames.items():
+        jsonl_name = f"{logical_name}.jsonl"
+        csv_name = f"{logical_name}.csv"
+        parquet_name = f"{logical_name}.parquet"
+        artifacts[jsonl_name] = frame.to_json(
+            orient="records", lines=True, date_format="iso", double_precision=12
+        ).encode("utf-8")
+        artifacts[csv_name] = frame.to_csv(
+            index=False,
+            lineterminator="\n",
+            date_format="%Y-%m-%dT%H:%M:%S.%f%z",
+            float_format="%.12g",
+        ).encode("utf-8")
+        parquet_buffer = BytesIO()
+        frame.to_parquet(
+            parquet_buffer,
+            index=False,
+            engine="pyarrow",
+            compression="zstd",
+        )
+        artifacts[parquet_name] = parquet_buffer.getvalue()
+
+        common_metadata: dict[str, object] = {
+            "logical_table": logical_name,
+            "rows": int(len(frame)),
+            "columns": list(frame.columns),
+            "dtypes": {column: str(dtype) for column, dtype in frame.dtypes.items()},
+        }
+        for artifact_name, artifact_format in (
+            (jsonl_name, "jsonl"),
+            (csv_name, "csv"),
+            (parquet_name, "parquet"),
+        ):
+            artifact_metadata[artifact_name] = {
+                **common_metadata,
+                "format": artifact_format,
+            }
+
+    hashes = {
+        name: hashlib.sha256(content).hexdigest()
+        for name, content in artifacts.items()
     }
-    hashes: dict[str, str] = {}
-    for name, content in artifacts.items():
-        path = target / name
-        encoded = content.encode("utf-8")
-        if path.exists() and path.read_bytes() != encoded:
-            raise FileExistsError(f"Immutable archetype snapshot would be overwritten: {path}")
-        path.write_bytes(encoded)
-        hashes[name] = hashlib.sha256(encoded).hexdigest()
     manifest = {
         "model_version": model_version,
         "snapshot_date": pd.Timestamp(snapshot_date).isoformat(),
         "artifacts": hashes,
-        "artifact_metadata": {
-            name: {
-                "rows": int(len(frame)),
-                "columns": list(frame.columns),
-            }
-            for name, frame in normalized_frames.items()
-        },
+        "artifact_metadata": artifact_metadata,
     }
     manifest_path = target / "manifest.json"
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    # Compare the manifest first so a legacy JSONL-only snapshot cannot be
+    # silently augmented, which would violate the snapshot's immutability.
     if manifest_path.exists() and manifest_path.read_bytes() != manifest_bytes:
         raise FileExistsError(f"Immutable archetype manifest would be overwritten: {manifest_path}")
+
+    for name, content in artifacts.items():
+        path = target / name
+        if path.exists() and path.read_bytes() != content:
+            raise FileExistsError(f"Immutable archetype snapshot would be overwritten: {path}")
+
+    target.mkdir(parents=True, exist_ok=True)
+    for name, content in artifacts.items():
+        (target / name).write_bytes(content)
     manifest_path.write_bytes(manifest_bytes)
     return target
 

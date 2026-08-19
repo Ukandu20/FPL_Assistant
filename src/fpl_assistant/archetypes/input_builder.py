@@ -61,6 +61,24 @@ def _normalize_provider_id(values: pd.Series) -> pd.Series:
     return numeric.astype("Int64").astype("string")
 
 
+def _player_names(frame: pd.DataFrame) -> pd.Series:
+    names = pd.Series(pd.NA, index=frame.index, dtype="string")
+    if "name" in frame:
+        names = frame["name"].astype("string").str.strip().replace("", pd.NA)
+    if {"first_name", "second_name"}.issubset(frame):
+        full_names = (
+            frame["first_name"].fillna("").astype("string").str.strip()
+            + " "
+            + frame["second_name"].fillna("").astype("string").str.strip()
+        ).str.strip().replace("", pd.NA)
+        names = names.fillna(full_names)
+    if "web_name" in frame:
+        names = names.fillna(
+            frame["web_name"].astype("string").str.strip().replace("", pd.NA)
+        )
+    return names
+
+
 def _fpl_match_id(frame: pd.DataFrame) -> pd.Series:
     for column in ("match_id", "game_id"):
         if column in frame:
@@ -195,6 +213,7 @@ def _canonical_fpl_rows(
         {
             "match_id": frame["_match_id"].astype("string"),
             "player_id": frame["player_id"].astype("string"),
+            "player_name": _player_names(frame),
             "team_id": frame["team_id"].astype("string"),
             "opponent_id": frame.get("opp_id", pd.Series(pd.NA, index=frame.index)).astype("string"),
             "season": str(season),
@@ -450,12 +469,17 @@ def _apply_current_roster_context(
     current_position = roster_index.get("fpl_pos", roster_index.get("position"))
     current_position = current_position.astype("string").str.upper().replace({"GK": "GKP"})
     current_team = roster_index["team_id"].astype("string")
+    current_name = _player_names(roster).set_axis(roster["player_id"]).astype("string")
     latest = (
         work.sort_values("kickoff_utc", kind="stable")
         .drop_duplicates("player_id", keep="last")
         .set_index("player_id")
     )
     work["fpl_position"] = work["player_id"].map(current_position).fillna(work["fpl_position"])
+    existing_names = work.get(
+        "player_name", pd.Series(pd.NA, index=work.index, dtype="string")
+    )
+    work["player_name"] = work["player_id"].map(current_name).fillna(existing_names)
     work["current_team_id"] = work["player_id"].map(current_team)
     latest_team = latest["team_id"].astype("string")
     latest_position = latest["historical_fpl_position"].astype("string")
@@ -486,6 +510,7 @@ def _player_values(matches: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     if roster.empty:
         return pd.DataFrame()
     values = roster[[column for column in ("player_id", "fpl_pos", "position", "now_cost") if column in roster]].copy()
+    values.insert(1, "player_name", _player_names(roster))
     values["fpl_position"] = values.get("fpl_pos", values.get("position")).astype("string").str.upper().replace({"GK": "GKP"})
     values["price"] = _numeric(values, "now_cost")
     history = (
@@ -510,7 +535,8 @@ def _player_values(matches: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     )
     return values[
         [
-            "player_id", "fpl_position", "price", "historical_value_over_replacement",
+            "player_id", "player_name", "fpl_position", "price",
+            "historical_value_over_replacement",
             "historical_minutes", "historical_appearances", "historical_points",
             "points_per_million", "replacement_points_per_million",
         ]

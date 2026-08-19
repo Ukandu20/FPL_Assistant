@@ -48,8 +48,12 @@ def test_pipeline_emits_exactly_one_position_composite() -> None:
 
 
 def test_versioned_snapshot_is_deterministic_and_immutable(tmp_path: Path) -> None:
+    observations = _observations()
+    observations["player_name"] = observations["player_id"].map(
+        {"low": "Low Player", "mid": "Mid Player", "high": "High Player"}
+    )
     result = build_archetype_snapshot(
-        _observations(),
+        observations,
         as_of="2026-05-01T00:00:00Z",
         current_season="2025-2026",
     )
@@ -60,7 +64,11 @@ def test_versioned_snapshot_is_deterministic_and_immutable(tmp_path: Path) -> No
         evidence_tables=result.evidence_tables,
     )
     assert (target / "archetypes.jsonl").is_file()
+    assert (target / "archetypes.csv").is_file()
+    assert (target / "archetypes.parquet").is_file()
     assert (target / "team_ratings.jsonl").is_file()
+    assert (target / "team_ratings.csv").is_file()
+    assert (target / "team_ratings.parquet").is_file()
     assert (target / "manifest.json").is_file()
     assert (target / "player_match_evidence.jsonl").is_file()
     assert (target / "production_component_evidence.jsonl").is_file()
@@ -73,6 +81,25 @@ def test_versioned_snapshot_is_deterministic_and_immutable(tmp_path: Path) -> No
     }
     manifest = pd.read_json(target / "manifest.json", typ="series")
     assert "production_component_evidence.jsonl" in manifest["artifacts"]
+    assert "production_component_evidence.csv" in manifest["artifacts"]
+    assert "production_component_evidence.parquet" in manifest["artifacts"]
+    assert manifest["artifact_metadata"]["archetypes.parquet"]["format"] == "parquet"
+    assert manifest["artifact_metadata"]["archetypes.parquet"]["rows"] == len(
+        result.archetypes
+    )
+    csv_archetypes = pd.read_csv(target / "archetypes.csv")
+    parquet_archetypes = pd.read_parquet(target / "archetypes.parquet")
+    assert len(csv_archetypes) == len(result.archetypes)
+    assert len(parquet_archetypes) == len(result.archetypes)
+    assert csv_archetypes.loc[csv_archetypes["player_id"].eq("high"), "player_name"].eq(
+        "High Player"
+    ).all()
+    assert parquet_archetypes.loc[
+        parquet_archetypes["player_id"].eq("high"), "player_name"
+    ].eq("High Player").all()
+    assert "player_name" in pd.read_parquet(
+        target / "production_component_evidence.parquet"
+    )
     assert persist_snapshot(
         result.archetypes, result.team_ratings,
         output_root=tmp_path, snapshot_date="2026-05-01T00:00:00Z",
@@ -107,6 +134,28 @@ def test_versioned_snapshot_is_deterministic_and_immutable(tmp_path: Path) -> No
             model_version="1.0.0",
             evidence_tables=result.evidence_tables,
         )
+
+    legacy_root = tmp_path / "legacy"
+    legacy_target = (
+        legacy_root
+        / "model_version=1.0.0"
+        / "snapshot=2026-05-01T00-00-00Z"
+    )
+    legacy_target.mkdir(parents=True)
+    (legacy_target / "manifest.json").write_text(
+        '{"artifacts":{"archetypes.jsonl":"legacy"}}\n', encoding="utf-8"
+    )
+    with pytest.raises(FileExistsError, match="manifest would be overwritten"):
+        persist_snapshot(
+            result.archetypes,
+            result.team_ratings,
+            output_root=legacy_root,
+            snapshot_date="2026-05-01T00:00:00Z",
+            model_version="1.0.0",
+            evidence_tables=result.evidence_tables,
+        )
+    assert not (legacy_target / "archetypes.csv").exists()
+    assert not (legacy_target / "archetypes.parquet").exists()
 
 
 def test_pipeline_adds_own_and_opponent_pre_match_context_to_evidence() -> None:

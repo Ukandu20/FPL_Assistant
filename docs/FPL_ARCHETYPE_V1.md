@@ -106,15 +106,15 @@ Outputs are partitioned by semantic model version and snapshot timestamp:
 data/processed/archetypes/
   model_version=1.0.0/
     snapshot=2026-05-25T14-00-00Z/
-      archetypes.jsonl
-      team_ratings.jsonl
-      player_match_evidence.jsonl
-      team_match_evidence.jsonl
-      player_value_evidence.jsonl
-      production_component_evidence.jsonl
-      family_calculation_evidence.jsonl
-      field_provenance.jsonl
-      input_build_audit.jsonl
+      archetypes.{jsonl,csv,parquet}
+      team_ratings.{jsonl,csv,parquet}
+      player_match_evidence.{jsonl,csv,parquet}
+      team_match_evidence.{jsonl,csv,parquet}
+      player_value_evidence.{jsonl,csv,parquet}
+      production_component_evidence.{jsonl,csv,parquet}
+      family_calculation_evidence.{jsonl,csv,parquet}
+      field_provenance.{jsonl,csv,parquet}
+      input_build_audit.{jsonl,csv,parquet}
       manifest.json
 ```
 
@@ -133,8 +133,11 @@ The snapshot retains both results and their complete lead-up data:
 - `team_match_evidence.jsonl` and `player_value_evidence.jsonl` preserve the
   other supplied inputs. `team_ratings.jsonl` remains the immutable pre-match
   team-rating sequence.
-- `manifest.json` records every artifact's SHA-256 hash, row count, and column
-  list.
+- Each table is published as canonical JSONL, human-readable CSV, and typed,
+  Zstandard-compressed Parquet. Player-keyed tables include `player_name` from
+  the current-season FPL roster. The application continues to consume JSONL.
+- `manifest.json` records every artifact's SHA-256 hash, format, logical table,
+  row count, column list, and pandas dtypes.
 
 An existing snapshot can be written again only when its bytes are identical.
 A conflicting write fails instead of erasing historical output. Supply the
