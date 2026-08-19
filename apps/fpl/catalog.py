@@ -12,6 +12,7 @@ RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 FPL_ROOT = PROCESSED_ROOT / "fpl"
 RAW_FPL_ROOT = RAW_ROOT / "fpl"
 UNDERSTAT_ROOT = PROCESSED_ROOT / "understat"
+WHOSCORED_ROOT = PROCESSED_ROOT / "whoscored"
 PREDICTIONS_ROOT = PROJECT_ROOT / "data" / "predictions"
 ARCHETYPE_ROOT = PROCESSED_ROOT / "archetypes"
 FIXTURE_REGISTRY_ROOT = PROCESSED_ROOT / "registry" / "fixtures"
@@ -129,6 +130,10 @@ def latest_archetype_snapshot(
 
 def understat_team_season_path(league: str, season: str) -> Path:
     return UNDERSTAT_ROOT / league / season / "team_season.csv"
+
+
+def whoscored_roles_path(league: str, season: str) -> Path:
+    return WHOSCORED_ROOT / league / season / "player_season" / "roles.csv"
 
 
 def file_version(path: Path) -> tuple[int, int] | None:

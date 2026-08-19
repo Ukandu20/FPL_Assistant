@@ -378,7 +378,7 @@ def comparable_players(
         ascending=[False, False, True, True],
         kind="mergesort",
     ).head(limit)
-    output = candidates[["name", "team", "now_cost", "total_points", "selected_by_percent"]].copy()
+    output = candidates[["player_id", "name", "team", "now_cost", "total_points", "selected_by_percent"]].copy()
     output["now_cost"] = output["now_cost"].map(
         lambda value: f"£{float(value) / 10:.1f}m" if pd.notna(value) else "—"
     )
