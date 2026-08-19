@@ -6,6 +6,23 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from apps.fpl.app_data import (
+    archetypes,
+    raw_fixtures,
+    raw_teams,
+    season_players,
+    set_piece_roles,
+)
+from apps.fpl.state import (
+    comparison,
+    query_value,
+    set_comparison,
+    shortlist,
+    switch_page,
+    toggle_shortlist,
+    update_query,
+)
+from apps.fpl.ui import apply_chart_style, empty_state, file_freshness, inject_global_styles, page_header
 from apps.fpl.catalog import (
     FPL_ROOT,
     discover_leagues,
@@ -15,9 +32,11 @@ from apps.fpl.catalog import (
     fpl_season_path,
     understat_team_season_path,
 )
+from fpl_assistant.apps.viewmodels.dashboard import enrich_current_players, fixture_rows
+from fpl_assistant.apps.viewmodels.player_card import team_badge_url
 
 
-st.set_page_config(page_title="FPL Team Analysis", layout="wide")
+st.set_page_config(page_title="FPL Teams", page_icon="🛡️", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
@@ -128,120 +147,205 @@ def format_number(value: object, digits: int = 1) -> str:
 
 
 def main() -> None:
-    st.title("Team Analysis")
-    st.caption(
-        "Compare club performance and identify the players producing the most "
-        "FPL value and recent returns."
-    )
-
+    inject_global_styles()
     leagues = discover_leagues(FPL_ROOT)
     if not leagues:
-        st.error(f"No FPL league data found in {FPL_ROOT}.")
+        empty_state("No FPL data", f"No processed league data was found in {FPL_ROOT}.", icon="⚠️")
         return
 
-    league = st.sidebar.selectbox("League", leagues, key="team_league")
+    requested_league = query_value("league")
+    league_index = leagues.index(requested_league) if requested_league in leagues else 0
+    league = st.sidebar.selectbox("League", leagues, index=league_index, key="team_league")
     seasons = discover_seasons(league)
     if not seasons:
-        st.warning(f"No FPL seasons are available for {league}.")
+        empty_state("No seasons", f"No FPL seasons are available for {league}.", icon="⚠️")
         return
-    season = st.sidebar.selectbox("Season", seasons, key="team_season")
+    requested_season = query_value("season")
+    season_index = seasons.index(requested_season) if requested_season in seasons else 0
+    season = st.sidebar.selectbox("Season", seasons, index=season_index, key="team_season")
 
     players_path = fpl_season_path(league, season)
     gameweeks_path = fpl_gameweeks_path(league, season)
-    understat_path = understat_team_season_path(league, season)
-    players = load_csv(str(players_path), file_version(players_path))
+    players = season_players(league, season)
     gameweeks = load_csv(str(gameweeks_path), file_version(gameweeks_path))
-    team_season = load_csv(str(understat_path), file_version(understat_path))
-
     if players.empty or "team" not in players.columns:
-        st.warning(f"No player-season data is available for {league} {season}.")
+        empty_state("No roster", f"No player-season data is available for {league} {season}.")
         return
 
     teams = sorted(players["team"].dropna().astype(str).unique())
-    team = st.sidebar.selectbox("Team", teams, key="team_selected")
+    requested_team = query_value("team")
+    team_index = teams.index(requested_team) if requested_team in teams else 0
+    team = st.sidebar.selectbox("Team", teams, index=team_index, key="team_selected")
     recent_rounds = st.sidebar.slider("Recent form window", 3, 8, 5)
+    update_query(league=league, season=season, team=team)
 
+    previous_index = seasons.index(season) + 1
+    previous_season = seasons[previous_index] if previous_index < len(seasons) else None
+    previous_players = season_players(league, previous_season) if previous_season else pd.DataFrame()
+    archetype_data, _ = archetypes(season)
+    enriched = enrich_current_players(players, previous_players, archetype_data)
+    enriched_team = enriched.loc[enriched["team"].astype(str).eq(team)].copy()
+
+    raw_team_data = raw_teams(league, season)
+    team_row = raw_team_data.loc[raw_team_data.get("short_name", pd.Series(dtype="object")).astype(str).eq(team)]
+    badge = None
+    if not team_row.empty:
+        badge = team_badge_url(team_row.iloc[0].get("code"), asset_version="25")
+    header_columns = st.columns([1, 8], vertical_alignment="center")
+    if badge:
+        header_columns[0].image(badge, width=72)
+    with header_columns[1]:
+        page_header(
+            team,
+            "Team context, fixture outlook, squad roles and player-level FPL decisions.",
+            eyebrow=f"{season} team analysis",
+            freshness=file_freshness(players_path),
+        )
+
+    understat_path = understat_team_season_path(league, season)
+    team_season = load_csv(str(understat_path), file_version(understat_path))
     performance = build_team_performance(team_season, team)
-    st.subheader(f"{team} · {season}")
+    performance_label = season
+    if performance is None and previous_season:
+        baseline_path = understat_team_season_path(league, previous_season)
+        baseline = load_csv(str(baseline_path), file_version(baseline_path))
+        performance = build_team_performance(baseline, team)
+        performance_label = f"{previous_season} baseline"
     if performance is None:
-        st.info(
-            "Underlying team-season performance is not available for this "
-            "season yet. The player analysis below uses the current FPL roster."
-        )
+        st.info("Team-performance context is not available; squad and fixture analysis remains current.")
     else:
-        metrics = st.columns(6)
-        metrics[0].metric("Points", format_number(performance.get("points"), 0))
-        metrics[1].metric("Expected points", format_number(performance.get("expected_points")))
-        metrics[2].metric("Goals", format_number(performance.get("goals_for"), 0))
-        metrics[3].metric("xG", format_number(performance.get("xg")))
-        metrics[4].metric("xGA", format_number(performance.get("xga")))
-        metrics[5].metric("xGD", format_number(performance.get("xg_difference")))
+        st.caption(f"Team-performance evidence: {performance_label}")
+        first_metrics = st.columns(4)
+        second_metrics = st.columns(2)
+        values = [
+            ("Points", performance.get("points"), 0),
+            ("Expected points", performance.get("expected_points"), 1),
+            ("Goals", performance.get("goals_for"), 0),
+            ("xG", performance.get("xg"), 1),
+            ("xGA", performance.get("xga"), 1),
+            ("xGD", performance.get("xg_difference"), 1),
+        ]
+        for container, (label, value, digits) in zip([*first_metrics, *second_metrics], values):
+            container.metric(label, format_number(value, digits))
 
-    player_table = build_team_player_table(
-        players, gameweeks, team, recent_rounds=recent_rounds
+    all_fixture_rows = fixture_rows(raw_fixtures(league, season), raw_team_data)
+    team_numeric = pd.to_numeric(enriched_team.get("fpl_team_numeric_id"), errors="coerce").dropna()
+    team_fixtures = (
+        all_fixture_rows.loc[all_fixture_rows["team_numeric_id"].eq(team_numeric.iloc[0])].head(5)
+        if not all_fixture_rows.empty and not team_numeric.empty else pd.DataFrame()
     )
-    if player_table.empty:
-        st.warning("No players were found for this team.")
-        return
+    st.markdown("### Fixture run")
+    if team_fixtures.empty:
+        empty_state("No upcoming fixtures", "The current fixture feed has no scheduled matches for this team.")
+    else:
+        fixture_columns = st.columns(min(5, len(team_fixtures)))
+        for container, fixture in zip(fixture_columns, team_fixtures.to_dict("records")):
+            with container:
+                st.metric(
+                    f"GW{int(fixture['GW'])} · {fixture['Venue']}",
+                    str(fixture["Opponent"]),
+                    f"FDR {fixture['FDR']:.0f}",
+                )
 
-    has_played_performance = bool(
-        numeric_series(player_table, "Minutes").fillna(0).gt(0).any()
-        or numeric_series(player_table, f"Last {recent_rounds} minutes")
-        .fillna(0)
-        .gt(0)
-        .any()
-    )
-    if not has_played_performance:
-        st.info(
-            "This is a preseason roster: no played minutes or FPL returns are "
-            "available yet. Select the previous season to compare performance."
+    st.markdown("### Squad structure")
+    structure_columns = st.columns(3)
+    for container, (label, column) in zip(
+        structure_columns,
+        [("Production profiles", "Production profile"), ("Usage states", "Usage"), ("Risk flags", "Risk")],
+    ):
+        with container:
+            st.markdown(f"#### {label}")
+            if column not in enriched_team or enriched_team[column].dropna().empty:
+                st.caption("No active classifications")
+            else:
+                counts = enriched_team[column].dropna().value_counts().rename_axis("Profile").reset_index(name="Players")
+                st.dataframe(counts, hide_index=True, width="stretch")
+
+    st.markdown("### Set-piece hierarchy")
+    roles_season = season
+    roles = set_piece_roles(league, season)
+    if roles.empty and previous_season:
+        roles = set_piece_roles(league, previous_season)
+        roles_season = previous_season
+    team_roles = roles.loc[roles.get("team", pd.Series(dtype="object")).astype(str).eq(team)].copy()
+    if team_roles.empty:
+        st.caption("No observed set-piece hierarchy is available for this team.")
+    else:
+        st.caption(f"Observed taker evidence from {roles_season}; current availability may differ.")
+        role_display = team_roles[[
+            column for column in [
+                "player", "role", "side", "role_rank", "share", "confidence_label", "last_taken"
+            ] if column in team_roles
+        ]].rename(
+            columns={
+                "player": "Player", "role": "Role", "side": "Side",
+                "role_rank": "Hierarchy", "share": "Share",
+                "confidence_label": "Confidence", "last_taken": "Last taken",
+            }
         )
-        st.subheader("Current roster")
+        if "Share" in role_display:
+            role_display["Share"] = pd.to_numeric(role_display["Share"], errors="coerce").mul(100)
         st.dataframe(
-            player_table[["Player", "Position", "Status", "Price (£m)", "Ownership %"]],
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Price (£m)": st.column_config.NumberColumn(format="£%.1fm"),
-                "Ownership %": st.column_config.NumberColumn(format="%.1f%%"),
-            },
+            role_display.head(20), hide_index=True, width="stretch",
+            column_config={"Share": st.column_config.NumberColumn(format="%.0f%%")},
         )
+
+    player_table = build_team_player_table(players, gameweeks, team, recent_rounds=recent_rounds)
+    if player_table.empty:
+        empty_state("No players", "No players were found for this team.")
         return
+    live_minutes = numeric_series(player_table, "Minutes").fillna(0)
+    has_live = live_minutes.gt(0).any()
+    identity = enriched_team[["player_id", "name", *[
+        column for column in ["Production profile", "Usage", "Risk", "baseline_total_points", "baseline_minutes"]
+        if column in enriched_team
+    ]]].rename(columns={"name": "Player"})
+    display = player_table.merge(identity, on="Player", how="left", validate="one_to_one")
+    if not has_live:
+        st.info(
+            "This is a preseason roster. Performance columns use the previous-season baseline "
+            "where the player has matching historical evidence."
+        )
+        display["Baseline points"] = pd.to_numeric(display.get("baseline_total_points"), errors="coerce")
+        display["Baseline minutes"] = pd.to_numeric(display.get("baseline_minutes"), errors="coerce")
+    else:
+        recent_points = f"Last {recent_rounds} points"
+        leaders = st.columns(4)
+        for container, (label, column) in zip(
+            leaders,
+            [
+                ("Season points leader", "Season points"),
+                ("Recent form leader", recent_points),
+                ("Best value", "Points/£m"),
+                ("Minutes leader", "Minutes"),
+            ],
+        ):
+            eligible = display.dropna(subset=[column])
+            if eligible.empty:
+                container.metric(label, "—")
+            else:
+                leader = eligible.loc[eligible[column].idxmax()]
+                container.metric(label, str(leader["Player"]), format_number(leader[column]))
+        chart_data = display.nlargest(12, "Season points").sort_values("Season points")
+        figure = px.bar(
+            chart_data, x="Season points", y="Player", orientation="h", color="Position",
+            hover_data=["Price (£m)", recent_points, "Minutes", "Points/£m"],
+            title=f"Top FPL performers for {team}",
+        )
+        apply_chart_style(figure, height=430)
+        st.plotly_chart(figure, width="stretch")
 
-    recent_points = f"Last {recent_rounds} points"
-    leader_columns = st.columns(4)
-    leaders = (
-        ("Season points leader", "Season points"),
-        ("Recent form leader", recent_points),
-        ("Best value", "Points/£m"),
-        ("Minutes leader", "Minutes"),
-    )
-    for container, (label, column) in zip(leader_columns, leaders):
-        eligible = player_table.dropna(subset=[column])
-        if eligible.empty:
-            container.metric(label, "—")
-        else:
-            leader = eligible.loc[eligible[column].idxmax()]
-            container.metric(label, str(leader["Player"]), format_number(leader[column]))
-
-    chart_data = player_table.nlargest(12, "Season points").sort_values("Season points")
-    figure = px.bar(
-        chart_data,
-        x="Season points",
-        y="Player",
-        orientation="h",
-        color="Position",
-        hover_data=["Price (£m)", recent_points, "Minutes", "Points/£m"],
-        title=f"Top FPL performers for {team}",
-    )
-    figure.update_layout(height=430, margin=dict(t=50, b=20, l=20, r=20))
-    st.plotly_chart(figure, width="stretch")
-
-    st.subheader("Player performance")
-    st.dataframe(
-        player_table,
+    st.markdown("### Players")
+    visible = display.drop(columns=[
+        column for column in ["player_id", "baseline_total_points", "baseline_minutes"] if column in display
+    ])
+    selection = st.dataframe(
+        visible,
         hide_index=True,
         width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"team_players_{season}_{team}",
         column_config={
             "Price (£m)": st.column_config.NumberColumn(format="£%.1fm"),
             "xG": st.column_config.NumberColumn(format="%.2f"),
@@ -250,6 +354,21 @@ def main() -> None:
             "Ownership %": st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
+    if selection.selection.rows:
+        chosen = display.iloc[selection.selection.rows[0]]
+        st.caption(f"Selected: {chosen['Player']}")
+        actions = st.columns(3)
+        if actions[0].button("Open Player Card", type="primary", width="stretch"):
+            switch_page("0_main.py", season=season, player=chosen["player_id"], view="Overview")
+        if actions[1].button("Add to Compare", width="stretch"):
+            set_comparison([*comparison(), chosen["player_id"]])
+            st.toast(f"Added {chosen['Player']} to Compare")
+        is_shortlisted = str(chosen["player_id"]) in shortlist()
+        if actions[2].button(
+            "Remove shortlist" if is_shortlisted else "Add shortlist", width="stretch"
+        ):
+            toggle_shortlist(chosen["player_id"])
+            st.rerun()
 
 
 if __name__ == "__main__":

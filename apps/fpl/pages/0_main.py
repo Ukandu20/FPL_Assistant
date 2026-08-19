@@ -8,6 +8,7 @@ import plotly.express as px
 import streamlit as st
 import streamlit_shadcn_ui as ui
 
+from apps.fpl.app_data import archetypes as app_archetypes, player_archetype_history
 from apps.fpl.catalog import (
     PREDICTIONS_ROOT,
     FPL_ROOT,
@@ -24,6 +25,28 @@ from apps.fpl.catalog import (
     fpl_raw_teams_path,
     fpl_season_path,
     latest_archetype_snapshot,
+)
+from apps.fpl.state import (
+    comparison,
+    query_value,
+    recent_players,
+    record_recent_player,
+    set_comparison,
+    shortlist,
+    switch_page,
+    toggle_shortlist,
+    update_query,
+)
+from apps.fpl.ui import (
+    apply_chart_style,
+    badge_markdown as archetype_badge_markdown,
+    inject_global_styles,
+    page_header,
+)
+from fpl_assistant.apps.viewmodels.dashboard import (
+    FAMILY_DESCRIPTIONS,
+    active_archetype_tags,
+    archetype_reason,
 )
 from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
 
@@ -47,7 +70,7 @@ select_profile_snapshot = player_card_viewmodels.select_profile_snapshot
 team_badge_url = player_card_viewmodels.team_badge_url
 
 
-st.set_page_config(page_title="Fantasy Premier League dashboard", layout="wide")
+st.set_page_config(page_title="FPL Players", page_icon="👤", layout="wide")
 
 MIN_PER_90_MINUTES = 450
 
@@ -115,33 +138,6 @@ LOWER_IS_BETTER_METRICS = {
     "goals_against",
     "penalties_allowed",
     "penalties_missed",
-}
-
-ARCHETYPE_FAMILY_BADGE_COLORS = {
-    "Production Composite": "violet",
-    "Production Style": "blue",
-    "Production": "blue",
-    "Usage": "green",
-    "Return Shape": "orange",
-    "Risk Badge": "red",
-    "Value Historical": "gray",
-    "Venue Behaviour": "gray",
-}
-
-ARCHETYPE_FAMILY_ORDER = {
-    family: index
-    for index, family in enumerate(
-        [
-            "Production Composite",
-            "Production Style",
-            "Production",
-            "Usage",
-            "Return Shape",
-            "Venue Behaviour",
-            "Value Historical",
-            "Risk Badge",
-        ]
-    )
 }
 
 GAMEWEEK_POINT_COMPONENTS = [
@@ -982,183 +978,6 @@ def filter_player_pool(
     return pool
 
 
-def _render_legacy_overview_tab(
-    selected_record: pd.Series,
-    total_record: pd.Series,
-    raw_record: pd.Series,
-    gameweek_history: pd.DataFrame,
-    forecast: pd.DataFrame,
-    profile: pd.Series | None,
-    *,
-    per_90: bool,
-) -> None:
-    """Render the decision-oriented summary for a selected player-season."""
-    position = selected_record["Position"]
-    is_goalkeeper = is_goalkeeper_position(position)
-    metric_suffix = " /90" if per_90 else ""
-    selected_points = pd.to_numeric(selected_record["Points"], errors="coerce")
-    selected_goals = pd.to_numeric(selected_record["Goals"], errors="coerce")
-    selected_assists = pd.to_numeric(selected_record["Assists"], errors="coerce")
-    selected_saves = pd.to_numeric(selected_record.get("Saves"), errors="coerce")
-    selected_defcon = pd.to_numeric(selected_record.get("Def Con"), errors="coerce")
-
-    metrics = st.columns(5)
-    with metrics[0]:
-        render_price_metric_card(
-            selected_record["Price"],
-            selected_record.get("Price Category", "Uncategorized"),
-        )
-    with metrics[1]:
-        # Overview always shows decision-friendly season points, not a rate.
-        total_points = pd.to_numeric(raw_record.get("total_points"), errors="coerce")
-        render_metric_card(
-            f"{selected_record['Season']} points",
-            format_metric_card_value(total_points, False),
-            format_metric_percentile_delta(total_record, "Points"),
-        )
-    with metrics[2]:
-        metric_name = "Saves" if is_goalkeeper else "Goals"
-        metric_value = selected_saves if is_goalkeeper else selected_goals
-        render_metric_card(
-            f"{metric_name}{metric_suffix}",
-            format_metric_card_value(metric_value, per_90),
-            format_metric_percentile_delta(selected_record, metric_name),
-        )
-    with metrics[3]:
-        if is_goalkeeper:
-            save_pct = pd.to_numeric(selected_record.get("Save %"), errors="coerce")
-            render_metric_card(
-                "Save %",
-                format_percentage(save_pct),
-                format_metric_percentile_delta(selected_record, "Save %"),
-            )
-        else:
-            render_metric_card(
-                f"Assists{metric_suffix}",
-                format_metric_card_value(selected_assists, per_90),
-                format_metric_percentile_delta(selected_record, "Assists"),
-            )
-    with metrics[4]:
-        render_metric_card(
-            f"Def Con{metric_suffix}",
-            format_metric_card_value(selected_defcon, per_90),
-            format_metric_percentile_delta(selected_record, "Def Con"),
-        )
-
-    recent_points = pd.to_numeric(
-        gameweek_history.tail(3).get("Total FPL points"), errors="coerce"
-    ).sum(min_count=1) if not gameweek_history.empty else pd.NA
-    summary = forecast_summary(forecast)
-    decision_cards = st.columns(5)
-    decision_cards[0].metric(
-        "Last 3 GWs",
-        "—" if pd.isna(recent_points) else f"{recent_points:.0f} pts",
-    )
-    decision_cards[1].metric(
-        "Forecast window",
-        "—" if not summary else f"{summary['expected_points']:.1f} xPts",
-    )
-    decision_cards[2].metric(
-        "Predicted minutes",
-        "—" if not summary else f"{summary['predicted_minutes']:.0f}",
-    )
-    decision_cards[3].metric(
-        "Next fixture", "—" if not summary else str(summary["next_fixture"])
-    )
-    ownership = pd.to_numeric(raw_record.get("selected_by_percent"), errors="coerce")
-    decision_cards[4].metric(
-        "Ownership", "—" if pd.isna(ownership) else f"{ownership:.1f}%"
-    )
-
-    status = str(raw_record.get("status", ""))
-    news = str(raw_record.get("news", "")).strip()
-    if status and status.lower() not in {"a", "available", "nan"}:
-        st.warning(f"Availability status: {status}. {news}".strip())
-    elif news and news.lower() != "nan":
-        st.info(news)
-
-    if profile is not None and str(profile.get("profile_status")) in {
-        "Established",
-        "Provisional",
-    }:
-        st.caption(
-            f"Profile: {profile.get('production_tier', 'Unrated')} "
-            f"{profile.get('production_archetype', 'profile')} · "
-            f"Primary strength: {profile.get('primary_strength', '—')}"
-        )
-
-
-def active_archetype_tags(
-    archetypes: pd.DataFrame, *, overview: bool = False
-) -> pd.DataFrame:
-    """Return active labels in a stable display order.
-
-    The overview deliberately carries only the production summary, usage state,
-    and risk badge. The dedicated profile view can show every active label.
-    """
-    required = {"family", "display_name", "active_label"}
-    if archetypes.empty or not required.issubset(archetypes.columns):
-        return pd.DataFrame(columns=list(archetypes.columns))
-
-    active_values = archetypes["active_label"]
-    active_mask = active_values.eq(True) | active_values.astype("string").str.lower().eq(
-        "true"
-    )
-    active = archetypes.loc[active_mask].copy()
-    if active.empty:
-        return active
-
-    active["_score"] = pd.to_numeric(active.get("score_0_100"), errors="coerce")
-    active["_family_order"] = active["family"].map(ARCHETYPE_FAMILY_ORDER).fillna(
-        len(ARCHETYPE_FAMILY_ORDER)
-    )
-    active = active.sort_values(
-        ["_family_order", "_score", "display_name"],
-        ascending=[True, False, True],
-        kind="stable",
-    )
-
-    if overview:
-        chosen: list[pd.DataFrame] = []
-        production = active.loc[active["family"].eq("Production Composite")]
-        if production.empty:
-            production = active.loc[
-                active["family"].isin(["Production Style", "Production"])
-            ]
-        if not production.empty:
-            chosen.append(production.head(1))
-        for family in ("Usage", "Risk Badge"):
-            family_rows = active.loc[active["family"].eq(family)]
-            if not family_rows.empty:
-                chosen.append(family_rows.head(1))
-        active = pd.concat(chosen, ignore_index=True) if chosen else active.head(0)
-
-    dedupe_column = "archetype_id" if "archetype_id" in active else "display_name"
-    return (
-        active.drop_duplicates(subset=[dedupe_column], keep="first")
-        .drop(columns=["_score", "_family_order"], errors="ignore")
-        .reset_index(drop=True)
-    )
-
-
-def archetype_badge_markdown(archetypes: pd.DataFrame) -> str:
-    """Build inline, non-interactive Streamlit badge markup for archetypes."""
-    badges: list[str] = []
-    for row in archetypes.to_dict("records"):
-        label = str(row.get("display_name", "")).strip()
-        if not label:
-            continue
-        label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-        confidence = str(row.get("confidence_band", "")).strip().lower()
-        color = (
-            "gray"
-            if confidence == "low"
-            else ARCHETYPE_FAMILY_BADGE_COLORS.get(str(row.get("family", "")), "gray")
-        )
-        badges.append(f":{color}-badge[{label}]")
-    return " ".join(badges)
-
-
 def render_overview_tab(
     player_name: str,
     selected_season: str,
@@ -1303,16 +1122,15 @@ def render_overview_tab(
                 if pd.isna(opponent_team_id)
                 else team_badges.get(int(opponent_team_id))
             )
-            fixture_metrics = st.columns(
-                [1, 2, 2, 1, 1, 1], vertical_alignment="center"
-            )
+            fixture_identity = st.columns([1, 8], vertical_alignment="center")
             if opponent_badge:
-                fixture_metrics[0].image(opponent_badge, width=48)
-            fixture_metrics[1].metric("Opponent", f"{opponent} ({venue})")
-            fixture_metrics[2].metric("Kick-off", date_label)
-            fixture_metrics[3].metric("Gameweek", "—" if pd.isna(gw) else f"GW{gw:.0f}")
-            fixture_metrics[4].metric("FDR", "—" if pd.isna(fdr) else f"{fdr:.0f}/5")
-            fixture_metrics[5].metric(
+                fixture_identity[0].image(opponent_badge, width=48)
+            fixture_identity[1].markdown(f"#### {opponent} ({venue})")
+            fixture_metrics = st.columns(4)
+            fixture_metrics[0].metric("Kick-off", date_label)
+            fixture_metrics[1].metric("Gameweek", "—" if pd.isna(gw) else f"GW{gw:.0f}")
+            fixture_metrics[2].metric("FDR", "—" if pd.isna(fdr) else f"{fdr:.0f}/5")
+            fixture_metrics[3].metric(
                 "Next xPts",
                 "Not published" if pd.isna(expected_points) else f"{expected_points:.1f}",
             )
@@ -1323,7 +1141,7 @@ def render_overview_tab(
             )
 
     recent = recent_form_summary(gameweek_history)
-    st.markdown("### Decision snapshot")
+    st.markdown("### Decision summary")
     snapshot = st.columns(4)
     snapshot[0].metric(
         "Recent form",
@@ -1332,64 +1150,40 @@ def render_overview_tab(
         else f"{recent['points']:.0f} pts · last {recent['gameweeks']} GWs",
     )
     next_minutes = pd.NA if fixtures.empty else number(fixtures.iloc[0].get("pred_minutes"))
+    next_xpts = pd.NA if fixtures.empty else number(fixtures.iloc[0].get("xPts"))
     snapshot[1].metric(
-        "Minutes security",
-        "Forecast not published" if pd.isna(next_minutes) else f"{next_minutes:.0f} next match",
+        "Next fixture xPts",
+        "Not published" if pd.isna(next_xpts) else f"{next_xpts:.1f}",
+    )
+    snapshot[2].metric(
+        "Predicted minutes",
+        "Not published" if pd.isna(next_minutes) else f"{next_minutes:.0f}",
         None if not recent else f"{recent['starts']} starts · last {recent['gameweeks']} GWs",
     )
-    if player_details is None:
-        snapshot[2].metric("Market movement", "Unavailable")
-        snapshot[3].metric("FPL next estimate", "Unavailable")
-    else:
+    season_points = number(raw_record.get("total_points"))
+    snapshot[3].metric(
+        "Season points", "—" if pd.isna(season_points) else f"{season_points:.0f}"
+    )
+    if player_details is not None:
         net_transfers = number(player_details.get("transfers_in_event")) - number(
             player_details.get("transfers_out_event")
         )
         price_change = number(player_details.get("cost_change_event"))
-        snapshot[2].metric(
-            "Net transfers this GW",
-            "—" if pd.isna(net_transfers) else f"{net_transfers:+,.0f}",
-            None if pd.isna(price_change) else f"{price_change / 10:+.1f}m price change",
-        )
         ep_next = number(player_details.get("ep_next"))
-        snapshot[3].metric(
-            "FPL next estimate", "—" if pd.isna(ep_next) else f"{ep_next:.1f} pts"
-        )
+        market_parts = []
+        if pd.notna(net_transfers):
+            market_parts.append(f"{net_transfers:+,.0f} net transfers")
+        if pd.notna(price_change):
+            market_parts.append(f"{price_change / 10:+.1f}m price change")
+        if pd.notna(ep_next):
+            market_parts.append(f"FPL estimate {ep_next:.1f}")
+        if market_parts:
+            st.caption("Market context · " + " · ".join(market_parts))
 
-    st.markdown("#### Current-season snapshot")
     season_minutes = number(raw_record.get("minutes"))
-    season_points = number(raw_record.get("total_points"))
-    price_tenths = number(raw_record.get("now_cost"))
-    points_per_million = (
-        pd.NA
-        if pd.isna(season_points) or pd.isna(price_tenths) or price_tenths <= 0
-        else season_points / (price_tenths / 10)
-    )
-    season_metrics = st.columns(5)
-    season_metrics[0].metric(
-        "FPL points", "—" if pd.isna(season_points) else f"{season_points:.0f}"
-    )
-    if is_goalkeeper_position(position):
-        season_metrics[1].metric(
-            "Saves", "—" if pd.isna(number(raw_record.get("saves"))) else f"{number(raw_record.get('saves')):.0f}"
-        )
-        save_pct = number(raw_record.get("save_pct"))
-        season_metrics[2].metric("Save %", "—" if pd.isna(save_pct) else f"{save_pct:.1f}%")
-    else:
-        goals = number(raw_record.get("goals_scored"))
-        assists = number(raw_record.get("assists"))
-        season_metrics[1].metric("Goals", "—" if pd.isna(goals) else f"{goals:.0f}")
-        season_metrics[2].metric("Assists", "—" if pd.isna(assists) else f"{assists:.0f}")
-    expected_involvement = number(raw_record.get("xg")) + number(raw_record.get("xa"))
-    season_metrics[3].metric(
-        "xGI", "—" if pd.isna(expected_involvement) else f"{expected_involvement:.2f}"
-    )
-    season_metrics[4].metric(
-        "Points / £m",
-        "—" if pd.isna(points_per_million) else f"{points_per_million:.1f}",
-    )
     if pd.isna(season_minutes) or season_minutes == 0:
         st.caption(
-            "Preseason state: current-season production is shown as zero; use the "
+            "Preseason state: no current-season production has been recorded; use the "
             "labelled prior profile and upcoming fixtures for context."
         )
 
@@ -1521,6 +1315,7 @@ def render_overview_tab(
             )
         )
         figure.update_layout(height=280, margin=dict(t=45, b=15, l=15, r=15))
+        apply_chart_style(figure, height=280)
         st.plotly_chart(figure, width="stretch")
 
     positives, risks = decision_factors(
@@ -1553,7 +1348,22 @@ def render_overview_tab(
     if alternatives.empty:
         st.info("No comparable alternatives are available in the selected player pool.")
     else:
-        st.dataframe(alternatives, hide_index=True, width="stretch")
+        st.caption("Select an alternative to open its Player Card.")
+        alternative_event = st.dataframe(
+            alternatives.drop(columns="player_id", errors="ignore"),
+            hide_index=True,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"alternatives_{selected_season}_{player_name}",
+        )
+        if alternative_event.selection.rows and "player_id" in alternatives:
+            alternative_id = str(
+                alternatives.iloc[alternative_event.selection.rows[0]]["player_id"]
+            )
+            switch_page(
+                "0_main.py", season=selected_season, player=alternative_id, view="Overview"
+            )
 
     freshness = " · ".join(
         f"{label}: {value}" for label, value in data_freshness.items()
@@ -1611,6 +1421,7 @@ def render_performance_tab(
             legend_title_text="Contribution",
         )
         figure.update_xaxes(dtick=1)
+        apply_chart_style(figure, height=380)
         st.plotly_chart(figure, width="stretch")
 
     season_percentiles = percentile_table.loc[
@@ -1655,6 +1466,7 @@ def render_forecast_tab(
     )
     figure.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
     figure.update_xaxes(dtick=1)
+    apply_chart_style(figure, height=350)
     st.plotly_chart(figure, width="stretch")
 
     display_columns = {
@@ -1687,6 +1499,7 @@ def render_history_tab(
     percentile_table: pd.DataFrame,
     *,
     per_90: bool,
+    archetype_history: pd.DataFrame | None = None,
 ) -> None:
     """Render prior seasons and historical percentile context."""
     metric_suffix = " /90" if per_90 else ""
@@ -1701,6 +1514,7 @@ def render_history_tab(
         title=f"FPL points{metric_suffix} by season",
     )
     figure.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
+    apply_chart_style(figure, height=350)
     st.plotly_chart(figure, width="stretch")
 
     regular_columns = [
@@ -1732,6 +1546,27 @@ def render_history_tab(
         key=f"history_{player_id}",
         max_height=500,
     )
+    st.markdown("### Archetype history")
+    if archetype_history is None or archetype_history.empty:
+        st.info(
+            "Archetype changes will appear after multiple snapshots are published for this season."
+        )
+    else:
+        display = archetype_history[
+            [
+                column for column in [
+                    "Snapshot", "family", "display_name", "score_0_100",
+                    "confidence_band", "trend_direction", "status",
+                ] if column in archetype_history
+            ]
+        ].rename(
+            columns={
+                "family": "Family", "display_name": "Archetype",
+                "score_0_100": "Score", "confidence_band": "Confidence",
+                "trend_direction": "Trend", "status": "Status",
+            }
+        )
+        st.dataframe(display, hide_index=True, width="stretch")
 
 
 def render_profile_tab(
@@ -1863,6 +1698,11 @@ def render_v1_archetype_profile(
         for family, family_rows in active.groupby("family", sort=False):
             st.markdown(f"**{family}**")
             st.markdown(archetype_badge_markdown(family_rows))
+            st.caption(FAMILY_DESCRIPTIONS.get(str(family), "Active classification."))
+            for row in family_rows.to_dict("records"):
+                reason = archetype_reason(row)
+                if reason:
+                    st.caption(f"Why {row['display_name']}: {reason}")
         if active["confidence_band"].astype("string").str.lower().eq("low").any():
             st.caption("Muted tags indicate low-confidence classifications.")
 
@@ -1981,14 +1821,21 @@ def render_v1_archetype_profile(
 
 
 def main() -> None:
-    st.title("Fantasy Premier League Player Dashboard")
+    inject_global_styles()
+    page_header(
+        "Players",
+        "Discover FPL options, understand their role and risk, and inspect the evidence behind each profile.",
+        eyebrow="FPL decision centre",
+    )
 
     leagues = discover_leagues()
     if not leagues:
         st.error(f"No processed FPL data was found in {FPL_ROOT}.")
         return
 
-    league = st.sidebar.selectbox("League", leagues, key="fpl_league")
+    requested_league = query_value("league")
+    league_index = leagues.index(requested_league) if requested_league in leagues else 0
+    league = st.sidebar.selectbox("League", leagues, index=league_index, key="fpl_league")
     players = load_historical_fpl(league, historical_fpl_version(league))
 
     if players.empty:
@@ -1998,14 +1845,18 @@ def main() -> None:
     seasons = discover_seasons(league)
     saved_filters = st.session_state.get("player_filter_state", {})
     reset_version = st.session_state.get("player_filter_reset_version", 0)
-    saved_season = saved_filters.get("season", seasons[0])
+    requested_player = query_value("player")
+    player_widget_key = (
+        f"historical_player_{reset_version}_{requested_player or 'none'}"
+    )
+    saved_season = query_value("season") or saved_filters.get("season", seasons[0])
     if saved_season not in seasons:
         saved_season = seasons[0]
 
     with st.expander(
         "Find or switch player",
         expanded=not bool(
-            st.session_state.get(f"historical_player_{reset_version}")
+            st.session_state.get(player_widget_key)
         ),
     ):
         season_column, team_column, category_column, price_column = st.columns(4)
@@ -2119,6 +1970,87 @@ def main() -> None:
             selected_price_range,
             selected_price_category,
         )
+        discovery_archetypes, _ = app_archetypes(selected_season)
+        filter_columns = st.columns(3)
+        with filter_columns[0]:
+            availability_options = ["All statuses", "Available", "Flagged"]
+            saved_availability = saved_filters.get("availability", "All statuses")
+            if saved_availability not in availability_options:
+                saved_availability = "All statuses"
+            selected_availability = st.selectbox(
+                "Availability",
+                availability_options,
+                index=availability_options.index(saved_availability),
+                key=f"player_availability_{selected_season}_{reset_version}",
+            )
+        active_discovery = active_archetype_tags(discovery_archetypes)
+        archetype_options = [
+            "All archetypes",
+            *sorted(active_discovery.get("display_name", pd.Series(dtype="object")).dropna().astype(str).unique()),
+        ]
+        with filter_columns[1]:
+            saved_archetype = saved_filters.get("archetype", "All archetypes")
+            if saved_archetype not in archetype_options:
+                saved_archetype = "All archetypes"
+            selected_archetype = st.selectbox(
+                "Active archetype",
+                archetype_options,
+                index=archetype_options.index(saved_archetype),
+                key=f"player_archetype_{selected_season}_{reset_version}",
+            )
+        sort_options = ["Name", "Ownership", "Price", "Season points"]
+        with filter_columns[2]:
+            saved_sort = saved_filters.get("sort", "Name")
+            if saved_sort not in sort_options:
+                saved_sort = "Name"
+            selected_sort = st.selectbox(
+                "Sort players",
+                sort_options,
+                index=sort_options.index(saved_sort),
+                key=f"player_sort_{selected_season}_{reset_version}",
+            )
+        if selected_availability != "All statuses":
+            available_mask = filtered_players.get(
+                "status", pd.Series("", index=filtered_players.index)
+            ).astype("string").str.lower().isin(["a", "available"])
+            filtered_players = filtered_players.loc[
+                available_mask if selected_availability == "Available" else ~available_mask
+            ]
+        selected_archetype_scores = pd.Series(dtype="float64")
+        if selected_archetype != "All archetypes" and not active_discovery.empty:
+            matching_archetypes = active_discovery.loc[
+                active_discovery["display_name"].astype(str).eq(selected_archetype)
+            ].copy()
+            matching_archetypes["player_id"] = matching_archetypes["player_id"].astype(str)
+            matching_archetypes["_selected_score"] = pd.to_numeric(
+                matching_archetypes.get("score_0_100"), errors="coerce"
+            )
+            selected_archetype_scores = (
+                matching_archetypes.sort_values(
+                    "_selected_score", ascending=False, na_position="last", kind="stable"
+                )
+                .drop_duplicates("player_id", keep="first")
+                .set_index("player_id")["_selected_score"]
+            )
+            matching_archetype_ids = set(matching_archetypes["player_id"])
+            filtered_players = filtered_players.loc[
+                filtered_players["player_id"].astype(str).isin(matching_archetype_ids)
+            ]
+        sort_columns = {
+            "Name": ("name", True),
+            "Ownership": ("selected_by_percent", False),
+            "Price": ("now_cost", False),
+            "Season points": ("total_points", False),
+        }
+        sort_column, ascending = sort_columns[selected_sort]
+        if sort_column in filtered_players:
+            if sort_column != "name":
+                filtered_players[sort_column] = pd.to_numeric(
+                    filtered_players[sort_column], errors="coerce"
+                )
+            filtered_players = filtered_players.sort_values(
+                sort_column, ascending=ascending, na_position="last", kind="stable"
+            )
         labels = build_player_labels(filtered_players)
 
         search_column, player_column, mode_column, reset_column = st.columns(4)
@@ -2145,12 +2077,18 @@ def main() -> None:
 
         with player_column:
             if matching_labels:
+                player_options = list(matching_labels)
+                requested_index = (
+                    player_options.index(requested_player)
+                    if requested_player in player_options
+                    else None
+                )
                 selected_player_id = ui.select(
                     "Select a player to view",
-                    options=list(matching_labels),
+                    options=player_options,
                     format_func=lambda player_id: matching_labels[player_id],
-                    index=None,
-                    key=f"historical_player_{reset_version}",
+                    index=requested_index,
+                    key=player_widget_key,
                     placeholder="Select a matching player...",
                 )
             else:
@@ -2175,7 +2113,7 @@ def main() -> None:
     if reset_filters:
         st.session_state.pop("player_filter_state", None)
         st.session_state.pop("historical_player", None)
-        st.session_state.pop(f"historical_player_{reset_version}", None)
+        st.session_state.pop(player_widget_key, None)
         st.session_state["player_filter_reset_version"] = reset_version + 1
         st.rerun()
 
@@ -2187,7 +2125,11 @@ def main() -> None:
         "price_range": tuple(selected_price_range),
         "player_search": player_search,
         "per_90": per_90,
+        "availability": selected_availability,
+        "archetype": selected_archetype,
+        "sort": selected_sort,
     }
+    update_query(league=league, season=selected_season)
 
     st.caption(
         f"Showing {len(matching_labels):,} of {len(labels):,} filtered players "
@@ -2203,7 +2145,78 @@ def main() -> None:
         return
 
     if selected_player_id is None:
-        st.info("Select a player to see their FPL history.")
+        recent_ids = recent_players()
+        recent_rows = filtered_players.loc[
+            filtered_players["player_id"].astype(str).isin(recent_ids)
+        ].copy()
+        if not recent_rows.empty:
+            recent_rows["_order"] = recent_rows["player_id"].astype(str).map(
+                {value: index for index, value in enumerate(recent_ids)}
+            )
+            recent_rows = recent_rows.sort_values("_order")
+            st.markdown("### Recently viewed")
+            recent_columns = st.columns(min(4, len(recent_rows)))
+            for container, row in zip(recent_columns, recent_rows.to_dict("records")):
+                if container.button(
+                    f"{row.get('name')} · {row.get('team')}",
+                    key=f"recent_{row.get('player_id')}",
+                    width="stretch",
+                ):
+                    switch_page(
+                        "0_main.py", season=selected_season,
+                        player=row.get("player_id"), view="Overview",
+                    )
+        st.markdown("### Player discovery")
+        st.caption(
+            "Select any row to open a player card. In preseason, ownership and price "
+            "provide the most useful current-roster discovery signals."
+        )
+        discovery = filtered_players.copy()
+        discovery["_ownership"] = pd.to_numeric(
+            discovery.get("selected_by_percent"), errors="coerce"
+        )
+        discovery["_price"] = pd.to_numeric(discovery.get("now_cost"), errors="coerce").div(10)
+        if selected_archetype != "All archetypes":
+            discovery["_archetype_score"] = discovery["player_id"].astype(str).map(
+                selected_archetype_scores
+            )
+        discovery = discovery.sort_values(
+            ["_ownership", "_price"], ascending=False, na_position="last"
+        ).head(30)
+        discovery_columns = {
+            "Player": discovery.get("name"),
+            "Team": discovery.get("team"),
+            "Position": discovery.get("fpl_pos"),
+            "Price": discovery["_price"],
+            "Ownership": discovery["_ownership"],
+            "Status": discovery.get("status"),
+        }
+        if selected_archetype != "All archetypes":
+            discovery_columns["Archetype score"] = discovery["_archetype_score"]
+        discovery_display = pd.DataFrame(discovery_columns)
+        selection = st.dataframe(
+            discovery_display,
+            hide_index=True,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"player_discovery_{selected_season}_{reset_version}",
+            column_config={
+                "Price": st.column_config.NumberColumn(format="£%.1fm"),
+                "Ownership": st.column_config.NumberColumn(format="%.1f%%"),
+                "Archetype score": st.column_config.ProgressColumn(
+                    label=f"{selected_archetype} score",
+                    format="%.1f",
+                    min_value=0,
+                    max_value=100,
+                ),
+            },
+        )
+        if selection.selection.rows:
+            row_index = selection.selection.rows[0]
+            chosen_id = str(discovery.iloc[row_index]["player_id"])
+            update_query(player=chosen_id)
+            st.rerun()
         return
 
     history = build_player_history(players, selected_player_id, per_90=per_90)
@@ -2221,6 +2234,41 @@ def main() -> None:
         st.warning("The selected player is missing from the season roster.")
         return
     raw_record = raw_rows.iloc[0]
+    selected_player_id = str(selected_player_id)
+    record_recent_player(selected_player_id)
+    update_query(player=selected_player_id)
+
+    view_options = ["Overview", "Form & Forecast", "Profile", "History"]
+    requested_view = query_value("view", "Overview")
+    if requested_view not in view_options:
+        requested_view = "Overview"
+    selected_view = st.segmented_control(
+        "Player view",
+        view_options,
+        default=requested_view,
+        selection_mode="single",
+        key=f"player_view_{selected_player_id}",
+        label_visibility="collapsed",
+    ) or "Overview"
+    update_query(view=selected_view)
+
+    action_columns = st.columns([1, 1, 6])
+    is_shortlisted = selected_player_id in shortlist()
+    if action_columns[0].button(
+        "Remove shortlist" if is_shortlisted else "Add to shortlist",
+        key=f"shortlist_{selected_player_id}",
+        width="stretch",
+    ):
+        toggle_shortlist(selected_player_id)
+        st.rerun()
+    if action_columns[1].button(
+        "Compare",
+        key=f"compare_{selected_player_id}",
+        type="primary",
+        width="stretch",
+    ):
+        set_comparison([*comparison(), selected_player_id])
+        switch_page("3_compare.py", season=selected_season)
 
     gameweek_path = fpl_gameweeks_path(league, selected_season)
     gameweeks = load_gameweek_fpl(
@@ -2291,15 +2339,20 @@ def main() -> None:
         v1_archetypes = load_archetype_artifact(
             str(archetype_path), file_version(archetype_path)
         )
-        component_evidence = load_archetype_artifact(
-            str(component_evidence_path), file_version(component_evidence_path)
-        )
-        family_evidence = load_archetype_artifact(
-            str(family_evidence_path), file_version(family_evidence_path)
-        )
-        match_evidence = load_archetype_artifact(
-            str(match_evidence_path), file_version(match_evidence_path)
-        )
+        if selected_view == "Profile":
+            component_evidence = load_archetype_artifact(
+                str(component_evidence_path), file_version(component_evidence_path)
+            )
+            family_evidence = load_archetype_artifact(
+                str(family_evidence_path), file_version(family_evidence_path)
+            )
+            match_evidence = load_archetype_artifact(
+                str(match_evidence_path), file_version(match_evidence_path)
+            )
+        else:
+            component_evidence = pd.DataFrame()
+            family_evidence = pd.DataFrame()
+            match_evidence = pd.DataFrame()
         selected_v1_archetypes = (
             v1_archetypes.loc[
                 v1_archetypes["player_id"].eq(str(selected_player_id))
@@ -2390,10 +2443,7 @@ def main() -> None:
         "forecast": updated_label(forecast_path),
     }
 
-    overview_tab, performance_tab, forecast_tab, history_tab, profile_tab = st.tabs(
-        ["Overview", "Performance", "Forecast", "History", "Profile"]
-    )
-    with overview_tab:
+    if selected_view == "Overview":
         render_overview_tab(
             player_name,
             selected_season,
@@ -2412,21 +2462,25 @@ def main() -> None:
             data_freshness,
             selected_v1_archetypes,
         )
-    with performance_tab:
+    elif selected_view == "Form & Forecast":
         render_performance_tab(
             player_name, selected_season, gameweek_history, percentile_table
         )
-    with forecast_tab:
+        st.divider()
         render_forecast_tab(player_name, selected_season, player_forecast)
-    with history_tab:
+    elif selected_view == "History":
+        selected_archetype_history = player_archetype_history(
+            selected_season, selected_player_id
+        )
         render_history_tab(
             player_name,
             selected_player_id,
             history,
             percentile_table,
             per_90=per_90,
+            archetype_history=selected_archetype_history,
         )
-    with profile_tab:
+    else:
         if not selected_v1_archetypes.empty:
             render_v1_archetype_profile(
                 player_name,

@@ -1,0 +1,22 @@
+[theme]
+primaryColor = "#5B21B6"
+font = "sans-serif"
+
+[theme.light]
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#EEF2F7"
+textColor = "#172033"
+
+[theme.dark]
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#F1F5F9"
+
+[server]
+headless = true
+
+[client]
+# Keep tracebacks visible while this project is being developed locally. Use
+# "none" only for a public deployment whose server logs are being monitored.
+showErrorDetails = "full"
+toolbarMode = "developer"

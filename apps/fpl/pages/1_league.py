@@ -2,7 +2,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from apps.fpl.state import query_value, switch_page, update_query
+from apps.fpl.ui import apply_chart_style, empty_state, file_freshness, inject_global_styles, page_header
 from apps.fpl.catalog import (
+    FPL_ROOT,
     UNDERSTAT_ROOT,
     discover_leagues as catalog_discover_leagues,
     discover_seasons as catalog_discover_seasons,
@@ -11,7 +14,7 @@ from apps.fpl.catalog import (
 )
 
 
-st.set_page_config(page_title="League Tables", layout="wide")
+st.set_page_config(page_title="FPL League Insights", page_icon="🏆", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
@@ -80,7 +83,7 @@ def build_league_table(df: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def render_table(table: pd.DataFrame) -> None:
+def league_table_display(table: pd.DataFrame) -> pd.DataFrame:
     display = pd.DataFrame(
         {
             "Pos": table["position"],
@@ -101,10 +104,13 @@ def render_table(table: pd.DataFrame) -> None:
         }
     )
 
-    st.dataframe(
-        display,
-        width="stretch",
-        hide_index=True,
+    return display
+
+
+def render_table(table: pd.DataFrame, *, key: str = "league_table") -> object:
+    return st.dataframe(
+        league_table_display(table), width="stretch", hide_index=True,
+        on_select="rerun", selection_mode="single-row", key=key,
         column_config={
             "xPts": st.column_config.NumberColumn(format="%.2f"),
             "Pts-xPts": st.column_config.NumberColumn(format="%.2f"),
@@ -119,26 +125,6 @@ def render_charts(table: pd.DataFrame) -> None:
     col1, col2 = st.columns(2)
 
     with col1:
-        points_chart = table.sort_values("points", ascending=True)
-        fig_points = px.bar(
-            points_chart,
-            x="points",
-            y="team",
-            orientation="h",
-            color="points_minus_xpts",
-            color_continuous_scale="RdYlGn",
-            color_continuous_midpoint=0,
-            labels={"points": "Points", "team": "Team", "points_minus_xpts": "Pts - xPts"},
-            title="Points by Team",
-        )
-        fig_points.update_layout(
-            height=max(380, len(points_chart) * 24),
-            margin=dict(t=50, b=20, l=20, r=20),
-            yaxis_title=None,
-        )
-        st.plotly_chart(fig_points, width="stretch")
-
-    with col2:
         fig_perf = px.scatter(
             table,
             x="expected_points",
@@ -146,7 +132,7 @@ def render_charts(table: pd.DataFrame) -> None:
             text="team",
             size="goals_for",
             color="goal_difference",
-            color_continuous_scale="Blues",
+            color_continuous_scale="Purples",
             labels={"expected_points": "Expected Points (xPts)", "points": "Points"},
             title="Points vs Expected Points",
         )
@@ -165,7 +151,26 @@ def render_charts(table: pd.DataFrame) -> None:
             height=max(380, len(table) * 22),
             margin=dict(t=50, b=20, l=20, r=20),
         )
+        apply_chart_style(fig_perf, height=max(380, len(table) * 22))
         st.plotly_chart(fig_perf, width="stretch")
+
+    with col2:
+        fig_context = px.scatter(
+            table,
+            x="xg",
+            y="xga",
+            text="team",
+            size="points",
+            color="points_minus_xpts",
+            color_continuous_scale="BrBG",
+            color_continuous_midpoint=0,
+            labels={"xg": "Expected goals", "xga": "Expected goals against"},
+            title="Attack and defence context",
+        )
+        fig_context.update_traces(textposition="top center")
+        fig_context.update_yaxes(autorange="reversed")
+        apply_chart_style(fig_context, height=max(380, len(table) * 22))
+        st.plotly_chart(fig_context, width="stretch")
 
 
 def render_league_tab(league: str, season: str) -> None:
@@ -192,56 +197,69 @@ def render_league_tab(league: str, season: str) -> None:
 
 
 def main() -> None:
-    st.title("League Table Dashboard")
-    st.caption("Understat team-season standings across available leagues")
-
-    leagues = discover_leagues()
+    inject_global_styles()
+    fpl_leagues = catalog_discover_leagues(FPL_ROOT)
+    leagues = [league for league in fpl_leagues if league in discover_leagues()]
     if not leagues:
-        st.error("No processed Understat league folders were found in data/processed/understat.")
+        page_header("League", "FPL-focused league context and team performance.")
+        empty_state("No league evidence", "No league has both an FPL roster and team-performance data.", icon="⚠️")
         return
 
-    st.sidebar.header("Filters")
-    selected_leagues = st.sidebar.multiselect(
-        "Leagues",
-        options=leagues,
-        default=leagues,
+    requested_league = query_value("league")
+    league_index = leagues.index(requested_league) if requested_league in leagues else 0
+    league = st.sidebar.selectbox("League", leagues, index=league_index, key="league_selected")
+    seasons = discover_seasons(league)
+    if not seasons:
+        empty_state("No seasons", f"No team-performance seasons are available for {league}.")
+        return
+    requested_season = query_value("season")
+    season_index = seasons.index(requested_season) if requested_season in seasons else 0
+    season = st.sidebar.selectbox("Season", seasons, index=season_index, key="league_season")
+    update_query(league=league, season=season)
+
+    path = understat_team_season_path(league, season)
+    frame = load_team_season(league, season, file_version(path))
+    table = build_league_table(frame)
+    page_header(
+        "League",
+        "Standings and underlying team context connected directly to FPL team decisions.",
+        eyebrow=f"{league} · {season}",
+        freshness=file_freshness(path),
     )
-    if not selected_leagues:
-        st.info("Select at least one league from the sidebar.")
+    if table.empty:
+        empty_state("No standings", "The selected season does not contain the required team metrics.")
         return
 
-    season_mode = st.sidebar.radio(
-        "Season",
-        options=["Latest per league", "Choose one season"],
-        index=0,
+    leader = table.iloc[0]
+    runner_up = table.iloc[1] if len(table) > 1 else None
+    best_attack = table.loc[table["xg"].idxmax()]
+    best_defence = table.loc[table["xga"].idxmin()]
+    overperformer = table.loc[table["points_minus_xpts"].idxmax()]
+    metrics = st.columns(4)
+    gap = "—" if runner_up is None else f"+{leader['points'] - runner_up['points']:.0f} pts"
+    metrics[0].metric("Leader", str(leader["team"]), gap)
+    metrics[1].metric("Best attack", str(best_attack["team"]), f"{best_attack['xg']:.1f} xG")
+    metrics[2].metric("Best defence", str(best_defence["team"]), f"{best_defence['xga']:.1f} xGA")
+    metrics[3].metric(
+        "Biggest overperformance", str(overperformer["team"]),
+        f"{overperformer['points_minus_xpts']:+.1f} vs xPts",
     )
 
-    global_season = None
-    if season_mode == "Choose one season":
-        all_seasons = sorted(
-            {s for lg in selected_leagues for s in discover_seasons(lg)},
-            reverse=True,
+    view = st.segmented_control(
+        "League view", ["Standings", "Underlying performance"], default="Standings",
+        label_visibility="collapsed",
+    ) or "Standings"
+    if view == "Standings":
+        st.caption("Select a team row to open its FPL squad and fixture analysis.")
+        event = render_table(table, key=f"league_table_{league}_{season}")
+        if event.selection.rows:
+            selected_team = str(table.iloc[event.selection.rows[0]]["team"])
+            switch_page("2_teams.py", league=league, season=season, team=selected_team)
+    else:
+        render_charts(table)
+        st.caption(
+            "Lower xGA is better. Chart labels and axes carry the meaning so colour is not the sole signal."
         )
-        if not all_seasons:
-            st.error("No seasons with team_season.csv were found for the selected leagues.")
-            return
-        global_season = st.sidebar.selectbox("Season to use", options=all_seasons)
-
-    tabs = st.tabs(selected_leagues)
-    for tab, league in zip(tabs, selected_leagues):
-        with tab:
-            seasons = discover_seasons(league)
-            if not seasons:
-                st.warning(f"No seasons found for {league}.")
-                continue
-
-            season = seasons[0] if season_mode == "Latest per league" else global_season
-            if season not in seasons:
-                st.info(f"{league} does not have data for {season}. Available: {', '.join(seasons)}")
-                continue
-
-            st.subheader(f"{league} - {season}")
-            render_league_tab(league, season)
 
 
 if __name__ == "__main__":
