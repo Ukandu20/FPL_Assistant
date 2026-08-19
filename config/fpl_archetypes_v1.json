@@ -66,7 +66,7 @@
     "GOAL_THREAT": {
       "positions": ["DEF", "MID", "FWD"],
       "core_fields": ["minutes", "npxg", "shots_in_box", "shots_on_target", "non_penalty_goals"],
-      "weights": {"npxg": 0.45, "shots_in_box": 0.25, "shots_on_target": 0.20, "non_penalty_goals": 0.10}
+      "weights": {"npxg": 0.45, "shots_in_box": 0.15, "shots_on_target": 0.20, "non_penalty_goals": 0.20}
     },
     "CREATOR": {
       "positions": ["DEF", "MID", "FWD"],
