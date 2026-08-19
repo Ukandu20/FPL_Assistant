@@ -50,6 +50,106 @@ def test_catalog_selects_latest_archetype_snapshot_within_season(
     assert latest_archetype_snapshot("2025-2026", root=tmp_path) == latest
 
 
+def test_overview_archetype_tags_prioritize_summary_usage_and_risk() -> None:
+    player_page = load_page_module("0_main.py")
+    archetypes = pd.DataFrame(
+        [
+            {
+                "archetype_id": "COMPLETE_FORWARD",
+                "family": "Production Composite",
+                "display_name": "Complete Forward",
+                "score_0_100": 82,
+                "active_label": True,
+                "confidence_band": "High",
+            },
+            {
+                "archetype_id": "GOAL_THREAT",
+                "family": "Production Style",
+                "display_name": "Goal Threat",
+                "score_0_100": 91,
+                "active_label": True,
+                "confidence_band": "High",
+            },
+            {
+                "archetype_id": "REGULAR_STARTER",
+                "family": "Usage",
+                "display_name": "Regular Starter",
+                "score_0_100": 88,
+                "active_label": True,
+                "confidence_band": "Medium",
+            },
+            {
+                "archetype_id": "POINTS_HAZARD",
+                "family": "Risk Badge",
+                "display_name": "Points Hazard",
+                "score_0_100": 72,
+                "active_label": True,
+                "confidence_band": "Low",
+            },
+            {
+                "archetype_id": "EXPLOSIVE",
+                "family": "Return Shape",
+                "display_name": "Explosive Returner",
+                "score_0_100": 77,
+                "active_label": True,
+                "confidence_band": "Medium",
+            },
+        ]
+    )
+
+    result = player_page.active_archetype_tags(archetypes, overview=True)
+
+    assert result["archetype_id"].tolist() == [
+        "COMPLETE_FORWARD",
+        "REGULAR_STARTER",
+        "POINTS_HAZARD",
+    ]
+    markup = player_page.archetype_badge_markdown(result)
+    assert ":violet-badge[Complete Forward]" in markup
+    assert ":green-badge[Regular Starter]" in markup
+    assert ":gray-badge[Points Hazard]" in markup
+
+
+def test_overview_archetype_tags_fall_back_to_strongest_production_component() -> None:
+    player_page = load_page_module("0_main.py")
+    archetypes = pd.DataFrame(
+        [
+            {
+                "archetype_id": "CREATOR",
+                "family": "Production Style",
+                "display_name": "Creator",
+                "score_0_100": 71,
+                "active_label": True,
+            },
+            {
+                "archetype_id": "GOAL_THREAT",
+                "family": "Production Style",
+                "display_name": "Goal Threat",
+                "score_0_100": 84,
+                "active_label": True,
+            },
+            {
+                "archetype_id": "ROTATION_RISK",
+                "family": "Usage",
+                "display_name": "Rotation Risk",
+                "score_0_100": 62,
+                "active_label": True,
+            },
+            {
+                "archetype_id": "INACTIVE_RISK",
+                "family": "Risk Badge",
+                "display_name": "Inactive risk",
+                "score_0_100": 99,
+                "active_label": False,
+            },
+        ]
+    )
+
+    result = player_page.active_archetype_tags(archetypes, overview=True)
+
+    assert result["archetype_id"].tolist() == ["GOAL_THREAT", "ROTATION_RISK"]
+
+
 def test_player_season_duplicates_keep_best_supported_row() -> None:
     player_page = load_page_module("0_main.py")
     players = pd.DataFrame(

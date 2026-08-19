@@ -117,6 +117,33 @@ LOWER_IS_BETTER_METRICS = {
     "penalties_missed",
 }
 
+ARCHETYPE_FAMILY_BADGE_COLORS = {
+    "Production Composite": "violet",
+    "Production Style": "blue",
+    "Production": "blue",
+    "Usage": "green",
+    "Return Shape": "orange",
+    "Risk Badge": "red",
+    "Value Historical": "gray",
+    "Venue Behaviour": "gray",
+}
+
+ARCHETYPE_FAMILY_ORDER = {
+    family: index
+    for index, family in enumerate(
+        [
+            "Production Composite",
+            "Production Style",
+            "Production",
+            "Usage",
+            "Return Shape",
+            "Venue Behaviour",
+            "Value Historical",
+            "Risk Badge",
+        ]
+    )
+}
+
 GAMEWEEK_POINT_COMPONENTS = [
     "Appearance points",
     "Goal points",
@@ -1061,6 +1088,77 @@ def _render_legacy_overview_tab(
         )
 
 
+def active_archetype_tags(
+    archetypes: pd.DataFrame, *, overview: bool = False
+) -> pd.DataFrame:
+    """Return active labels in a stable display order.
+
+    The overview deliberately carries only the production summary, usage state,
+    and risk badge. The dedicated profile view can show every active label.
+    """
+    required = {"family", "display_name", "active_label"}
+    if archetypes.empty or not required.issubset(archetypes.columns):
+        return pd.DataFrame(columns=list(archetypes.columns))
+
+    active_values = archetypes["active_label"]
+    active_mask = active_values.eq(True) | active_values.astype("string").str.lower().eq(
+        "true"
+    )
+    active = archetypes.loc[active_mask].copy()
+    if active.empty:
+        return active
+
+    active["_score"] = pd.to_numeric(active.get("score_0_100"), errors="coerce")
+    active["_family_order"] = active["family"].map(ARCHETYPE_FAMILY_ORDER).fillna(
+        len(ARCHETYPE_FAMILY_ORDER)
+    )
+    active = active.sort_values(
+        ["_family_order", "_score", "display_name"],
+        ascending=[True, False, True],
+        kind="stable",
+    )
+
+    if overview:
+        chosen: list[pd.DataFrame] = []
+        production = active.loc[active["family"].eq("Production Composite")]
+        if production.empty:
+            production = active.loc[
+                active["family"].isin(["Production Style", "Production"])
+            ]
+        if not production.empty:
+            chosen.append(production.head(1))
+        for family in ("Usage", "Risk Badge"):
+            family_rows = active.loc[active["family"].eq(family)]
+            if not family_rows.empty:
+                chosen.append(family_rows.head(1))
+        active = pd.concat(chosen, ignore_index=True) if chosen else active.head(0)
+
+    dedupe_column = "archetype_id" if "archetype_id" in active else "display_name"
+    return (
+        active.drop_duplicates(subset=[dedupe_column], keep="first")
+        .drop(columns=["_score", "_family_order"], errors="ignore")
+        .reset_index(drop=True)
+    )
+
+
+def archetype_badge_markdown(archetypes: pd.DataFrame) -> str:
+    """Build inline, non-interactive Streamlit badge markup for archetypes."""
+    badges: list[str] = []
+    for row in archetypes.to_dict("records"):
+        label = str(row.get("display_name", "")).strip()
+        if not label:
+            continue
+        label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        confidence = str(row.get("confidence_band", "")).strip().lower()
+        color = (
+            "gray"
+            if confidence == "low"
+            else ARCHETYPE_FAMILY_BADGE_COLORS.get(str(row.get("family", "")), "gray")
+        )
+        badges.append(f":{color}-badge[{label}]")
+    return " ".join(badges)
+
+
 def render_overview_tab(
     player_name: str,
     selected_season: str,
@@ -1077,6 +1175,7 @@ def render_overview_tab(
     team_badges: dict[int, str],
     alternatives: pd.DataFrame,
     data_freshness: dict[str, str],
+    archetypes: pd.DataFrame,
 ) -> None:
     """Render a player-first, decision-oriented landing page."""
 
@@ -1161,6 +1260,10 @@ def render_overview_tab(
             f'{escape(availability)}</span>',
             unsafe_allow_html=True,
         )
+        overview_tags = active_archetype_tags(archetypes, overview=True)
+        badge_markup = archetype_badge_markdown(overview_tags)
+        if badge_markup:
+            st.markdown(badge_markup)
         if news:
             st.caption(news)
     with market_column:
@@ -1745,7 +1848,7 @@ def render_v1_archetype_profile(
         st.info(f"No V1 archetype snapshot is available for {player_name}.")
         return
 
-    active = archetypes.loc[archetypes["active_label"].fillna(False)].copy()
+    active = active_archetype_tags(archetypes)
     composite_rows = active.loc[active["family"].eq("Production Composite")]
     usage_rows = active.loc[active["family"].eq("Usage")]
     composite = None if composite_rows.empty else composite_rows.iloc[0]
@@ -1754,6 +1857,14 @@ def render_v1_archetype_profile(
     confidence = pd.to_numeric(
         representative.get("confidence_0_1"), errors="coerce"
     )
+
+    if not active.empty:
+        st.markdown("#### Active archetypes")
+        for family, family_rows in active.groupby("family", sort=False):
+            st.markdown(f"**{family}**")
+            st.markdown(archetype_badge_markdown(family_rows))
+        if active["confidence_band"].astype("string").str.lower().eq("low").any():
+            st.caption("Muted tags indicate low-confidence classifications.")
 
     cards = st.columns(4)
     cards[0].metric(
@@ -2299,6 +2410,7 @@ def main() -> None:
             team_badges,
             alternatives,
             data_freshness,
+            selected_v1_archetypes,
         )
     with performance_tab:
         render_performance_tab(
