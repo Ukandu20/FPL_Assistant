@@ -144,4 +144,5 @@ docs/*
 !docs/SCRIPT_MIGRATION_REPORT.md
 !docs/FPL_ARCHETYPE_V1.md
 !docs/FPL_ARCHETYPE_V1_SAMPLE_OUTPUT.json
+!docs/FPL_APP_DESIGN.md
 archived_files/

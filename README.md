@@ -73,8 +73,12 @@ python -m pip install -e ".[app]"
 streamlit run apps/fpl/app.py
 ```
 
-The public app is read-only. Model execution and optimizer controls remain in
-the separate research control panel.
+The public app is read-only and strictly FPL-focused. Its primary workflows are
+Gameweek Hub, Players, Compare, Teams, and League. Player, team, season, and
+comparison context can be shared through URL parameters, while the shortlist
+and recently viewed players persist for the current Streamlit session. See
+[`docs/FPL_APP_DESIGN.md`](docs/FPL_APP_DESIGN.md) for the implemented product
+structure and UI conventions.
 
 ## Provider processing safety
 
