@@ -94,6 +94,25 @@ def test_archetype_reason_ignores_nested_calculation_metadata() -> None:
     assert archetype_reason(row) == "Goal Threat: 88.0 · Creator: 74.0"
 
 
+def test_usage_reason_uses_historical_labels_and_denominators() -> None:
+    row = {
+        "family": "Usage",
+        "component_scores": json.dumps(
+            {
+                "expected_minutes": 76.075,
+                "start_probability": 0.875,
+                "cameo_probability": 0.2525,
+            }
+        ),
+    }
+
+    assert archetype_reason(row) == (
+        "Avg min / available team match: 76.1 · "
+        "Historical start rate: 87.5% · "
+        "Historical cameo rate when benched: 25.2%"
+    )
+
+
 def test_current_roster_is_enriched_with_baseline_and_unique_family_columns() -> None:
     current = pd.DataFrame(
         {

@@ -51,6 +51,19 @@ def archetype_reason(row: pd.Series | dict[str, object], *, limit: int = 3) -> s
         return ""
     if not isinstance(values, dict):
         return ""
+    if str(row.get("family", "")) == "Usage":
+        usage_parts: list[str] = []
+        usage_fields = (
+            ("expected_minutes", "Avg min / available team match", False),
+            ("start_probability", "Historical start rate", True),
+            ("cameo_probability", "Historical cameo rate when benched", True),
+        )
+        for field, label, as_percentage in usage_fields:
+            number = pd.to_numeric(values.get(field), errors="coerce")
+            if bool(pd.notna(number)):
+                display = f"{float(number) * 100:.1f}%" if as_percentage else f"{float(number):.1f}"
+                usage_parts.append(f"{label}: {display}")
+        return " · ".join(usage_parts[:limit])
     ranked: list[tuple[str, float]] = []
     for name, value in values.items():
         # Calculation payloads also persist structural metadata such as
