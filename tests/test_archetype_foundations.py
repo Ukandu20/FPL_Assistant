@@ -131,6 +131,36 @@ def test_usage_uses_latest_six_team_matches_and_half_weights_reason_absences() -
     assert 0 <= result["expected_minutes"] <= 90
 
 
+def test_preseason_usage_uses_entire_previous_season_with_equal_weights() -> None:
+    history = pd.DataFrame(
+        {
+            "kickoff_utc": pd.date_range("2024-08-01", periods=44, freq="7D", tz="UTC"),
+            "season": ["2024-2025"] * 6 + ["2025-2026"] * 38,
+            "started": [False] * 6 + [True] * 30 + [False] * 8,
+            "minutes": [0] * 6 + [90] * 30 + [0] * 8,
+            "availability_status": ["available"] * 44,
+        }
+    )
+
+    result = estimate_usage(
+        history,
+        current_season="2026-2027",
+        prior_observations=0,
+    )
+
+    assert result["observations"] == 38
+    assert result["start_probability"] == pytest.approx(30 / 38)
+    assert result["expected_minutes"] == pytest.approx(2700 / 38, abs=0.001)
+
+    in_season_result = estimate_usage(
+        history,
+        current_season="2026-2027",
+        preseason=False,
+        prior_observations=0,
+    )
+    assert in_season_result["observations"] == 6
+
+
 def test_usage_state_change_requires_two_updates_except_immediate_reset() -> None:
     first = stabilize_usage_state(
         "Rotation Risk", previous_state="Regular Starter"
@@ -145,6 +175,38 @@ def test_usage_state_change_requires_two_updates_except_immediate_reset() -> Non
         "Fringe", previous_state="Nailed", immediate_reset=True
     )
     assert reset == ("Fringe", None, 0)
+
+
+def test_usage_hysteresis_does_not_advance_without_new_evidence() -> None:
+    unchanged = stabilize_usage_state(
+        "Rotation Risk",
+        previous_state="Regular Starter",
+        pending_state="Rotation Risk",
+        pending_updates=1,
+        evidence_changed=False,
+    )
+    assert unchanged == ("Regular Starter", "Rotation Risk", 1)
+
+
+def test_usage_fingerprint_changes_only_when_usage_evidence_changes() -> None:
+    history = pd.DataFrame(
+        {
+            "match_id": ["m1", "m2"],
+            "kickoff_utc": pd.to_datetime(["2026-08-01", "2026-08-08"], utc=True),
+            "season": ["2026-2027", "2026-2027"],
+            "started": [True, True],
+            "minutes": [90, 80],
+            "availability_status": ["available", "available"],
+        }
+    )
+    first = estimate_usage(history, current_season="2026-2027")
+    repeated = estimate_usage(history.copy(), current_season="2026-2027")
+    corrected = history.copy()
+    corrected.loc[1, "minutes"] = 70
+    changed = estimate_usage(corrected, current_season="2026-2027")
+
+    assert first["evidence_fingerprint"] == repeated["evidence_fingerprint"]
+    assert first["evidence_fingerprint"] != changed["evidence_fingerprint"]
 
 
 def test_usage_keeps_double_gameweek_matches_separate_and_excludes_injury() -> None:

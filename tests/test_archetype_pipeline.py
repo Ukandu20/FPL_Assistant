@@ -47,6 +47,32 @@ def test_pipeline_emits_exactly_one_position_composite() -> None:
     assert "DISTRIBUTOR" not in result.archetypes["archetype_id"].tolist()
 
 
+def test_preseason_usage_resets_stale_state_immediately() -> None:
+    observations = _observations()
+    observations["started"] = True
+    observations["availability_status"] = "available"
+    previous = build_archetype_snapshot(
+        observations,
+        as_of="2026-05-01T00:00:00Z",
+        current_season="2025-2026",
+    )
+    result = build_archetype_snapshot(
+        observations,
+        as_of="2026-05-02T00:00:00Z",
+        current_season="2026-2027",
+        previous_states=previous.archetypes,
+    )
+    usage = result.evidence_tables["family_calculation_evidence"].query(
+        "evidence_type == 'usage'"
+    )
+
+    assert not usage.empty
+    assert usage["proposed_state"].eq(usage["stable_state"]).all()
+    assert usage["pending_updates"].eq(0).all()
+    assert usage["immediate_reset"].all()
+    assert usage["usage_window_mode"].eq("previous_season").all()
+
+
 def test_versioned_snapshot_is_deterministic_and_immutable(tmp_path: Path) -> None:
     observations = _observations()
     observations["player_name"] = observations["player_id"].map(

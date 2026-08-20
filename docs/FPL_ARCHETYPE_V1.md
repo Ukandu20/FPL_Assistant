@@ -18,8 +18,10 @@ The implementation lives in `src/fpl_assistant/archetypes/`:
 - `preprocessing.py`, `temporal.py`, and `scoring.py` implement position-relative
   rates, 1st/99th winsorization, transformations, past-only standardization,
   25/30/45 evidence windows, separate small-sample shrinkage, and base scores.
-- `usage.py` implements the latest-six-team-match usage model with a three-match
-  half-life and mutually exclusive state boundaries.
+- `usage.py` uses the complete previous season as an equal-weight preseason
+  baseline, then switches to the latest six team matches with a three-match
+  half-life once the current season starts. Usage hysteresis advances only when
+  its persisted match-evidence fingerprint changes.
 - `families.py` implements fixture, venue, return-shape, value, and risk states.
 - `clean_sheets.py` implements Clean-Sheet Specialist.
 - `composites.py` resolves exactly one position-specific production composite

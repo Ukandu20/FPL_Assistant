@@ -250,12 +250,22 @@ def build_archetype_snapshot(
     usage_rows: list[dict[str, object]] = []
     usage_required = {"availability_status", "started", "minutes"}
     if usage_required.issubset(work):
+        usage_preseason = (
+            "season" in work
+            and not work["season"].astype("string").eq(str(current_season)).any()
+        )
         for player_id, group in work.groupby("player_id", sort=False):
             usage_group = group
             if "team_id" in group and group["team_id"].notna().any():
                 current_team = group.sort_values("kickoff_utc", kind="stable").iloc[-1]["team_id"]
                 usage_group = group[group["team_id"].eq(current_team)]
-            usage = estimate_usage(usage_group)
+            usage = estimate_usage(
+                usage_group,
+                current_season=current_season,
+                preseason=usage_preseason,
+                recent_team_matches=int(selected.values["usage"]["recent_team_matches"]),
+                half_life_matches=float(selected.values["usage"]["half_life_matches"]),
+            )
             previous_usage = None
             if previous_states is not None and not previous_states.empty:
                 matches_previous = previous_states[
@@ -264,8 +274,30 @@ def build_archetype_snapshot(
                 ]
                 if not matches_previous.empty:
                     previous_usage = matches_previous.iloc[-1]
+            previous_fingerprint = (
+                previous_usage.get("usage_evidence_fingerprint")
+                if previous_usage is not None else None
+            )
+            previous_method_version = (
+                previous_usage.get("usage_method_version")
+                if previous_usage is not None else None
+            )
+            evidence_changed = bool(
+                previous_usage is None
+                or pd.isna(previous_fingerprint)
+                or str(previous_fingerprint) != str(usage["evidence_fingerprint"])
+            )
+            method_changed = bool(
+                previous_usage is not None
+                and (
+                    pd.isna(previous_method_version)
+                    or str(previous_method_version) != str(usage["method_version"])
+                )
+            )
             immediate_reset = bool(
-                group.get("transferred", pd.Series(False, index=group.index)).fillna(False).astype(bool).iloc[-1]
+                usage_preseason
+                or method_changed
+                or group.get("transferred", pd.Series(False, index=group.index)).fillna(False).astype(bool).iloc[-1]
                 or group.get("manager_changed", pd.Series(False, index=group.index)).fillna(False).astype(bool).iloc[-1]
             )
             stable_state, pending_state, pending_updates = stabilize_usage_state(
@@ -274,6 +306,7 @@ def build_archetype_snapshot(
                 pending_state=(str(previous_usage.get("pending_usage_state")) if previous_usage is not None and pd.notna(previous_usage.get("pending_usage_state")) else None),
                 pending_updates=(int(previous_usage.get("pending_usage_updates", 0) or 0) if previous_usage is not None else 0),
                 immediate_reset=immediate_reset,
+                evidence_changed=evidence_changed,
             )
             minutes = float(pd.to_numeric(group["minutes"], errors="coerce").sum())
             observations = int(usage["observations"])
@@ -302,6 +335,9 @@ def build_archetype_snapshot(
             ))
             usage_rows[-1]["pending_usage_state"] = pending_state
             usage_rows[-1]["pending_usage_updates"] = pending_updates
+            usage_rows[-1]["usage_evidence_fingerprint"] = usage["evidence_fingerprint"]
+            usage_rows[-1]["usage_window_mode"] = usage["window_mode"]
+            usage_rows[-1]["usage_method_version"] = usage["method_version"]
             family_evidence_parts.append(pd.DataFrame([{
                 "player_id": str(player_id), "evidence_type": "usage",
                 "proposed_state": str(usage["state"]), "stable_state": stable_state,
@@ -311,6 +347,10 @@ def build_archetype_snapshot(
                 "observations": observations, "total_history_minutes": minutes,
                 "confidence_0_1": confidence, "pending_state": pending_state,
                 "pending_updates": pending_updates, "immediate_reset": immediate_reset,
+                "evidence_changed": evidence_changed,
+                "usage_evidence_fingerprint": usage["evidence_fingerprint"],
+                "usage_window_mode": usage["window_mode"],
+                "usage_method_version": usage["method_version"],
             }]))
     if usage_rows:
         parts.append(pd.DataFrame(usage_rows))
