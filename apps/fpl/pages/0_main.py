@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import json
 from html import escape
 from pathlib import Path
@@ -73,6 +74,23 @@ team_badge_url = player_card_viewmodels.team_badge_url
 st.set_page_config(page_title="FPL Players", page_icon="👤", layout="wide")
 
 MIN_PER_90_MINUTES = 450
+ALL_PLAYERS_OPTION = "__all_players__"
+
+
+def player_selector_index(
+    options: list[str],
+    requested_player: str | None,
+    *,
+    filters_changed: bool,
+    query_is_new: bool,
+) -> int:
+    """Default to the pool unless an explicit player request should be honored."""
+    if (
+        requested_player in options
+        and (not filters_changed or query_is_new)
+    ):
+        return options.index(str(requested_player))
+    return 0
 
 PLAYER_HISTORY_COLUMNS = {
     "season": "Season",
@@ -1846,18 +1864,13 @@ def main() -> None:
     saved_filters = st.session_state.get("player_filter_state", {})
     reset_version = st.session_state.get("player_filter_reset_version", 0)
     requested_player = query_value("player")
-    player_widget_key = (
-        f"historical_player_{reset_version}_{requested_player or 'none'}"
-    )
     saved_season = query_value("season") or saved_filters.get("season", seasons[0])
     if saved_season not in seasons:
         saved_season = seasons[0]
 
     with st.expander(
         "Find or switch player",
-        expanded=not bool(
-            st.session_state.get(player_widget_key)
-        ),
+        expanded=not bool(requested_player),
     ):
         season_column, team_column, category_column, price_column = st.columns(4)
 
@@ -2075,24 +2088,62 @@ def main() -> None:
         else:
             matching_labels = labels
 
+        pool_filter_state = {
+            "season": selected_season,
+            "position": selected_position,
+            "team": selected_team,
+            "price_category": selected_price_category,
+            "price_range": tuple(float(value) for value in selected_price_range),
+            "availability": selected_availability,
+            "archetype": selected_archetype,
+            "sort": selected_sort,
+            "player_search": player_search,
+        }
+        pool_filter_token = hashlib.sha256(
+            json.dumps(pool_filter_state, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        previous_filter_token = st.session_state.get("player_pool_filter_token")
+        filters_changed = bool(
+            previous_filter_token is not None
+            and previous_filter_token != pool_filter_token
+        )
+        previous_requested_player = st.session_state.get(
+            "player_selector_last_requested_player"
+        )
+        query_is_new = bool(
+            requested_player
+            and requested_player != previous_requested_player
+        )
+        player_widget_key = (
+            f"historical_player_{reset_version}_{pool_filter_token}_"
+            f"{requested_player or 'none'}"
+        )
+
         with player_column:
-            if matching_labels:
-                player_options = list(matching_labels)
-                requested_index = (
-                    player_options.index(requested_player)
-                    if requested_player in player_options
-                    else None
-                )
-                selected_player_id = ui.select(
-                    "Select a player to view",
-                    options=player_options,
-                    format_func=lambda player_id: matching_labels[player_id],
-                    index=requested_index,
-                    key=player_widget_key,
-                    placeholder="Select a matching player...",
-                )
-            else:
-                selected_player_id = None
+            player_options = [ALL_PLAYERS_OPTION, *matching_labels]
+            requested_index = player_selector_index(
+                player_options,
+                requested_player,
+                filters_changed=filters_changed,
+                query_is_new=query_is_new,
+            )
+            selected_player_value = ui.select(
+                "Select a player to view",
+                options=player_options,
+                format_func=lambda player_id: (
+                    "All players"
+                    if player_id == ALL_PLAYERS_OPTION
+                    else matching_labels[player_id]
+                ),
+                index=requested_index,
+                key=player_widget_key,
+            )
+            selected_player_id = (
+                None
+                if selected_player_value in {None, ALL_PLAYERS_OPTION}
+                else str(selected_player_value)
+            )
+            if not matching_labels:
                 st.caption("No matching players")
 
         with mode_column:
@@ -2116,6 +2167,11 @@ def main() -> None:
         st.session_state.pop(player_widget_key, None)
         st.session_state["player_filter_reset_version"] = reset_version + 1
         st.rerun()
+
+    st.session_state["player_pool_filter_token"] = pool_filter_token
+    st.session_state["player_selector_last_requested_player"] = requested_player
+    if selected_player_id is None:
+        update_query(player=None)
 
     st.session_state["player_filter_state"] = {
         "season": selected_season,

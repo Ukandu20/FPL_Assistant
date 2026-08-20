@@ -50,6 +50,30 @@ def test_catalog_selects_latest_archetype_snapshot_within_season(
     assert latest_archetype_snapshot("2025-2026", root=tmp_path) == latest
 
 
+def test_player_selector_resets_to_all_players_when_filters_change() -> None:
+    player_page = load_page_module("0_main.py")
+    options = [player_page.ALL_PLAYERS_OPTION, "p1", "p2"]
+
+    assert player_page.player_selector_index(
+        options,
+        "p1",
+        filters_changed=True,
+        query_is_new=False,
+    ) == 0
+    assert player_page.player_selector_index(
+        options,
+        "p1",
+        filters_changed=True,
+        query_is_new=True,
+    ) == 1
+    assert player_page.player_selector_index(
+        options,
+        None,
+        filters_changed=False,
+        query_is_new=False,
+    ) == 0
+
+
 def test_overview_archetype_tags_prioritize_summary_usage_and_risk() -> None:
     player_page = load_page_module("0_main.py")
     archetypes = pd.DataFrame(
