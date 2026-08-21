@@ -498,7 +498,22 @@ class NativeWhoScoredBackend:
             season_url,
             self.cache_dir / "pages" / league / season / "season.html",
         )
-        stages = parse_stage_options(season_html) or [StageRecord(stage_id=tournament_id, stage=None)]
+        stages = parse_stage_options(season_html)
+        if not stages:
+            # Cloudflare can return a block page for the season URL while the
+            # tournament fallback still redirects to the requested season.
+            # Recover the real stage ID from that page instead of querying the
+            # monthly endpoint with the tournament ID (for the EPL, ``2``).
+            fallback_stage = StageRecord(stage_id=tournament_id, stage=None)
+            fallback_url = (
+                f"{WHOSCORED_URL}/Regions/{region_id}/Tournaments/{tournament_id}"
+                f"/Seasons/{season_id}/Stages/{tournament_id}"
+            )
+            fallback_html = self._fetch_text(
+                fallback_url,
+                self.cache_dir / "pages" / league / season / f"stage_{tournament_id}.html",
+            )
+            stages = parse_stage_options(fallback_html) or [fallback_stage]
 
         parts: List[pd.DataFrame] = []
         for stage_record in stages:
@@ -535,15 +550,15 @@ class NativeWhoScoredBackend:
                         )
                         continue
                     if isinstance(payload, Mapping):
-                        parts.append(
-                            parse_schedule_month_payload(
-                                payload,
-                                league=league,
-                                season=season,
-                                stage_id=stage_record.stage_id,
-                                stage_name=stage_record.stage,
-                            )
+                        month_df = parse_schedule_month_payload(
+                            payload,
+                            league=league,
+                            season=season,
+                            stage_id=stage_record.stage_id,
+                            stage_name=stage_record.stage,
                         )
+                        if not month_df.empty:
+                            parts.append(month_df)
             if not parts:
                 fallback_df = parse_embedded_tournament_fixtures(
                     stage_html,

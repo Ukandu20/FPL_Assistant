@@ -11,6 +11,7 @@ from fpl_assistant.providers.whoscored import whoscored_match_stats_scraper as w
 from fpl_assistant.providers.whoscored import whoscored_scraper as ws_legacy
 from fpl_assistant.providers.whoscored import (
     CompetitionConfig,
+    NativeWhoScoredBackend,
     extract_match_centre_payload,
     parse_calendar_mask,
     parse_embedded_tournament_fixtures,
@@ -328,6 +329,59 @@ def test_parse_embedded_tournament_fixtures():
 
     assert df.iloc[0]["game_id"] == 123456
     assert df.iloc[0]["home_team"] == "Home FC"
+
+
+def test_native_schedule_recovers_stage_after_blocked_season_page(tmp_path, monkeypatch):
+    competition = CompetitionConfig(
+        key="ENG-Premier League",
+        source_name="England - Premier League",
+        region_id=252,
+        tournament_id=2,
+        competition_type="club",
+        season_mode="split-year",
+    )
+    backend = NativeWhoScoredBackend(
+        competitions={competition.key: competition},
+        cache_dir=tmp_path,
+        browser_fallback=False,
+    )
+    stage_html = """
+    <script>
+      var wsCalendar = {mask:{2022:{7:{15:1}}}};
+    </script>
+    <script type="application/json" data-hypernova-key="tournamentfixtures"><!--
+    {"tournaments":[{"matches":[{"id":123456,"startTimeUtc":"2022-08-15T19:00:00Z","status":"FT","homeTeamId":10,"homeTeamName":"Home FC","awayTeamId":20,"awayTeamName":"Away FC","homeScore":2,"awayScore":1}]}]}
+    --></script>
+    """
+
+    def fake_fetch_text(url, _cache_path):
+        if url.endswith("/Seasons/9075"):
+            return "<title>Attention Required! | Cloudflare</title>"
+        if url.endswith("/Stages/2"):
+            return '<html><body><a href="/regions/252/tournaments/2/seasons/9075/stages/20934">Fixtures</a></body></html>'
+        if url.endswith("/Stages/20934"):
+            return stage_html
+        raise AssertionError(url)
+
+    def fake_fetch_json(url, _cache_path, marker=None):
+        assert "/tournaments/20934/" in url
+        return {"tournaments": []}
+
+    monkeypatch.setattr(backend, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(backend, "_fetch_json", fake_fetch_json)
+
+    schedule = backend.read_schedule(
+        league="ENG-Premier League",
+        season_record={
+            "season": "2022",
+            "season_id": 9075,
+            "region_id": 252,
+            "tournament_id": 2,
+        },
+    )
+
+    assert schedule["game_id"].tolist() == [123456]
+    assert schedule.loc[0, "stage_id"] == 20934
 
 
 def test_legacy_whoscored_scraper_delegates(monkeypatch):
