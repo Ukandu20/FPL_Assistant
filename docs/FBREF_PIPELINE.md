@@ -1,17 +1,36 @@
-# FBref pipeline runbook
+# Provider integration pipeline runbook
 
-This is the production runbook for acquiring, cleaning, validating, and
-integrating FBref data. Commands are PowerShell commands and assume they are
-run from the repository root.
+This is the production runbook for building canonical fixture, team-form, and
+player-form artifacts. FBref is optional: current-season publication can use
+official FPL schedules, WhoScored match data, and Understat expected metrics.
+Commands are PowerShell commands and assume they run from the repository root.
 
-## Current 2025-2026 source boundary
+## Current 2026-2027 source boundary
+
+The provider-neutral path is the default for 2026-2027:
+
+| Artifact | Required source | Optional enrichment |
+|---|---|---|
+| canonical fixture bootstrap | FPL fixtures and teams | none |
+| completed fixture calendar | FPL + WhoScored + Understat | FBref schedule validation |
+| FPL canonical match IDs | fixture calendar | historical FBref fallback |
+| player fixture calendar | fixture calendar + WhoScored | none |
+| team/player form | canonical calendars | none |
+| assurance | canonical calendars + registries | FBref lineup cross-check |
+
+The pipeline must not stop merely because `data/raw/fbref` or
+`data/processed/fbref` has no 2026-2027 folder. Canonical `match_id` is the
+provider-neutral identity. `fbref_id` remains in published files as a temporary
+compatibility alias and must not be interpreted as proof of FBref provenance.
+
+## Optional historical FBref acquisition
 
 FBref removed the advanced match-report tables used by the historical
 pipeline. Their absence is a provider limitation, not a cleaning error. For
-2025-2026, the active processed dataset must use only tables that FBref still
+seasons where FBref is acquired, the active processed dataset must use only tables that FBref still
 publishes completely:
 
-| Family | Accepted 2025-2026 tables |
+| Family | Accepted optional FBref tables |
 |---|---|
 | `team_season` | `standard`, `keeper`, `shooting`, `playing_time`, `misc` |
 | `player_season` | `standard`, `keeper` |
@@ -37,23 +56,24 @@ $env:SOCCERDATA_LOGLEVEL = "ERROR"
 The FBref cleaner needs the already-cleaned official FPL roster at:
 
 ```text
-data/processed/fpl/ENG-Premier League/2025-2026/
+data/processed/fpl/ENG-Premier League/2026-2027/
 ```
 
 That dependency is intentional. FPL is authoritative for `fpl_pos`, while
 FBref's provider position remains available as tactical detail.
 
-## 2. Acquire or resume the raw FBref snapshot
+## 2. Optional: acquire or resume an FBref snapshot
 
-Skip this step when the required raw snapshot already exists under
-`data/raw/fbref/ENG-Premier League/2025-2026/`.
+Skip this entire section for an FBref-free run. When deliberately acquiring
+FBref, the snapshot belongs under
+`data/raw/fbref/ENG-Premier League/2026-2027/`.
 
-For a deliberately fresh 2025-2026 season-level pull:
+For a deliberately fresh 2026-2027 season-level pull:
 
 ```powershell
 python -m fpl_assistant.providers.fbref.scrape.season_stats_scraper `
   --league "ENG-Premier League" `
-  --seasons "2025-2026" `
+  --seasons "2026-2027" `
   --out-dir "data/raw/fbref" `
   --levels both `
   --team-mode direct `
@@ -72,7 +92,7 @@ tables for this season:
 ```powershell
 python -m fpl_assistant.providers.fbref.scrape.match_stats_scraper `
   --league "ENG-Premier League" `
-  --seasons "2025-2026" `
+  --seasons "2026-2027" `
   --out-dir "data/raw/fbref" `
   --levels player `
   --player-stats summary keepers `
@@ -97,7 +117,7 @@ already in soccerdata's cache remain usable. Resume without `--refresh` or
 ```powershell
 python -m fpl_assistant.providers.fbref.scrape.match_stats_scraper `
   --league "ENG-Premier League" `
-  --seasons "2025-2026" `
+  --seasons "2026-2027" `
   --out-dir "data/raw/fbref" `
   --levels player `
   --player-stats summary keepers `
@@ -112,13 +132,13 @@ Use `--rerun-failed` when `data/meta/scraper_runs.json` contains a recorded
 partial run. Use `--force-cache` only for an intentionally offline run. Use
 `--refresh`/`--no-cache` only when the cached response itself is stale or bad.
 
-## 3. Inspect raw coverage before cleaning
+## 3. Optional: inspect FBref coverage before cleaning
 
 Review these files when present:
 
 ```text
-data/raw/fbref/ENG-Premier League/2025-2026/_meta/fbref_capabilities.json
-data/raw/fbref/ENG-Premier League/2025-2026/_meta/coverage_manifest.json
+data/raw/fbref/ENG-Premier League/2026-2027/_meta/fbref_capabilities.json
+data/raw/fbref/ENG-Premier League/2026-2027/_meta/coverage_manifest.json
 data/meta/scraper_runs.json
 ```
 
@@ -127,9 +147,9 @@ table is marked `schema_only`, or a table contains only headers. The cleaner
 also enforces the schedule and schema-only guards, but checking the manifest
 makes the cause of a rejection clearer.
 
-## 4. Run the FBref cleaner
+## 4. Optional: run the FBref cleaner
 
-The league-scoped `--fpl-root` is required for 2025-2026. Passing the older
+The league-scoped `--fpl-root` is required when cleaning FBref. Passing the older
 `data/processed/fpl` root prevents the cleaner from finding the official FPL
 positions.
 
@@ -138,7 +158,7 @@ python -m fpl_assistant.providers.fbref.clean.csv_cleaner `
   --raw-dir "data/raw/fbref" `
   --clean-dir "data/processed" `
   --league "ENG-Premier League" `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --fpl-root "data/processed/fpl/ENG-Premier League" `
   --force `
   --log-level INFO
@@ -153,7 +173,7 @@ The cleaner performs the following work sequentially:
 5. applies official FPL position as `fpl_pos` without deleting FBref tactical
    position fields;
 6. writes provider-owned tables below
-   `data/processed/fbref/ENG-Premier League/2025-2026/`;
+   `data/processed/fbref/ENG-Premier League/2026-2027/`;
 7. updates the identity lookup/audit artifacts only after valid input passes
    the safety checks.
 
@@ -161,16 +181,16 @@ Cleaning is deliberately single-threaded because it mutates shared identity
 registries. The accepted `--workers` option is retained only for CLI
 compatibility.
 
-## 5. Quarantine deprecated partial outputs
+## 5. Optional: quarantine deprecated FBref partial outputs
 
-For 2025-2026, any generated `team_match/keeper.csv`,
+For 2026-2027, any generated `team_match/keeper.csv`,
 `team_match/shooting.csv`, or `team_match/misc.csv` is not production data.
 These explicit commands preserve the files for audit while removing them from
 the active processed tree:
 
 ```powershell
-$fbrefActive = "data/processed/fbref/ENG-Premier League/2025-2026/team_match"
-$fbrefQuarantine = "data/quarantine/fbref/ENG-Premier League/2025-2026/incomplete_processed/team_match"
+$fbrefActive = "data/processed/fbref/ENG-Premier League/2026-2027/team_match"
+$fbrefQuarantine = "data/quarantine/fbref/ENG-Premier League/2026-2027/incomplete_processed/team_match"
 New-Item -ItemType Directory -Force -Path $fbrefQuarantine | Out-Null
 
 if (Test-Path "$fbrefActive/keeper.csv") {
@@ -188,12 +208,12 @@ Raw snapshots remain immutable. Because the cleaner scans all raw CSVs, repeat
 this quarantine step after a forced clean if an older raw snapshot still
 contains those deprecated partial files.
 
-## 6. Validate the cleaned provider tables
+## 6. Optional: validate cleaned FBref tables
 
 Check the active surface and basic Premier League cardinalities:
 
 ```powershell
-$fbrefSeason = "data/processed/fbref/ENG-Premier League/2025-2026"
+$fbrefSeason = "data/processed/fbref/ENG-Premier League/2026-2027"
 $schedule = Import-Csv "$fbrefSeason/player_match/schedule.csv"
 $summary = Import-Csv "$fbrefSeason/player_match/summary.csv"
 
@@ -235,17 +255,19 @@ python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
   --log-level INFO
 ```
 
-For a season with cleaned provider match data, build the full calendar without
-FDR. FPL supplies fixture IDs, gameweeks, and the scheduled calendar.
+After WhoScored and Understat publish completed-match data, build the enriched
+calendar without FDR. FPL supplies fixture IDs, gameweeks, and the scheduled
+calendar. FBref is consulted only when its optional schedule exists.
 
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --fpl-root "data/raw/fpl/ENG-Premier League" `
-   --whoscored-league-dir "data/processed/whoscored/ENG-Premier League" `
-   --team-map "data/processed/registry/_id_lookup_teams.json" `
+  --whoscored-league-dir "data/processed/whoscored/ENG-Premier League" `
+  --understat-league-dir "data/processed/understat/ENG-Premier League" `
+  --team-map "data/processed/registry/_id_lookup_teams.json" `
   --short-map "data/config/teams.json" `
-   --out-dir "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/fixtures" `
   --features-root "data/processed/registry/features" `
   --force `
   --log-level INFO
@@ -254,7 +276,7 @@ python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
 Expected output:
 
 ```text
-data/processed/registry/fixtures/2025-2026/fixture_calendar.csv
+data/processed/registry/fixtures/2026-2027/fixture_calendar.csv
 ```
 
 It should contain 760 team-fixture rows, representing both sides of 380
@@ -266,27 +288,28 @@ separately as `is_home` in the fixture calendar and `was_home` in the player
 calendar; downstream form calculations use those flags rather than parsing the
 stadium string.
 
-## 8. Assign canonical FBref match IDs to FPL rows
+## 8. Assign canonical match IDs to FPL rows
 
 ```powershell
 python -m fpl_assistant.providers.fpl.clean.assign_game_ids `
   --proc-root "data/processed/fpl/ENG-Premier League" `
-  --fbref-root "data/processed/fbref" `
   --fixture-calendar-root "data/processed/registry/fixtures" `
   --league "ENG-Premier League" `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --tz UTC `
   --log-level INFO
 ```
 
-This updates the cleaned FPL gameweek rows to use FBref `game_id`, while FPL's
-official fixture ID and corrected gameweek remain separate fields.
+This updates cleaned FPL gameweek rows with provider-neutral `match_id` and the
+legacy `game_id` alias. If an optional historical FBref summary exists it is a
+fallback, not a prerequisite. FPL's official fixture ID and corrected
+gameweek remain separate fields.
 
 ## 9. Build team form and optional FDR view
 
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.team_form_builder `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --fixtures-root "data/processed/registry/fixtures" `
   --out-dir "data/processed/registry/features" `
   --write-latest `
@@ -304,12 +327,11 @@ view is needed.
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.calendar_builder `
   --fixtures-root "data/processed/registry/fixtures" `
-  --fbref-root "data/processed/fbref/ENG-Premier League" `
   --whoscored-root "data/processed/whoscored/ENG-Premier League" `
   --fpl-root "data/processed/fpl/ENG-Premier League" `
   --features-root "data/processed/registry/features" `
   --team-version latest `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --force `
   --log-level INFO
 ```
@@ -321,7 +343,7 @@ diagnostic escape hatch.
 
 ```powershell
 python -m fpl_assistant.providers.fbref.integrate.player_form_builder `
-  --season "2025-2026" `
+  --season "2026-2027" `
   --fixtures-root "data/processed/registry/fixtures" `
   --out-dir "data/processed/registry/features" `
   --write-latest `
@@ -339,15 +361,15 @@ into the composite `latest` directory.
 ```powershell
 python -m fpl_assistant.qa.assurance `
   --fixtures-root "data/processed/registry/fixtures" `
-  --fbref-league-dir "data/processed/fbref/ENG-Premier League" `
   --teams-lookup "data/processed/registry/_id_lookup_teams.json" `
   --players-lookup "data/processed/registry/_id_lookup_players.json" `
-  --seasons "2025-2026" `
+  --seasons "2026-2027" `
   --log-level INFO
 
 python -m pytest -q
 ```
 
 Assurance is an integration check, so run it only after the fixture and player
-calendars exist. Investigate failures rather than lowering coverage thresholds
-for a production publication.
+calendars exist. The FBref lineup cross-check runs automatically when an
+optional FBref lineup file exists and is skipped otherwise. Investigate
+failures rather than lowering coverage thresholds for production publication.

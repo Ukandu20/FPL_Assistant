@@ -106,5 +106,5 @@ def test_player_form_uses_was_home_without_rewriting_stadium_or_dropping_gkp_sta
 
     assert coerced["venue"].tolist() == ["Old Trafford", "Emirates Stadium"]
     assert coerced["was_home"].tolist() == [1, 0]
-    assert coerced["pos"].tolist() == ["GK", "GK"]
+    assert coerced["pos"].tolist() == ["GKP", "GKP"]
     assert coerced["saves"].tolist() == [4, 2]

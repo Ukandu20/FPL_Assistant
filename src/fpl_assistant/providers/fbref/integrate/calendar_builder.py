@@ -11,7 +11,7 @@ import numpy as np
 # ───────────────────────────── Canonical output schema (price is optional) ─────────────────────────
 OUT_COLS = [
     # Fixture identity / join keys
-    "fbref_id", "fpl_id", "gw_orig", "gw_played","date_sched","date_played",
+    "match_id", "fbref_id", "fpl_id", "gw_orig", "gw_played","date_sched","date_played",
     "team_id", "opponent_id", "team", "venue", "was_home", "fdr_home", "fdr_away",
 
     # Player identity & availability
@@ -90,7 +90,11 @@ def _read_calendar_base(season_dir: Path) -> pd.DataFrame:
     """Read the PURE fixtures calendar (expects gw_orig present)."""
     fp = season_dir / "fixture_calendar.csv"
     df = pd.read_csv(fp, low_memory=False, parse_dates=["date_played","date_sched"])
-    for c in ["team_id","home_id","away_id","opponent_id","fbref_id","fpl_id"]:
+    if "match_id" not in df.columns and "fbref_id" in df.columns:
+        df["match_id"] = df["fbref_id"]
+    if "fbref_id" not in df.columns and "match_id" in df.columns:
+        df["fbref_id"] = df["match_id"]
+    for c in ["team_id","home_id","away_id","opponent_id","match_id","fbref_id","fpl_id"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.lower()
     # normalize dates to date-only
@@ -150,9 +154,14 @@ def load_fixture_calendar(season_dir: Path, *, features_root: Path, team_version
             df["opponent_id"] = df["opponent_id"].fillna(pd.Series(opp, index=df.index)).astype("string")
     return df
 
-# ───────────────────────────── FBref loaders ─────────────────────────────
+# ───────────────────────────── Player-match loaders ─────────────────────────────
 
-def load_minutes(season_dir: Path, fbref_root: Path, whoscored_root) -> pd.DataFrame:
+def load_minutes(season_dir: Path, fbref_root: Path, whoscored_root: Path) -> pd.DataFrame:
+    """Load provider-neutral player-match metrics from WhoScored.
+
+    ``fbref_root`` remains in the signature for CLI/API compatibility but is
+    intentionally not read.
+    """
     season_key = season_dir.name
     summary_fp = whoscored_root / season_key / "player_match" / "summary.csv"
     keeper_fp  = whoscored_root / season_key / "player_match" / "keepers.csv"
@@ -167,7 +176,7 @@ def load_minutes(season_dir: Path, fbref_root: Path, whoscored_root) -> pd.DataF
         ],
         low_memory=False
     ).rename(columns={
-        "match_id":"fbref_id", "fpl_pos":"pos", "shots_total":"shots",
+        "fpl_pos":"pos", "shots_total":"shots",
         "shots_on_target": "sot", "yellow_cards": "yellow_crd",
         "red_cards": "red_crd",
     })
@@ -176,30 +185,32 @@ def load_minutes(season_dir: Path, fbref_root: Path, whoscored_root) -> pd.DataF
         keeper_fp,
         usecols=["match_id","player_id","team_id","shots_on_target_against","saves","save_pct"],
         low_memory=False
-    ).rename(columns={"match_id":"fbref_id","shots_on_target_against":"sot_against"})
+    ).rename(columns={"shots_on_target_against":"sot_against"})
 
     df_def = pd.read_csv(
         def_fp, usecols=["match_id","player_id","team_id","blocks","tackles_won","interceptions","clearances"],
         low_memory=False
     ).rename(columns={
-        "match_id":"fbref_id", "tackles_won":"tkl",
+        "tackles_won":"tkl",
         "interceptions":"int", "clearances":"clr",
     })
 
     df_misc = pd.read_csv(
         misc_fp, usecols=["match_id","player_id","team_id","recoveries","penalties_won","own_goals"],
         low_memory=False
-    ).rename(columns={"match_id":"fbref_id","penalties_won":"pk_won"})
+    ).rename(columns={"penalties_won":"pk_won"})
 
-    df = df.merge(df_gk,  on=["fbref_id","player_id","team_id"], how="left")
-    df = df.merge(df_def, on=["fbref_id","player_id","team_id"], how="left")
-    df = df.merge(df_misc,on=["fbref_id","player_id","team_id"], how="left")
+    keys = ["match_id", "player_id", "team_id"]
+    df = df.merge(df_gk, on=keys, how="left")
+    df = df.merge(df_def, on=keys, how="left")
+    df = df.merge(df_misc, on=keys, how="left")
 
     for col in ("sot_against","saves","save_pct"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    for c in ["player_id","team_id","fbref_id"]:
+    for c in ["player_id", "team_id", "match_id"]:
         df[c] = df[c].astype(str).str.lower()
+    df.insert(1, "fbref_id", df["match_id"])
 
     return df
 
@@ -548,8 +559,7 @@ def build_minutes_calendar(
             write_empty_minutes_calendar(season_dir, include_price)
             return
         else:
-            logging.warning(msg + " — skipped (use --create-empty to write empty)")
-            return
+            raise FileNotFoundError(msg)
 
     # Load fixture calendar (+FDR if available)
     cal = load_fixture_calendar(season_dir, features_root=features_root, team_version=team_version, views_subdir=views_subdir)
@@ -557,8 +567,11 @@ def build_minutes_calendar(
     # Load player minutes directly
     minutes = load_minutes(season_dir, fbref_root, whoscored_root)
 
-    # Merge on both 'fbref_id' and 'team_id'
-    merged = minutes.merge(cal, on=["fbref_id", "team_id"], how="left")
+    # Canonical match identity is provider-neutral. ``fbref_id`` is retained
+    # only as a compatibility alias in the published output.
+    merged = minutes.drop(columns=["fbref_id"], errors="ignore").merge(
+        cal, on=["match_id", "team_id"], how="left"
+    )
 
     # Preserve provider venue as the physical stadium. Team perspective is a
     # separate identity-derived flag and must not depend on venue semantics.
@@ -583,7 +596,7 @@ def build_minutes_calendar(
     )
 
     # Normalize IDs for joins
-    for c in ["player_id","fbref_id","team_id","fpl_id"]:
+    for c in ["player_id","match_id","fbref_id","team_id","fpl_id"]:
         if c in merged.columns:
             merged[c] = merged[c].astype(str).str.lower()
     merged["date_played"] = _normalize_date(merged["date_played"])
@@ -742,6 +755,7 @@ def run_batch(
     force: bool,
     create_empty: bool,
 ) -> None:
+    failures: list[tuple[str, Exception]] = []
     for season in seasons:
         season_dir = fixtures_root / season
         if not season_dir.is_dir():
@@ -760,17 +774,21 @@ def run_batch(
                 include_price, price_master, price_seasonal, drop_missing_price,
                 force=force, create_empty=create_empty
             )
-        except Exception:
+        except Exception as exc:
             logging.exception("❌ %s failed", season)
+            failures.append((season, exc))
+    if failures:
+        failed_seasons = ", ".join(season for season, _ in failures)
+        raise RuntimeError(f"Player fixture calendar build failed for: {failed_seasons}")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures-root", type=Path, default=Path("data/processed/registry/fixtures"),
                     help="Root dir containing season subfolders")
     ap.add_argument("--fbref-root", type=Path, default=Path("data/processed/fbref/ENG-Premier League"),
-                    help="FBref league root (for JSONs and player_match)")
+                    help="Deprecated compatibility option; FBref data is not required")
     ap.add_argument("--whoscored-root", type=Path, default=Path("data/processed/whoscored/ENG-Premier League"),
-                    help="FBref league root (for JSONs and player_match)")
+                    help="WhoScored league root containing player-match metrics")
     ap.add_argument("--fpl-root", type=Path, default=Path("data/processed/fpl"),
                     help="FPL processed root (contains <season>/gws/merged_gws.csv)")
     ap.add_argument("--features-root", type=Path, default=Path("data/processed/registry/features"),
@@ -802,7 +820,7 @@ def main() -> None:
     else:
         seasons = sorted(d.name for d in args.fixtures_root.iterdir() if d.is_dir())
         if not seasons:
-            logging.error("No seasons found under %s", args.fixtures_root); return
+            raise SystemExit(f"No seasons found under {args.fixtures_root}")
 
     run_batch(
         seasons,

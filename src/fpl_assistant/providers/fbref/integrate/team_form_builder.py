@@ -49,7 +49,7 @@ METRICS = {
 }
 
 REQUIRED_BASE = {
-    "fpl_id", "fbref_id", "team_id", "team", "gw_orig",
+    "fpl_id", "match_id", "team_id", "team", "gw_orig",
     "home_id", "away_id", "date_played", "date_sched",
     "gf", "ga", "xg", "xga", "poss", "result",
 }
@@ -195,7 +195,7 @@ def _validate_or_infer_from_ids(frame: pd.DataFrame, season: str, strict: bool) 
     df = frame.copy()
 
     # Normalize id types
-    for c in ["team_id","opponent_id","home_id","away_id","fpl_id","fbref_id"]:
+    for c in ["team_id","opponent_id","home_id","away_id","fpl_id","match_id","fbref_id"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.lower()
 
@@ -258,11 +258,16 @@ def _load_all(fixtures_root: Path, seasons: List[str], strict_ids: bool) -> pd.D
             continue
         df = pd.read_csv(fp, parse_dates=["date_played","date_sched"])
 
+        if "match_id" not in df.columns and "fbref_id" in df.columns:
+            df["match_id"] = df["fbref_id"]
+        if "fbref_id" not in df.columns and "match_id" in df.columns:
+            df["fbref_id"] = df["match_id"]
+
         _require_base(df, s)
         df = _coerce_poss(df)
         df = _validate_or_infer_from_ids(df, s, strict=strict_ids)
 
-        for c in ["team_id","opponent_id","home_id","away_id","fpl_id","fbref_id"]:
+        for c in ["team_id","opponent_id","home_id","away_id","fpl_id","match_id","fbref_id"]:
             if c in df.columns:
                 df[c] = df[c].astype(str).str.lower()
 

@@ -403,9 +403,12 @@ def build_fixture_calendar(
             cal = read_fixture_calendar(out_dir, season)
             maybe_write_fdr_view(cal, season, features_root, attach_fdr, views_subdir)
         return False
-    if not (fpl_csv.is_file() and ws_csv.is_file() and und_csv.is_file()):
-        logging.warning("%s • missing fixture or schedule csv – skipped", season)
-        return False
+    required_inputs = [fpl_csv, ws_csv, und_csv]
+    missing_inputs = [str(path) for path in required_inputs if not path.is_file()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            f"{season} • missing fixture/provider inputs: {missing_inputs}"
+        )
 
     # -- lookups
     name2hex, name2code, code2hex = build_maps(
@@ -665,7 +668,10 @@ def build_fixture_calendar(
         "home", "away", "home_id", "away_id",
         "status", "sched_missing", "venue",
         "gf", "ga", "xga", "xg", "poss", "result", "is_promoted", "is_relegated",
-    ]].rename(columns={"match_id": "fbref_id"}).copy()
+    ]].copy()
+    # Compatibility alias for older consumers. ``match_id`` is canonical and
+    # provider-neutral; this value is not necessarily an FBref-native ID.
+    out.insert(2, "fbref_id", out["match_id"])
 
     # ── NEW: apply sticky schedule lock from previous calendar ──
     out = _lock_sched_fields(out, out_dir, season)
@@ -689,11 +695,11 @@ def build_fixture_calendar(
     logging.info("%s • fixture_calendar.csv (%d rows)", season, len(out))
 
     # Diagnostics
-    missing = out[out["fbref_id"].isna()]
-    missing_audit_path = dst_dir / "_manual_fbref_match.csv"
+    missing = out[out["match_id"].isna()]
+    missing_audit_path = dst_dir / "_manual_match_identity.csv"
     if not missing.empty:
         missing.to_csv(missing_audit_path, index=False)
-        logging.warning("%s • %d rows lack fbref_id (see _manual_fbref_match.csv)", season, len(missing))
+        logging.warning("%s • %d rows lack match_id (see _manual_match_identity.csv)", season, len(missing))
     else:
         missing_audit_path.unlink(missing_ok=True)
     null_ids = out[out["home_id"].isna() | out["away_id"].isna()]
@@ -722,13 +728,13 @@ def build_fixture_calendar(
     if bad_align.empty:
         (dst_dir / "_home_alignment_audit.csv").unlink(missing_ok=True)
 
-    audit = out.loc[out["fbref_id"].notna() & out["date_sched"].notna() & out["date_played"].notna()].copy()
+    audit = out.loc[out["match_id"].notna() & out["date_sched"].notna() & out["date_played"].notna()].copy()
     audit = audit[audit["date_sched"] != audit["date_played"]]
     if not audit.empty:
         audit["delta_days"] = (audit["date_played"] - audit["date_sched"]).dt.days.astype(int)
         audit["abs_delta_days"] = audit["delta_days"].abs()
         audit_cols = [
-            "fpl_id", "fbref_id", "gw_orig", "gw_played",
+            "fpl_id", "match_id", "fbref_id", "gw_orig", "gw_played",
             "home", "away", "team", "team_id", "opponent_id",
             "date_sched", "date_played", "delta_days", "abs_delta_days", "status"
         ]
@@ -766,6 +772,7 @@ def run_batch(
     bootstrap: bool = False,
     league: str = "ENG-Premier League",
 ):
+    failures: list[tuple[str, Exception]] = []
     for season in seasons:
         fpl_csv = fpl_root / season / "season" / "fixtures.csv"
         fb_csv = fbref_league / season / "team_match" / "schedule.csv"
@@ -803,8 +810,12 @@ def run_batch(
                 match_tolerance_days=match_tolerance_days,
                 force=force,
             )
-        except Exception:
+        except Exception as exc:
             logging.exception("%s • unhandled error", season)
+            failures.append((season, exc))
+    if failures:
+        failed_seasons = ", ".join(season for season, _ in failures)
+        raise RuntimeError(f"Fixture calendar build failed for: {failed_seasons}")
 
 
 # ───────────────────────────── CLI ─────────────────────────────────────────
@@ -822,9 +833,24 @@ def main():
         ),
     )
     ap.add_argument("--fpl-root", type=Path, default=Path("data/raw/fpl/ENG-Premier League"))
-    ap.add_argument("--fbref-league-dir", type=Path, default=Path("data/processed/fbref/ENG-Premier League"))
-    ap.add_argument("--whoscored-league-dir", type=Path, default=Path("data/processed/whoscored/ENG-Premier League"))
-    ap.add_argument("--understat-league-dir", type=Path, default=Path("data/processed/understat/ENG-Premier League"))
+    ap.add_argument(
+        "--fbref-league-dir",
+        type=Path,
+        default=Path("data/processed/fbref/ENG-Premier League"),
+        help="Optional FBref root used only for schedule validation when present",
+    )
+    ap.add_argument(
+        "--whoscored-league-dir",
+        type=Path,
+        default=Path("data/processed/whoscored/ENG-Premier League"),
+        help="Required for the enriched (non-bootstrap) calendar",
+    )
+    ap.add_argument(
+        "--understat-league-dir",
+        type=Path,
+        default=Path("data/processed/understat/ENG-Premier League"),
+        help="Required for the enriched (non-bootstrap) calendar",
+    )
     ap.add_argument("--team-map", type=Path, default=Path("data/processed/registry/_id_lookup_teams.json"))
     ap.add_argument("--short-map", type=Path, default=Path("data/config/teams.json"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed/registry/fixtures"))
@@ -835,14 +861,14 @@ def main():
     ap.add_argument("--views-subdir", default="views",
                     help="Subfolder under features/ to store materialized views (default: 'views').")
     ap.add_argument("--match-tolerance-days", type=int, default=21,
-                    help="Max days between scheduled (FPL) and played (FBref) for nearest-date recovery.")
+                    help="Max days between scheduled FPL and played provider dates for nearest-date recovery.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
     if not args.fpl_root.exists():
-        logging.error("FPL root not found: %s", args.fpl_root); return
+        raise SystemExit(f"FPL root not found: {args.fpl_root}")
     try:
         season_dirs = [d.name for d in args.fpl_root.iterdir() if d.is_dir()]
     except FileNotFoundError:
@@ -850,7 +876,7 @@ def main():
 
     seasons = [args.season] if args.season else sorted(season_dirs)
     if not seasons:
-        logging.error("No seasons found"); return
+        raise SystemExit("No seasons found")
 
     run_batch(
         seasons=seasons,

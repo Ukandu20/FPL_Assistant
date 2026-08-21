@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_opener
 
 import pandas as pd
 
@@ -460,7 +460,10 @@ class NativeWhoScoredBackend:
         self.browser_fallback = browser_fallback
         self.path_to_browser = path_to_browser
         self.headless = headless
-        self._opener = build_opener(HTTPCookieProcessor())
+        self._opener = build_opener(
+            HTTPCookieProcessor(),
+            HTTPSHandler(context=ssl.create_default_context()),
+        )
 
     def resolve_seasons(self, league: str, explicit_seasons: Optional[Sequence[str]]) -> pd.DataFrame:
         competition = self.competitions[league]
@@ -722,19 +725,9 @@ class NativeWhoScoredBackend:
 
         try:
             req = Request(url, headers=DEFAULT_HEADERS)
-            with self._opener.open(req, context=ssl.create_default_context(), timeout=30) as response:
+            with self._opener.open(req, timeout=30) as response:
                 data = response.read().decode("utf-8", errors="replace")
-        except TypeError:
-            try:
-                req = Request(url, headers=DEFAULT_HEADERS)
-                with self._opener.open(req, timeout=30) as response:
-                    data = response.read().decode("utf-8", errors="replace")
-            except (HTTPError, URLError) as exc:
-                if self.browser_fallback:
-                    data = self._fetch_text_with_browser(url)
-                else:
-                    raise RuntimeError(f"Request failed for {url}: {exc}") from exc
-        except (HTTPError, URLError) as exc:
+        except (HTTPError, URLError, OSError) as exc:
             if self.browser_fallback:
                 data = self._fetch_text_with_browser(url)
             else:

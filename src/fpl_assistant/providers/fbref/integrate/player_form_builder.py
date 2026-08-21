@@ -41,7 +41,7 @@ ALIASES: Dict[str, List[str]] = {
     "player_id": ["player_id", "fbref_player_id", "fpl_player_id", "id_player"],
     "player": ["player", "player_name", "name"],
     "pos": ["pos", "position", "position_short", "fpl_pos"],
-    "fbref_id": ["fbref_id", "fbref_url_id", "game_id", "fixture_id_fbref"],
+    "match_id": ["match_id", "fbref_id", "game_id", "fixture_id_fbref"],
     "fpl_id": ["fpl_id", "fpl_code", "fpl_fixture_id", "fixture_id_fpl"],
     "team_id": ["team_id", "team_code", "team_short_id", "squad_id", "team_hex"],
     "opponent_id": ["opponent_id", "opp_id"],
@@ -562,6 +562,9 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
                 rename_map[alt] = canon
                 break
     df = df.rename(columns=rename_map).copy()
+    if "match_id" in df.columns and "fbref_id" not in df.columns:
+        # Compatibility alias for existing model consumers.
+        df["fbref_id"] = df["match_id"]
 
     # 2) Basic keys & types
     if "season" not in df.columns:
@@ -604,7 +607,7 @@ def _coerce_columns(df: pd.DataFrame, fill_missing_fdr: Optional[float]) -> Tupl
     df["gw_orig"] = pd.to_numeric(df["gw_orig"], errors="coerce").astype("Int64")
 
     # strings
-    for c in ["player_id","team_id","opponent_id","fbref_id","fpl_id","player","team","pos"]:
+    for c in ["player_id","team_id","opponent_id","match_id","fbref_id","fpl_id","player","team","pos"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
     if "pos" in df.columns:

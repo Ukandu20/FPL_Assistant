@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from http.client import RemoteDisconnected
 from pathlib import Path
 
 import pandas as pd
@@ -382,6 +383,39 @@ def test_native_schedule_recovers_stage_after_blocked_season_page(tmp_path, monk
 
     assert schedule["game_id"].tolist() == [123456]
     assert schedule.loc[0, "stage_id"] == 20934
+
+
+def test_native_fetch_text_uses_browser_after_remote_disconnect(tmp_path, monkeypatch):
+    competition = CompetitionConfig(
+        key="ENG-Premier League",
+        source_name="England - Premier League",
+        region_id=252,
+        tournament_id=2,
+        competition_type="club",
+        season_mode="split-year",
+    )
+    backend = NativeWhoScoredBackend(
+        competitions={competition.key: competition},
+        cache_dir=tmp_path,
+        browser_fallback=True,
+        no_cache=True,
+        no_store=True,
+    )
+
+    class DisconnectingOpener:
+        def open(self, _request, *, timeout):
+            assert timeout == 30
+            raise RemoteDisconnected("remote closed the connection")
+
+    backend._opener = DisconnectingOpener()
+    monkeypatch.setattr(
+        backend,
+        "_fetch_text_with_browser",
+        lambda url: f"<html>{url}</html>",
+    )
+
+    url = "https://www.whoscored.com/test"
+    assert backend._fetch_text(url, tmp_path / "unused.html") == f"<html>{url}</html>"
 
 
 def test_legacy_whoscored_scraper_delegates(monkeypatch):
