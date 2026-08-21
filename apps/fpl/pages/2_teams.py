@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -22,7 +24,7 @@ from apps.fpl.state import (
     toggle_shortlist,
     update_query,
 )
-from apps.fpl.ui import apply_chart_style, empty_state, file_freshness, inject_global_styles, page_header
+from apps.fpl import ui as fpl_ui
 from apps.fpl.catalog import (
     FPL_ROOT,
     discover_leagues,
@@ -34,6 +36,15 @@ from apps.fpl.catalog import (
 )
 from fpl_assistant.apps.viewmodels.dashboard import enrich_current_players, fixture_rows
 from fpl_assistant.apps.viewmodels.player_card import team_badge_url
+
+
+fpl_ui = importlib.reload(fpl_ui)
+apply_chart_style = fpl_ui.apply_chart_style
+empty_state = fpl_ui.empty_state
+file_freshness = fpl_ui.file_freshness
+inject_global_styles = fpl_ui.inject_global_styles
+page_header = fpl_ui.page_header
+style_availability_table = fpl_ui.style_availability_table
 
 
 st.set_page_config(page_title="FPL Teams", page_icon="🛡️", layout="wide")
@@ -340,7 +351,7 @@ def main() -> None:
         column for column in ["player_id", "baseline_total_points", "baseline_minutes"] if column in display
     ])
     selection = st.dataframe(
-        visible,
+        style_availability_table(visible),
         hide_index=True,
         width="stretch",
         on_select="rerun",

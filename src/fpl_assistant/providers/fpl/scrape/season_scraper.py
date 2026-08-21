@@ -17,6 +17,7 @@ Under data/raw/fpl/<LEAGUE>/<YYYY-YYYY+1>/:
   gws/xP<gw>.csv, gws/* merged GW artifacts via your functions
   season/:
     cleaned_players.csv
+    events.csv
     fixtures.csv
     teams.csv
     fixture_metadata.csv
@@ -39,7 +40,13 @@ import pandas as pd
 
 from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
-from scripts.fpl_pipeline.utils.parse_helpers import *  # noqa: F401,F403
+from scripts.fpl_pipeline.utils.parse_helpers import (
+    parse_fixtures,
+    parse_player_gw_history,
+    parse_player_history,
+    parse_players,
+    parse_team_data,
+)
 from scripts.fpl_pipeline.clean.cleaners import clean_players, id_players, get_player_ids
 from scripts.fpl_pipeline.scrape.api_client import (
     FPLApiError,
@@ -125,6 +132,7 @@ def _fresh_cleanup(season_dir: str) -> None:
     season_sub = os.path.join(season_dir, "season")
     for fname in [
         "cleaned_players.csv",
+        "events.csv",
         "fixture_metadata.csv",
         "fixture_metadata_resolved.csv",
         "fixture_metadata_per_team.csv",
@@ -268,6 +276,17 @@ def fixtures(season_dir_season: str) -> None:
     data = get_fixtures_data()
     parse_fixtures(data, _with_sep(season_dir_season))
 
+
+def write_events(events: list[dict], season_dir_season: str) -> None:
+    """Persist the official FPL gameweek calendar used by deadline views."""
+    columns = [
+        "id", "name", "deadline_time", "is_previous", "is_current", "is_next",
+        "finished", "data_checked", "average_entry_score", "highest_score",
+    ]
+    frame = pd.DataFrame.from_records(events).reindex(columns=columns)
+    _write_csv_atomic(frame, os.path.join(season_dir_season, "events.csv"))
+
+
 def _promote_cleaned_players_to_season_subdir(season_dir: str, season_dir_season: str) -> None:
     candidates: List[str] = [
         os.path.join(season_dir, "players.csv"),
@@ -318,6 +337,7 @@ def parse_data(
 
     print("Parsing summary data …")
     parse_players(data["elements"], season_dir_sep)
+    write_events(data.get("events", []), season_dir_season)
 
     gw_num = 0
     for event in data.get("events", []):

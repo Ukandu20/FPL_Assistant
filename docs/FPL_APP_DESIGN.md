@@ -33,8 +33,12 @@ The registered pages are:
 - A missing forecast is displayed as missing; another season is never used as
   a hidden projection fallback.
 - Preseason rankings use a clearly labelled previous-season baseline.
-- The official deadline is not inferred from kickoff time when it is absent
-  from local source artifacts.
+- Official deadlines come from the persisted FPL gameweek calendar. When that
+  artifact is absent, the Hub displays a clearly labelled estimate calculated
+  as the first scheduled kickoff minus the official 90-minute cutoff.
+- Stat leaders are calculated from match-level FPL rows. Rate tables expose
+  their appearance or minute denominator and never use a hidden prior-season
+  fallback.
 - Low-confidence archetype labels are visually muted but not silently hidden.
 - Team performance and set-piece baselines identify their evidence season.
 

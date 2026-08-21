@@ -13,6 +13,7 @@ from apps.fpl.catalog import (
     PREDICTIONS_ROOT,
     file_version,
     fpl_gameweeks_path,
+    fpl_raw_events_path,
     fpl_raw_fixtures_path,
     fpl_raw_teams_path,
     fpl_season_path,
@@ -64,6 +65,11 @@ def gameweeks(league: str, season: str) -> pd.DataFrame:
 
 def raw_fixtures(league: str, season: str) -> pd.DataFrame:
     path = fpl_raw_fixtures_path(league, season)
+    return read_csv(str(path), file_version(path))
+
+
+def raw_events(league: str, season: str) -> pd.DataFrame:
+    path = fpl_raw_events_path(league, season)
     return read_csv(str(path), file_version(path))
 
 

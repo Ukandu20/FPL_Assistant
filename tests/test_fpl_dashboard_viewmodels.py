@@ -13,6 +13,8 @@ from fpl_assistant.apps.viewmodels.dashboard import (
     fixture_rows,
     forecast_watchlist,
     player_watchlist,
+    gameweek_deadline,
+    stat_leaders,
     team_fixture_outlook,
 )
 
@@ -178,6 +180,68 @@ def test_fixture_outlook_expands_both_teams_and_ranks_easier_runs() -> None:
     assert len(rows) == 4
     assert outlook.loc[outlook.Team.eq("AAA"), "Average FDR"].iloc[0] == 2
     assert outlook.loc[outlook.Team.eq("BBB"), "Average FDR"].iloc[0] == 4
+
+
+def test_deadline_prefers_official_event_and_labels_fixture_fallback() -> None:
+    fixtures = pd.DataFrame(
+        {"event": [1, 1], "kickoff_time": ["2026-08-21T19:00:00Z", "2026-08-22T11:30:00Z"]}
+    )
+    events = pd.DataFrame({"id": [1], "deadline_time": ["2026-08-21T17:30:00Z"]})
+
+    official, source = gameweek_deadline(events, fixtures, 1)
+    assert official == pd.Timestamp("2026-08-21T17:30:00Z")
+    assert source == "official"
+
+    estimated, source = gameweek_deadline(pd.DataFrame(), fixtures, 1)
+    assert estimated == pd.Timestamp("2026-08-21T17:30:00Z")
+    assert source == "estimated"
+
+
+def test_stat_leaders_use_match_rows_for_rates_value_and_defcon_hits() -> None:
+    players = pd.DataFrame(
+        {
+            "player_id": ["def", "mid", "gkp"],
+            "name": ["Defender", "Midfielder", "Keeper"],
+            "team": ["AAA", "BBB", "CCC"],
+            "fpl_pos": ["DEF", "MID", "GKP"],
+            "now_cost": [50, 100, 45],
+        }
+    )
+    gameweeks = pd.DataFrame(
+        {
+            "player_id": ["def", "def", "mid", "mid", "gkp"],
+            "fpl_pos": ["DEF", "DEF", "MID", "MID", "GKP"],
+            "round": [1, 2, 1, 1, 1],
+            "kickoff_time": [
+                "2026-08-21T19:00:00Z", "2026-08-29T14:00:00Z",
+                "2026-08-22T11:30:00Z", "2026-08-25T19:00:00Z",
+                "2026-08-22T14:00:00Z",
+            ],
+            "minutes": [90, 45, 90, 30, 90],
+            "total_points": [6, 2, 8, 1, 4],
+            "goals_scored": [0, 0, 1, 0, 0],
+            "assists": [0, 1, 0, 0, 0],
+            "defensive_contribution": [10, 9, 12, 11, 15],
+        }
+    )
+
+    value = stat_leaders(players, gameweeks, metric="Points / £m")
+    assert value.iloc[0]["Player"] == "Defender"
+    assert value.iloc[0]["Value"] == 1.6
+
+    per_match = stat_leaders(players, gameweeks, metric="Points", basis="Per appearance")
+    assert per_match.iloc[0]["Player"] == "Midfielder"
+    assert per_match.iloc[0]["Value"] == 4.5
+
+    hit_rate = stat_leaders(players, gameweeks, metric="DefCon hit rate")
+    assert hit_rate.set_index("Player").loc["Defender", "Value"] == 0.5
+    assert hit_rate.set_index("Player").loc["Midfielder", "Value"] == 0.5
+    assert "Keeper" not in hit_rate["Player"].tolist()
+
+    unavailable = stat_leaders(
+        players, gameweeks.drop(columns="defensive_contribution"), metric="DefCon hit rate"
+    )
+    assert unavailable.empty
 
 
 def test_archetype_changes_and_comparison_table_preserve_context() -> None:

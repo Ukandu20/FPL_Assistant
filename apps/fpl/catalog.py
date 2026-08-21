@@ -78,6 +78,10 @@ def fpl_raw_fixtures_path(league: str, season: str) -> Path:
     return RAW_FPL_ROOT / league / season / "season" / "fixtures.csv"
 
 
+def fpl_raw_events_path(league: str, season: str) -> Path:
+    return RAW_FPL_ROOT / league / season / "season" / "events.csv"
+
+
 def fpl_raw_teams_path(league: str, season: str) -> Path:
     return RAW_FPL_ROOT / league / season / "season" / "teams.csv"
 

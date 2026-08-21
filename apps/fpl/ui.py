@@ -42,6 +42,68 @@ ARCHETYPE_FAMILY_BADGE_COLORS = {
     "Venue Behaviour": "gray",
 }
 
+AVAILABILITY_STATUS_STYLES = {
+    "a": ("Available", "#16A34A", "#FFFFFF", "#DCFCE7", "#166534"),
+    "d": ("Doubtful", "#EAB308", "#422006", "#FEF9C3", "#854D0E"),
+    "i": ("Injured", "#DC2626", "#FFFFFF", "#FEE2E2", "#991B1B"),
+    "s": ("Suspended", "#DC2626", "#FFFFFF", "#FEE2E2", "#991B1B"),
+    "u": ("Unavailable", "#DC2626", "#FFFFFF", "#FEE2E2", "#991B1B"),
+    "n": ("Unavailable", "#DC2626", "#FFFFFF", "#FEE2E2", "#991B1B"),
+}
+
+AVAILABILITY_STATUS_ICONS = {
+    "a": "🟢",
+    "d": "🟡",
+    "i": "🔴",
+    "s": "🔴",
+    "u": "🔴",
+    "n": "🔴",
+}
+
+
+def availability_status(value: object) -> tuple[str, str, str]:
+    """Return an accessible label plus badge background and foreground colors."""
+    code = str(value).strip().lower()
+    label, background, foreground, _, _ = AVAILABILITY_STATUS_STYLES.get(
+        code, ("Status unknown", "#64748B", "#FFFFFF", "#E2E8F0", "#334155")
+    )
+    return label, background, foreground
+
+
+def availability_cell_style(value: object) -> str:
+    """Style a status-table cell using both text and semantic color."""
+    normalized = str(value).strip().lower()
+    plain_label = normalized.lstrip("🟢🟡🔴⚪ ").strip()
+    for code, style in AVAILABILITY_STATUS_STYLES.items():
+        if normalized == code or plain_label == style[0].lower():
+            _, _, _, background, foreground = style
+            return f"background-color:{background};color:{foreground};font-weight:600"
+    return "background-color:#E2E8F0;color:#334155;font-weight:600"
+
+
+def style_availability_table(frame: pd.DataFrame) -> pd.DataFrame | pd.io.formats.style.Styler:
+    """Render FPL status columns as labelled, color-coded table cells."""
+    output = frame.copy()
+    status_columns = [column for column in ("Status", "status") if column in output]
+    if not status_columns:
+        return output
+
+    label_to_code = {
+        style[0].lower(): code for code, style in AVAILABILITY_STATUS_STYLES.items()
+    }
+
+    def table_label(value: object) -> str:
+        normalized = str(value).strip().lower()
+        code = normalized if normalized in AVAILABILITY_STATUS_STYLES else label_to_code.get(normalized)
+        if code is None:
+            return "⚪ Status unknown"
+        label = AVAILABILITY_STATUS_STYLES[code][0]
+        return f"{AVAILABILITY_STATUS_ICONS[code]} {label}"
+
+    for column in status_columns:
+        output[column] = output[column].map(table_label)
+    return output.style.map(availability_cell_style, subset=status_columns)
+
 
 def inject_global_styles() -> None:
     """Apply small responsive refinements that Streamlit's theme cannot express."""

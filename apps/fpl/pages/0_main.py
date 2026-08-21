@@ -38,12 +38,7 @@ from apps.fpl.state import (
     toggle_shortlist,
     update_query,
 )
-from apps.fpl.ui import (
-    apply_chart_style,
-    badge_markdown as archetype_badge_markdown,
-    inject_global_styles,
-    page_header,
-)
+from apps.fpl import ui as fpl_ui
 from fpl_assistant.apps.viewmodels.dashboard import (
     FAMILY_DESCRIPTIONS,
     active_archetype_tags,
@@ -51,6 +46,15 @@ from fpl_assistant.apps.viewmodels.dashboard import (
 )
 from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
 
+
+# Keep shared UI helpers fresh in a long-running Streamlit development server.
+fpl_ui = importlib.reload(fpl_ui)
+apply_chart_style = fpl_ui.apply_chart_style
+availability_status = fpl_ui.availability_status
+archetype_badge_markdown = fpl_ui.badge_markdown
+inject_global_styles = fpl_ui.inject_global_styles
+page_header = fpl_ui.page_header
+style_availability_table = fpl_ui.style_availability_table
 
 # Streamlit reruns page modules without necessarily reloading their imported
 # dependencies. Reload this small, pure presentation module so newly added
@@ -1022,15 +1026,7 @@ def render_overview_tab(
     position = str(selected_record["Position"])
     team = str(selected_record["Team"])
     status_code = str(raw_record.get("status", "a")).strip().lower()
-    availability = {
-        "a": "Available",
-        "d": "Doubtful",
-        "i": "Injured",
-        "s": "Suspended",
-        "u": "Unavailable",
-        "n": "Unavailable",
-    }.get(status_code, "Status unknown")
-    status_color = "#16A34A" if availability == "Available" else "#D97706"
+    availability, status_color, status_text_color = availability_status(status_code)
     news = str(raw_record.get("news", "")).strip()
     if news.lower() == "nan":
         news = ""
@@ -1093,7 +1089,7 @@ def render_overview_tab(
         team_column.markdown(f"**{team}** · {position} · {selected_season}")
         st.markdown(
             '<span style="display:inline-block;padding:.2rem .6rem;border-radius:999px;'
-            f'background:{status_color};color:white;font-size:.8rem;font-weight:600">'
+            f'background:{status_color};color:{status_text_color};font-size:.8rem;font-weight:600">'
             f'{escape(availability)}</span>',
             unsafe_allow_html=True,
         )
@@ -2251,7 +2247,7 @@ def main() -> None:
             discovery_columns["Archetype score"] = discovery["_archetype_score"]
         discovery_display = pd.DataFrame(discovery_columns)
         selection = st.dataframe(
-            discovery_display,
+            style_availability_table(discovery_display),
             hide_index=True,
             width="stretch",
             on_select="rerun",

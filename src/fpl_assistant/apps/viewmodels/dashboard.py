@@ -7,6 +7,194 @@ import json
 import pandas as pd
 
 
+LEADER_METRICS = {
+    "Points": "points",
+    "Points / £m": "points_per_m",
+    "Goals": "goals",
+    "Assists": "assists",
+    "Defensive contributions": "defcon",
+    "DefCon hit rate": "defcon_hit_rate",
+}
+
+
+def gameweek_deadline(
+    events: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    gameweek: object,
+) -> tuple[pd.Timestamp, str]:
+    """Resolve an official deadline, or a clearly labelled 90-minute fallback."""
+    gw = pd.to_numeric(gameweek, errors="coerce")
+    if pd.isna(gw):
+        return pd.NaT, "unavailable"
+
+    if not events.empty and {"id", "deadline_time"}.issubset(events.columns):
+        event_ids = pd.to_numeric(events["id"], errors="coerce")
+        matched = events.loc[event_ids.eq(gw), "deadline_time"]
+        if not matched.empty:
+            deadline = pd.to_datetime(matched.iloc[0], errors="coerce", utc=True)
+            if pd.notna(deadline):
+                return deadline, "official"
+
+    if not fixtures.empty and {"event", "kickoff_time"}.issubset(fixtures.columns):
+        fixture_gws = pd.to_numeric(fixtures["event"], errors="coerce")
+        kickoffs = pd.to_datetime(
+            fixtures.loc[fixture_gws.eq(gw), "kickoff_time"],
+            errors="coerce",
+            utc=True,
+        ).dropna()
+        if not kickoffs.empty:
+            return kickoffs.min() - pd.Timedelta(minutes=90), "estimated"
+
+    return pd.NaT, "unavailable"
+
+
+def stat_leaders(
+    players: pd.DataFrame,
+    gameweeks: pd.DataFrame,
+    *,
+    metric: str = "Points",
+    basis: str = "Total",
+    period: str = "Season",
+    position: str = "All",
+    min_appearances: int = 0,
+    min_minutes: int = 0,
+    current_gameweek: object = None,
+    limit: int = 15,
+) -> pd.DataFrame:
+    """Rank match-level FPL output with explicit denominators and sample filters."""
+    if gameweeks.empty or metric not in LEADER_METRICS:
+        return pd.DataFrame()
+    required = {"player_id", "minutes", "total_points"}
+    if not required.issubset(gameweeks.columns):
+        return pd.DataFrame()
+
+    work = gameweeks.copy()
+    work["player_id"] = work["player_id"].astype("string")
+    work["_minutes"] = pd.to_numeric(work["minutes"], errors="coerce").fillna(0)
+    work = work.loc[work["_minutes"].gt(0)].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    round_column = "round" if "round" in work else "GW" if "GW" in work else None
+    if period == "Current GW" and round_column:
+        rounds = pd.to_numeric(work[round_column], errors="coerce")
+        requested_gw = pd.to_numeric(current_gameweek, errors="coerce")
+        target_gw = rounds.max() if pd.isna(requested_gw) else requested_gw
+        work = work.loc[rounds.eq(target_gw)].copy()
+    elif period == "Last 5 appearances":
+        sort_columns = [
+            column for column in ["player_id", "kickoff_time", round_column]
+            if column and column in work
+        ]
+        work = work.sort_values(sort_columns, kind="stable").groupby(
+            "player_id", group_keys=False
+        ).tail(5)
+    if work.empty:
+        return pd.DataFrame()
+
+    metric_columns = {
+        "Points": "total_points",
+        "Points / £m": "total_points",
+        "Goals": "goals_scored",
+        "Assists": "assists",
+        "Defensive contributions": "defensive_contribution",
+        "DefCon hit rate": "defensive_contribution",
+    }
+    selected_column = metric_columns[metric]
+    if selected_column not in work:
+        return pd.DataFrame()
+    if selected_column == "defensive_contribution":
+        observed = pd.to_numeric(work[selected_column], errors="coerce").notna()
+        work = work.loc[observed].copy()
+        if work.empty:
+            return pd.DataFrame()
+
+    def numeric(column: str) -> pd.Series:
+        if column not in work:
+            return pd.Series(0.0, index=work.index)
+        return pd.to_numeric(work[column], errors="coerce").fillna(0)
+
+    work["_points"] = numeric("total_points")
+    work["_goals"] = numeric("goals_scored")
+    work["_assists"] = numeric("assists")
+    work["_defcon"] = numeric("defensive_contribution")
+    positions = work.get(
+        "fpl_pos", work.get("position", pd.Series("", index=work.index))
+    ).astype("string").str.upper().replace("GK", "GKP")
+    work["_position"] = positions
+    work["_defcon_hit"] = (
+        (positions.eq("DEF") & work["_defcon"].ge(10))
+        | (positions.isin(["MID", "FWD"]) & work["_defcon"].ge(12))
+    ).astype(int)
+
+    grouped = work.groupby("player_id", as_index=False).agg(
+        points=("_points", "sum"),
+        goals=("_goals", "sum"),
+        assists=("_assists", "sum"),
+        defcon=("_defcon", "sum"),
+        defcon_hits=("_defcon_hit", "sum"),
+        Apps=("player_id", "size"),
+        Minutes=("_minutes", "sum"),
+    )
+
+    roster_columns = [
+        column for column in ["player_id", "name", "team", "fpl_pos", "now_cost"]
+        if column in players
+    ]
+    roster = players[roster_columns].copy() if roster_columns else pd.DataFrame()
+    if not roster.empty:
+        roster["player_id"] = roster["player_id"].astype("string")
+        roster = roster.drop_duplicates("player_id", keep="last")
+        grouped = grouped.merge(roster, on="player_id", how="left", validate="one_to_one")
+
+    # Match rows are the fallback source for identity fields in older seasons.
+    identity = work.drop_duplicates("player_id", keep="last").set_index("player_id")
+    for target, candidates in {
+        "name": ("name",), "team": ("team",), "fpl_pos": ("fpl_pos", "position")
+    }.items():
+        if target not in grouped:
+            grouped[target] = pd.NA
+        for candidate in candidates:
+            if candidate in identity:
+                grouped[target] = grouped[target].fillna(
+                    grouped["player_id"].map(identity[candidate])
+                )
+
+    grouped["fpl_pos"] = grouped["fpl_pos"].astype("string").str.upper().replace("GK", "GKP")
+    if position != "All":
+        grouped = grouped.loc[grouped["fpl_pos"].eq(position)].copy()
+    grouped = grouped.loc[
+        grouped["Apps"].ge(int(min_appearances))
+        & grouped["Minutes"].ge(int(min_minutes))
+    ].copy()
+    if grouped.empty:
+        return pd.DataFrame()
+
+    raw_price = grouped.get(
+        "now_cost", pd.Series(index=grouped.index, dtype="float64")
+    )
+    price = pd.to_numeric(raw_price, errors="coerce").div(10)
+    grouped["Price"] = price
+    grouped["points_per_m"] = grouped["points"].div(price.where(price.gt(0)))
+    grouped["defcon_hit_rate"] = grouped["defcon_hits"].div(grouped["Apps"])
+    grouped.loc[grouped["fpl_pos"].eq("GKP"), "defcon_hit_rate"] = pd.NA
+
+    source = LEADER_METRICS[metric]
+    values = pd.to_numeric(grouped[source], errors="coerce")
+    if basis == "Per appearance" and source != "defcon_hit_rate":
+        values = values.div(grouped["Apps"].where(grouped["Apps"].gt(0)))
+    elif basis == "Per 90" and source != "defcon_hit_rate":
+        values = values.mul(90).div(grouped["Minutes"].where(grouped["Minutes"].gt(0)))
+    grouped["Value"] = values
+    grouped = grouped.dropna(subset=["Value"]).sort_values(
+        ["Value", "Minutes", "name"], ascending=[False, False, True], kind="stable"
+    ).head(limit)
+    grouped.insert(0, "Rank", range(1, len(grouped) + 1))
+    return grouped.rename(
+        columns={"name": "Player", "team": "Team", "fpl_pos": "Pos"}
+    )[["Rank", "player_id", "Player", "Team", "Pos", "Value", "Apps", "Minutes", "Price"]].reset_index(drop=True)
+
+
 FAMILY_ORDER = {
     family: index
     for index, family in enumerate(
