@@ -149,8 +149,10 @@ the input row count. Provider routing is deterministic:
 | through 2024-2025 | FBref player-season defense | FBref player-season standard (`xag` becomes `xa`) | FBref player-season keeper |
 | 2025-2026 onward | WhoScored player-season defense | Understat player-season | WhoScored player-match keeper appearances |
 
-`defcon` is the project-defined sum of `blocks + interceptions + clearances`.
-It remains null unless all three ingredients are available. Goalkeeper fields
+`defcon` follows the position-aware FPL defensive-contribution definition. It
+is `blocks + interceptions + clearances + tackles_won` for defenders, with
+`recoveries` added for midfielders and forwards. It remains null unless all
+required ingredients are available. Goalkeeper fields
 include shots on target against, saves, goals against, save percentage,
 penalties faced, and the historical FBref penalty outcome splits. Modern
 WhoScored goalkeeper totals are rebuilt from rows with `fpl_pos=GKP` and
