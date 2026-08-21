@@ -1115,12 +1115,33 @@ def _event_aggregates(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     # event owns the carry: the prior event's end location is the carry start and
     # the current event's start location is its end. Time and distance bounds
     # suppress restarts, data gaps, and negligible control touches.
-    sequence = work.assign(
-        _source_order=np.arange(len(work)),
-        _carry_minute=work.get(
-            "expanded_minute", work.get("minute", pd.Series(np.nan, index=work.index))
-        ),
-        _carry_second=work.get("second", pd.Series(0, index=work.index)),
+    # Keep the carry sequence narrow. Copying and shifting the full normalized
+    # event table here more than triples peak memory for season-sized inputs.
+    sequence = pd.DataFrame(
+        {
+            "provider_match_id": work["provider_match_id"],
+            "provider_player_id": work["provider_player_id"],
+            "provider_team_id": work["provider_team_id"],
+            "type": work["type"],
+            "is_successful": work["is_successful"],
+            "x": work.get("x"),
+            "y": work.get("y"),
+            "end_x": work.get("end_x"),
+            "end_y": work.get("end_y"),
+            "is_touch": work.get(
+                "is_touch", pd.Series(False, index=work.index, dtype="bool")
+            ),
+            "is_set_piece": work.get(
+                "is_set_piece", pd.Series(False, index=work.index, dtype="bool")
+            ),
+            "_source_order": np.arange(len(work)),
+            "_carry_minute": work.get(
+                "expanded_minute",
+                work.get("minute", pd.Series(np.nan, index=work.index)),
+            ),
+            "_carry_second": work.get("second", pd.Series(0, index=work.index)),
+        },
+        index=work.index,
     ).sort_values(
         ["provider_match_id", "_carry_minute", "_carry_second", "_source_order"],
         kind="stable",
