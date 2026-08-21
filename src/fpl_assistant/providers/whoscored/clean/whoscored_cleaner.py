@@ -78,6 +78,8 @@ ROLE_RECENCY_HALF_LIFE_DAYS = 90.0
 BUILTIN_PLAYER_ALIASES = {
     "andy robertson": "andrew robertson",
     "charly alcaraz": "carlos alcaraz",
+    "emerson": "emerson palmieri",
+    "joe johnson": "joseph johnson",
     "savinho": "savio",
 }
 

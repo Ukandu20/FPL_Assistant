@@ -209,6 +209,69 @@ def test_player_resolution_includes_new_official_fpl_players():
     assert audit.loc[0, "match_method"] == "exact_normalized_name"
 
 
+def test_player_resolution_uses_builtin_given_name_alias():
+    players = pd.DataFrame(
+        [{
+            "provider_player_id": 473957,
+            "provider_player_name": "Joe Johnson",
+            "provider_team_id": 95,
+        }]
+    )
+    master = {
+        "b1e71b49": {
+            "name": "Joseph Johnson",
+            "career": {"2023-2024": {"team_id": "lut"}},
+        }
+    }
+
+    audit, _ = _player_resolution(
+        players,
+        player_lookup={"joseph johnson": "b1e71b49"},
+        master_players=master,
+        player_aliases={},
+        team_map={"95": "lut"},
+        season="2023-2024",
+        existing=pd.DataFrame(columns=IDENTITY_COLUMNS),
+    )
+
+    assert audit.loc[0, "canonical_id"] == "b1e71b49"
+    assert audit.loc[0, "match_method"] == "configured_alias"
+
+
+def test_player_resolution_distinguishes_emerson_palmieri_and_royal():
+    players = pd.DataFrame(
+        [
+            {
+                "provider_player_id": 101955,
+                "provider_player_name": "Emerson",
+                "provider_team_id": 29,
+            },
+            {
+                "provider_player_id": 328512,
+                "provider_player_name": "Emerson Royal",
+                "provider_team_id": 30,
+            },
+        ]
+    )
+
+    audit, _ = _player_resolution(
+        players,
+        player_lookup={
+            "emerson": "royal-id",
+            "emerson palmieri": "palmieri-id",
+            "emerson royal": "royal-id",
+        },
+        master_players={},
+        player_aliases={},
+        team_map={"29": "whu", "30": "tot"},
+        season="2023-2024",
+        existing=pd.DataFrame(columns=IDENTITY_COLUMNS),
+    )
+
+    resolved = dict(zip(audit["provider_id"], audit["canonical_id"]))
+    assert resolved == {"101955": "palmieri-id", "328512": "royal-id"}
+
+
 def test_player_resolution_prefers_current_fpl_id_over_stale_registry_id():
     players = pd.DataFrame(
         [{
