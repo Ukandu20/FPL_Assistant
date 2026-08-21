@@ -2,7 +2,7 @@
 """
 scripts.fpl_pipeline.clean.assign_game_ids
 
-Assign FBref game_id (from summary.csv) to processed FPL GW rows.
+Assign canonical match IDs to processed FPL GW rows.
 Build matches.csv from the FPL-joined rows so ROUND comes from FPL.
 
 Join tiers:
@@ -330,7 +330,8 @@ def attach_fixture_calendar_game_ids(
         return out
 
     calendar = read_csv(fixture_calendar_path)
-    required = {"fpl_id", "fbref_id"}
+    id_column = "match_id" if "match_id" in calendar.columns else "fbref_id"
+    required = {"fpl_id", id_column}
     if not required.issubset(calendar.columns):
         logging.warning(
             "Fixture calendar %s lacks required columns %s",
@@ -339,16 +340,16 @@ def attach_fixture_calendar_game_ids(
         )
         return out
 
-    bridge = calendar.loc[:, ["fpl_id", "fbref_id"]].dropna().copy()
+    bridge = calendar.loc[:, ["fpl_id", id_column]].dropna().copy()
     bridge["_fixture_key"] = pd.to_numeric(bridge["fpl_id"], errors="coerce").astype("Int64")
-    conflicts = bridge.groupby("_fixture_key")["fbref_id"].nunique()
+    conflicts = bridge.groupby("_fixture_key")[id_column].nunique()
     if (conflicts > 1).any():
         bad = conflicts[conflicts > 1].index.astype(str).tolist()
         raise ValueError(f"FPL fixture IDs map to multiple canonical game IDs: {bad}")
     fixture_map = (
         bridge.dropna(subset=["_fixture_key"])
         .drop_duplicates("_fixture_key")
-        .set_index("_fixture_key")["fbref_id"]
+        .set_index("_fixture_key")[id_column]
     )
     fixture_keys = pd.to_numeric(out["fixture"], errors="coerce").astype("Int64")
     canonical_ids = fixture_keys.map(fixture_map)
@@ -356,7 +357,7 @@ def attach_fixture_calendar_game_ids(
     conflicts = canonical_ids.notna() & existing.notna() & canonical_ids.astype("string").ne(existing)
     if conflicts.any():
         logging.warning(
-            "Fixture calendar replaced %d stale game_id value(s) with canonical FBref IDs",
+            "Fixture calendar replaced %d stale game_id value(s) with canonical match IDs",
             int(conflicts.sum()),
         )
     # The registry fixture bridge is authoritative.  Using fillna here retained
@@ -415,25 +416,38 @@ def process_season(proc_season_dir: Path,
         logging.warning("[%s] missing %s; skipping", season, merged_csv)
         return
 
-    fb_summary = locate_fbref_summary(fbref_root, league, longf, summary_name)
-    if not fb_summary:
-        logging.warning("[%s] FBref summary.csv not found under %s/%s/%s", season, fbref_root, league, longf)
-        return
-    logging.info("[%s] FBref summary: %s", season, fb_summary)
+    fixture_calendar = fixture_calendar_root / longf / "fixture_calendar.csv"
+    if not fixture_calendar.is_file():
+        raise FileNotFoundError(
+            f"[{season}] canonical fixture calendar not found: {fixture_calendar}"
+        )
 
-    # FBref per-game (for game_id only)
-    fb_games = read_fbref_summary(fb_summary)
+    fb_summary = locate_fbref_summary(fbref_root, league, longf, summary_name)
+    fb_games = None
+    if fb_summary:
+        logging.info("[%s] optional FBref summary enrichment: %s", season, fb_summary)
+        fb_games = read_fbref_summary(fb_summary)
+    else:
+        logging.info(
+            "[%s] FBref summary unavailable; using canonical fixture calendar only",
+            season,
+        )
 
     # FPL merged with derived keys
     merged = read_csv(merged_csv)
     merged_keys = derive_fpl_keys(merged, tz_name=tz_name)
     merged_keys = attach_fixture_calendar_game_ids(
         merged_keys,
-        fixture_calendar_root / longf / "fixture_calendar.csv",
+        fixture_calendar,
     )
 
-    # Attach game_id to merged
-    merged_with_gid = attach_game_ids(merged_keys, fb_games)
+    # FBref is only a fallback for historical calendars that lack an official
+    # FPL fixture bridge. Current seasons resolve from the canonical calendar.
+    merged_with_gid = (
+        attach_game_ids(merged_keys, fb_games)
+        if fb_games is not None and not fb_games.empty
+        else merged_keys
+    )
     merged_with_gid["match_id"] = merged_with_gid["game_id"]
     missing = int(merged_with_gid["game_id"].isna().sum())
     if missing:
@@ -481,13 +495,6 @@ def process_season(proc_season_dir: Path,
     write_csv(matches_out, matches)
     logging.info("[%s] wrote matches table (FPL round): %s", season, matches_out)
 
-    bridge_rows = matches.assign(
-        provider="fbref",
-        provider_match_id=matches["match_id"],
-        provider_game=matches["home"].astype("string") + " - " + matches["away"].astype("string"),
-        match_method="source_of_truth",
-        match_confidence=1.0,
-    )
     fpl_rows = merged_with_gid.loc[
         merged_with_gid["fixture"].notna() & merged_with_gid["match_id"].notna(),
         ["fixture", "match_id", "home", "away"],
@@ -501,16 +508,26 @@ def process_season(proc_season_dir: Path,
     )
     upsert_match_bridges(
         fixture_calendar_root.parent / "bridges" / "match_ids.csv",
-        pd.concat([bridge_rows, fpl_rows], ignore_index=True),
+        fpl_rows,
     )
 
 # ────────── CLI ──────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Assign FBref game_id to FPL GW rows using summary.csv; matches.csv uses FPL round.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Assign canonical match IDs to FPL GW rows; optionally use FBref "
+            "as a historical fallback."
+        )
+    )
     ap.add_argument("--proc-root", required=True, type=Path,
                     help="Processed FPL provider root or league root")
-    ap.add_argument("--fbref-root", required=True, type=Path, help="data/processed/fbref")
+    ap.add_argument(
+        "--fbref-root",
+        type=Path,
+        default=Path("data/processed/fbref"),
+        help="Optional processed FBref root used only as a historical fallback",
+    )
     ap.add_argument(
         "--fixture-calendar-root",
         type=Path,

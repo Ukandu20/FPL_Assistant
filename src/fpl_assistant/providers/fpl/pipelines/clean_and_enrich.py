@@ -965,21 +965,52 @@ def load_fpl_code_registry(
     """
     code_to_pid: Dict[str, str] = {}
     generated_codes: set[str] = set()
+    code_precedence: Dict[str, tuple[int, int, int]] = {}
 
-    def add(code: Any, player_id: Any, *, generated: bool, source: str) -> None:
+    def add(
+        code: Any,
+        player_id: Any,
+        *,
+        generated: bool,
+        source: str,
+        precedence: tuple[int, int, int],
+    ) -> None:
         provider_code = normalized_provider_code(code)
         canonical_id = "" if pd.isna(player_id) else str(player_id).strip()
         if not provider_code or not canonical_id:
             return
         prior = code_to_pid.get(provider_code)
         if prior and prior != canonical_id:
-            raise ValueError(
-                f"FPL provider code {provider_code} maps to both {prior} and "
-                f"{canonical_id} ({source})."
+            prior_precedence = code_precedence[provider_code]
+            if precedence == prior_precedence:
+                raise ValueError(
+                    f"FPL provider code {provider_code} maps to both {prior} and "
+                    f"{canonical_id} ({source})."
+                )
+            if precedence < prior_precedence:
+                logging.warning(
+                    "Ignoring lower-precedence FPL provider-code mapping %s -> %s "
+                    "from %s; keeping %s",
+                    provider_code,
+                    canonical_id,
+                    source,
+                    prior,
+                )
+                return
+            logging.warning(
+                "Replacing stale FPL provider-code mapping %s -> %s with %s "
+                "from %s",
+                provider_code,
+                prior,
+                canonical_id,
+                source,
             )
         code_to_pid[provider_code] = canonical_id
+        code_precedence[provider_code] = precedence
         if generated:
             generated_codes.add(provider_code)
+        else:
+            generated_codes.discard(provider_code)
 
     bridge_path = registry_root / "bridges" / "player_ids.csv"
     if bridge_path.is_file():
@@ -995,6 +1026,7 @@ def load_fpl_code_registry(
                 row.get("canonical_id"),
                 generated="generated" in str(row.get("match_method", "")).lower(),
                 source=str(bridge_path),
+                precedence=(3, 1, 0),
             )
 
     target_start = int(season_longform(target_season)[:4])
@@ -1012,13 +1044,19 @@ def load_fpl_code_registry(
             if not {"fpl_code", "player_id"} <= set(roster.columns):
                 continue
             for row in roster.to_dict("records"):
+                generated = str(row.get("player_id_source", "")).startswith(
+                    "generated_from_fpl_code"
+                )
                 add(
                     row.get("fpl_code"),
                     row.get("player_id"),
-                    generated=str(row.get("player_id_source", "")).startswith(
-                        "generated_from_fpl_code"
-                    ),
+                    generated=generated,
                     source=str(roster_path),
+                    precedence=(
+                        1 if generated else 2,
+                        int(len(str(row.get("player_id", "")).strip()) == 8),
+                        int(season_text[:4]),
+                    ),
                 )
     return code_to_pid, generated_codes
 
@@ -1186,6 +1224,165 @@ def register_generated_players(
         for row in audit_rows:
             key2pid[canonical(row["name"])] = row["player_id"]
     return pd.DataFrame(audit_rows, columns=audit_columns)
+
+
+def publish_fpl_roster_registry(
+    players: pd.DataFrame,
+    *,
+    season: str,
+    league: str,
+    registry_root: Path,
+    compatibility_master_path: Path | None = None,
+) -> dict[str, Any]:
+    """Publish an official FPL roster into the canonical season registries.
+
+    FPL is the authoritative current-season roster source.  This publisher is
+    intentionally independent of FBref and preserves all historical career
+    entries while upserting the requested season.
+    """
+    required = {"player_id", "name", "team", "team_id", "fpl_pos"}
+    missing = sorted(required - set(players.columns))
+    if missing:
+        raise ValueError(f"FPL roster registry publication lacks columns: {missing}")
+
+    roster = players.loc[:, sorted(required)].copy()
+    for column in required:
+        roster[column] = roster[column].astype("string").str.strip()
+    invalid = roster[list(required)].isna().any(axis=1) | roster[list(required)].eq("").any(axis=1)
+    if invalid.any():
+        raise ValueError(
+            f"FPL roster registry publication has {int(invalid.sum())} row(s) "
+            "with incomplete canonical identity."
+        )
+
+    player_team_counts = roster.groupby("player_id")["team_id"].nunique()
+    if (player_team_counts > 1).any():
+        conflicts = sorted(player_team_counts[player_team_counts > 1].index.tolist())
+        raise ValueError(f"FPL roster players map to multiple teams: {conflicts}")
+    team_code_counts = roster.groupby("team_id")["team"].nunique()
+    if (team_code_counts > 1).any():
+        conflicts = sorted(team_code_counts[team_code_counts > 1].index.tolist())
+        raise ValueError(f"Canonical team IDs map to multiple FPL codes: {conflicts}")
+    code_id_counts = roster.groupby("team")["team_id"].nunique()
+    if (code_id_counts > 1).any():
+        conflicts = sorted(code_id_counts[code_id_counts > 1].index.tolist())
+        raise ValueError(f"FPL team codes map to multiple canonical IDs: {conflicts}")
+    roster = roster.drop_duplicates("player_id", keep="last")
+
+    master_players_path = registry_root / "master_players.json"
+    master_fpl_path = registry_root / "master_fpl.json"
+    master_teams_path = registry_root / "master_teams.json"
+    player_lookup_path = registry_root / "_id_lookup_players.json"
+    team_lookup_path = registry_root / "_id_lookup_teams.json"
+
+    master_players = read_json_flex(master_players_path) if master_players_path.is_file() else {}
+    master_fpl = read_json_flex(master_fpl_path) if master_fpl_path.is_file() else {}
+    master_teams = read_json_flex(master_teams_path) if master_teams_path.is_file() else {}
+    player_lookup = read_json_flex(player_lookup_path) if player_lookup_path.is_file() else {}
+    team_lookup = read_json_flex(team_lookup_path) if team_lookup_path.is_file() else {}
+    compatibility_master = (
+        read_json_flex(compatibility_master_path)
+        if compatibility_master_path and compatibility_master_path.is_file()
+        else None
+    )
+
+    long_season = season_longform(season)
+    short_season = season_shortform(long_season)
+    added_players: list[str] = []
+    added_teams: list[str] = []
+    published_names: dict[str, str] = {}
+
+    for row in roster.to_dict("records"):
+        player_id = str(row["player_id"])
+        roster_name = str(row["name"])
+        team = str(row["team"]).upper()
+        team_id = str(row["team_id"])
+        fpl_pos = normalise_fpl_position(row["fpl_pos"]) or str(row["fpl_pos"]).upper()
+
+        if player_id not in master_players:
+            added_players.append(player_id)
+        player_record = dict(master_players.get(player_id) or {})
+        player_record["name"] = player_record.get("name") or roster_name
+        player_record.setdefault("nation", None)
+        player_record.setdefault("born", None)
+        career = player_record.setdefault("career", {})
+        season_record = dict(career.get(long_season) or {})
+        season_record.update(
+            {
+                "team": team,
+                "team_id": team_id,
+                "fpl_position": fpl_pos,
+                "league": league,
+            }
+        )
+        season_record.setdefault("position", FPL_TO_FBREF_POS.get(fpl_pos, fpl_pos))
+        season_record.setdefault("position_detail", "UNK")
+        career[long_season] = season_record
+        master_players[player_id] = player_record
+        published_names[player_id] = str(player_record["name"])
+
+        name_key = canonical(roster_name)
+        existing_lookup_id = player_lookup.get(name_key)
+        if not existing_lookup_id:
+            player_lookup[name_key] = player_id
+        elif str(existing_lookup_id) != player_id:
+            logging.warning(
+                "[%s] roster name %r already maps to %s; keeping canonical lookup",
+                long_season,
+                roster_name,
+                existing_lookup_id,
+            )
+
+        fpl_record = dict(master_fpl.get(player_id) or {})
+        fpl_record["name"] = fpl_record.get("name") or roster_name
+        fpl_record["player_id"] = player_id
+        fpl_record.setdefault("nation", player_record.get("nation"))
+        fpl_record.setdefault("born", player_record.get("born"))
+        fpl_record.setdefault("career", {})[short_season] = dict(season_record)
+        master_fpl[player_id] = fpl_record
+        if isinstance(compatibility_master, dict):
+            compatibility_master[player_id] = dict(fpl_record)
+
+    for (team_id, team), group in roster.groupby(["team_id", "team"], sort=True):
+        team_id = str(team_id)
+        team = str(team).upper()
+        if team_id not in master_teams:
+            added_teams.append(team_id)
+        team_record = dict(master_teams.get(team_id) or {})
+        team_record["name"] = team_record.get("name") or team
+        team_record.setdefault("career", {})[long_season] = {
+            "league": league,
+            "players": [
+                {"id": player_id, "name": published_names[player_id]}
+                for player_id in sorted(group["player_id"].astype(str).unique())
+            ],
+        }
+        master_teams[team_id] = team_record
+
+        lookup_key = canonical(team)
+        existing_team_id = team_lookup.get(lookup_key)
+        if existing_team_id and str(existing_team_id) != team_id:
+            raise ValueError(
+                f"FPL team code {team!r} maps to {existing_team_id}, not {team_id}."
+            )
+        team_lookup[lookup_key] = team_id
+
+    atomic_write_json_utf8(master_players_path, master_players)
+    atomic_write_json_utf8(master_fpl_path, master_fpl)
+    atomic_write_json_utf8(master_teams_path, master_teams)
+    atomic_write_json_utf8(player_lookup_path, player_lookup)
+    atomic_write_json_utf8(team_lookup_path, team_lookup)
+    if compatibility_master_path and isinstance(compatibility_master, dict):
+        atomic_write_json_utf8(compatibility_master_path, compatibility_master)
+
+    return {
+        "season": long_season,
+        "league": league,
+        "players_published": int(roster["player_id"].nunique()),
+        "teams_published": int(roster["team_id"].nunique()),
+        "new_player_records": sorted(added_players),
+        "new_team_records": sorted(added_teams),
+    }
 
 # ───────────────────────── Matching ─────────────────────────
 
@@ -1528,6 +1725,7 @@ def enrich_season(season_dir: Path,
     )
 
     registry_audit = pd.DataFrame()
+    roster_registry_audit: dict[str, Any] = {}
     if registry_root is not None and generated_mask.any():
         registry_audit = register_generated_players(
             df,
@@ -1538,6 +1736,20 @@ def enrich_season(season_dir: Path,
             compatibility_master_path=compatibility_master_path,
             pid2rec=pid2rec,
             key2pid=key2pid,
+        )
+    if registry_root is not None:
+        roster_registry_audit = publish_fpl_roster_registry(
+            df,
+            season=season_full,
+            league=league,
+            registry_root=registry_root,
+            compatibility_master_path=compatibility_master_path,
+        )
+        logging.info(
+            "[%s] published canonical roster membership: %d players across %d teams",
+            season,
+            roster_registry_audit["players_published"],
+            roster_registry_audit["teams_published"],
         )
 
     # Review partitions
@@ -1560,6 +1772,11 @@ def enrich_season(season_dir: Path,
         review_dir / f"player_season_stat_enrichment_{season_full}.json",
         player_stats_audit,
     )
+    if roster_registry_audit:
+        write_json_utf8(
+            review_dir / f"roster_registry_publication_{season_full}.json",
+            roster_registry_audit,
+        )
 
     if reset_columns:
         review_dir = out_root / season / "_manual_review"
@@ -1584,14 +1801,18 @@ def enrich_season(season_dir: Path,
         write_csv_utf8(miss_csv, tmp)
         logging.warning("[%s] unmatched rows=%d → %s", season, len(unmatched_ids), miss_csv)
 
-    # Write missing season career entries (CSV)
+    # Write missing season career entries (CSV), removing stale diagnostics
+    # once a later roster publication supplies the season membership.
+    review_dir = out_root / season / "_manual_review"
+    miss_season_csv = review_dir / f"missing_season_{season}.csv"
     if len(no_season_rows):
-        review_dir = out_root / season / "_manual_review"
         review_dir.mkdir(parents=True, exist_ok=True)
-        miss_season_csv = review_dir / f"missing_season_{season}.csv"
         cols = ["player_id", "name", "nation", "born"]
         write_csv_utf8(miss_season_csv, no_season_rows[cols])
         logging.warning("[%s] no-career-entry rows=%d → %s", season, len(no_season_rows), miss_season_csv)
+
+    else:
+        miss_season_csv.unlink(missing_ok=True)
 
     if generated_mask.any():
         review_dir = out_root / season / "_manual_review"

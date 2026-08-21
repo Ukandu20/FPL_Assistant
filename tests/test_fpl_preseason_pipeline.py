@@ -9,6 +9,7 @@ from fpl_assistant.providers.fpl.pipelines.clean_and_enrich import (
     attach_fpl_context,
     enrich_season,
     load_fpl_code_registry,
+    publish_fpl_roster_registry,
     register_generated_players,
     reset_preseason_carryover,
 )
@@ -277,6 +278,96 @@ def test_generated_players_are_promoted_to_all_player_registries():
     assert fpl_bridge.iloc[0]["canonical_id"] == "abc12345"
 
 
+def test_fpl_roster_publication_upserts_team_and_player_membership():
+    tmp_path = _case_dir("fpl_roster_registry")
+    registry = tmp_path / "registry"
+    registry.mkdir(parents=True, exist_ok=True)
+    (registry / "master_players.json").write_text(
+        json.dumps(
+            {
+                "player-a": {
+                    "name": "Canonical A",
+                    "career": {"2025-2026": {"team": "OLD", "team_id": "old-team"}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (registry / "master_teams.json").write_text(
+        json.dumps(
+            {
+                "team-a": {
+                    "name": "ARS",
+                    "career": {"2025-2026": {"league": "ENG-Premier League", "players": []}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (registry / "master_fpl.json").write_text("{}", encoding="utf-8")
+    (registry / "_id_lookup_players.json").write_text("{}", encoding="utf-8")
+    (registry / "_id_lookup_teams.json").write_text(
+        json.dumps({"ars": "team-a"}), encoding="utf-8"
+    )
+    roster = pd.DataFrame(
+        [
+            {
+                "player_id": "player-a",
+                "name": "FPL Name A",
+                "team": "ARS",
+                "team_id": "team-a",
+                "fpl_pos": "MID",
+            },
+            {
+                "player_id": "player-b",
+                "name": "Player B",
+                "team": "COV",
+                "team_id": "team-cov",
+                "fpl_pos": "FWD",
+            },
+        ]
+    )
+
+    audit = publish_fpl_roster_registry(
+        roster,
+        season="2026-2027",
+        league="ENG-Premier League",
+        registry_root=registry,
+    )
+    publish_fpl_roster_registry(
+        roster,
+        season="2026-2027",
+        league="ENG-Premier League",
+        registry_root=registry,
+    )
+
+    master_players = json.loads(
+        (registry / "master_players.json").read_text(encoding="utf-8")
+    )
+    master_teams = json.loads(
+        (registry / "master_teams.json").read_text(encoding="utf-8")
+    )
+    master_fpl = json.loads((registry / "master_fpl.json").read_text(encoding="utf-8"))
+    team_lookup = json.loads(
+        (registry / "_id_lookup_teams.json").read_text(encoding="utf-8")
+    )
+
+    assert audit["players_published"] == 2
+    assert audit["teams_published"] == 2
+    assert master_players["player-a"]["name"] == "Canonical A"
+    assert "2025-2026" in master_players["player-a"]["career"]
+    assert master_players["player-a"]["career"]["2026-2027"]["team_id"] == "team-a"
+    assert master_players["player-b"]["career"]["2026-2027"]["fpl_position"] == "FWD"
+    assert master_fpl["player-b"]["career"]["2026-27"]["team"] == "COV"
+    assert master_teams["team-a"]["career"]["2026-2027"]["players"] == [
+        {"id": "player-a", "name": "Canonical A"}
+    ]
+    assert master_teams["team-cov"]["career"]["2026-2027"]["players"] == [
+        {"id": "player-b", "name": "Player B"}
+    ]
+    assert team_lookup["cov"] == "team-cov"
+
+
 def test_fpl_code_registry_reuses_prior_season_id_but_excludes_target_output():
     tmp_path = _case_dir("fpl_code_history")
     registry = tmp_path / "registry"
@@ -304,6 +395,59 @@ def test_fpl_code_registry_reuses_prior_season_id_but_excludes_target_output():
 
     assert mapping["519440"] == "legacy12char"
     assert "519440" in generated
+
+
+def test_fpl_code_registry_prefers_later_corrected_historical_mapping():
+    tmp_path = _case_dir("fpl_code_history_correction")
+    registry = tmp_path / "registry"
+    (registry / "bridges").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=["provider", "provider_id", "canonical_id", "match_method"]).to_csv(
+        registry / "bridges" / "player_ids.csv", index=False
+    )
+    processed = tmp_path / "processed"
+    for season, player_id in (("2023-2024", "wrong001"), ("2025-2026", "right001")):
+        path = processed / season / "season"
+        path.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [{
+                "fpl_code": "628204",
+                "player_id": player_id,
+                "player_id_source": "master_or_override",
+            }]
+        ).to_csv(path / "cleaned_players.csv", index=False)
+
+    mapping, generated = load_fpl_code_registry(
+        registry, processed, target_season="2026-2027"
+    )
+
+    assert mapping["628204"] == "right001"
+    assert "628204" not in generated
+
+
+def test_fpl_code_registry_preserves_current_eight_character_id_policy():
+    tmp_path = _case_dir("fpl_code_id_length")
+    registry = tmp_path / "registry"
+    (registry / "bridges").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=["provider", "provider_id", "canonical_id", "match_method"]).to_csv(
+        registry / "bridges" / "player_ids.csv", index=False
+    )
+    processed = tmp_path / "processed"
+    for season, player_id in (("2023-2024", "9e868b71"), ("2025-2026", "9e868b7118fa")):
+        path = processed / season / "season"
+        path.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [{
+                "fpl_code": "214285",
+                "player_id": player_id,
+                "player_id_source": "master_or_override",
+            }]
+        ).to_csv(path / "cleaned_players.csv", index=False)
+
+    mapping, _ = load_fpl_code_registry(
+        registry, processed, target_season="2026-2027"
+    )
+
+    assert mapping["214285"] == "9e868b71"
 
 
 def test_generated_registration_refuses_name_collision():

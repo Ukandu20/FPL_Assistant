@@ -99,6 +99,23 @@ The published roster is:
 data/processed/fpl/ENG-Premier League/2026-2027/season/cleaned_players.csv
 ```
 
+The same publication atomically upserts official season membership into:
+
+```text
+data/processed/registry/master_players.json
+data/processed/registry/master_fpl.json
+data/processed/registry/master_teams.json
+data/processed/registry/_id_lookup_players.json
+data/processed/registry/_id_lookup_teams.json
+```
+
+`master_teams.json` receives one `career["2026-2027"]` entry per current FPL
+team, containing the canonical IDs and names of every rostered player. This is
+an FPL-owned publication step and does not require an FBref season folder.
+Historical career entries and richer provider metadata are preserved.
+Publication details are recorded in
+`_manual_review/roster_registry_publication_2026-2027.json`.
+
 ### New-player identity registration
 
 With `--generate-missing-ids`, the cleaner first checks the canonical player
@@ -115,8 +132,9 @@ An ID already used for the same FPL code in an earlier season is retained for
 historical join stability, even if that legacy ID predates the 8-character
 policy.
 
-Registration is enabled by default and atomically promotes each generated
-identity into all maintained machine registries:
+Registration is enabled by default. It promotes each generated identity and
+publishes the complete official season roster into the maintained machine
+registries:
 
 ```text
 data/processed/registry/master_players.json
@@ -313,6 +331,28 @@ python -m fpl_assistant.providers.fpl.clean.gw_stats_cleaner `
 The cleaner reads `season/teams.csv` and writes cleaned GW files beneath the
 same league and season in the processed tree. Review unmatched-player outputs
 before using `--on-unmatched drop` in a production build.
+
+## 4a. Publish effective eligibility and complete DNP calendars
+
+After the canonical fixture calendar and FPL roster/gameweek surfaces exist,
+publish the fixture-eligible modelling population:
+
+```powershell
+python -m fpl_assistant.providers.fpl.pipelines.eligibility_backfill `
+  --processed-fpl-root "data/processed/fpl/ENG-Premier League" `
+  --raw-fpl-root "data/raw/fpl/ENG-Premier League" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --registry-root "data/processed/registry" `
+  --force `
+  --log-level INFO
+```
+
+Historical zero-minute FPL observations become explicit DNP rows. A preseason
+season such as 2026-2027 instead receives pending roster-by-fixture rows with
+null minutes. The command also publishes effective-dated eligibility,
+availability history, fixture schedule snapshots, and reconstruction audits.
+See [FPL_ELIGIBILITY_BACKFILL.md](FPL_ELIGIBILITY_BACKFILL.md) for the data and
+timestamp-safety contract.
 
 ## 5. Assign canonical game IDs
 
