@@ -1,0 +1,36 @@
+{
+  "architecture_version": "minutes/v2.0",
+  "feature_version": "minutes-v2.0.0",
+  "registry_root": "data/processed/registry/fixtures",
+  "artifact_root": "data/models/minutes/v2.0",
+  "shadow_root": "data/predictions/minutes/shadow",
+  "canonical_label_seasons": ["2022-2023", "2023-2024", "2024-2025", "2025-2026"],
+  "diagnostic_only_seasons": ["2020-2021", "2021-2022"],
+  "forward_season": "2026-2027",
+  "trusted_starter_sources": ["fpl", "reconstructed_fpl_dnp", "observed_lineup"],
+  "untrusted_starter_sources": ["fallback", "imputed", "pending", ""],
+  "calibration_gws": 6,
+  "evaluation_gws": 6,
+  "step_gws": 6,
+  "final_holdout_gws": 6,
+  "calibration_min_rows": 200,
+  "calibration_min_positive": 30,
+  "calibration_min_negative": 30,
+  "calibration_max_fold_brier_deterioration": 0.002,
+  "random_seed": 20260821,
+  "bootstrap_iterations": 2000,
+  "bootstrap_confidence": 0.95,
+  "acceptance_margins": {
+    "p60_brier": 0.002,
+    "state_log_loss": 0.005,
+    "xpoints_mae": 0.01
+  },
+  "extensions": {
+    "season_priors_v2_1": false,
+    "availability_features_v2_2": false,
+    "congestion_v2_3": false,
+    "manager_effects": false,
+    "player_rotation_v2_3": false,
+    "distributional_uncertainty_v2_4": false
+  }
+}

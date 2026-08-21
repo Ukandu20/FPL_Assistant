@@ -98,7 +98,8 @@ KEEP_COLS = [
     "minutes",
     "is_starter", "days_since_last", "is_active",
     "venue", "is_home", "was_home",
-    "team_id"
+    "team_id", "eligible_for_fixture", "confirmed_unavailable",
+    "observation_status", "information_timestamp",
 ]
 
 def _pick_gw_col(cols: List[str]) -> Optional[str]:
@@ -127,6 +128,17 @@ def load_minutes(seasons: List[str], fix_root: Path) -> pd.DataFrame:
         cols = [c for c in KEEP_COLS if c in df.columns]
         df = df[cols].copy()
         df["season"] = season
+
+        # Pending preseason rows describe the forecast universe, not observed
+        # training labels. The hardened contract trains only fixture-eligible
+        # player rows at the recorded information cutoff.
+        if "observation_status" in df.columns:
+            df = df[df["observation_status"].astype(str).ne("fixture_pending")].copy()
+        if "eligible_for_fixture" in df.columns:
+            eligible = df["eligible_for_fixture"].astype(str).str.lower().isin(
+                ["1", "true", "yes"]
+            )
+            df = df[eligible].copy()
 
         # normalize is_home if missing
         if "is_home" not in df.columns:
@@ -1227,6 +1239,18 @@ def main():
         if cameo_calibs_by_pos.get(pos_tag) is not None:
             joblib.dump(cameo_calibs_by_pos[pos_tag], out_dir / f"cameo_given_bench_{pos_tag}_iso.joblib")
             joblib.dump(cameo_calibs_by_pos[pos_tag], version_dir / f"cameo_given_bench_{pos_tag}_iso.joblib")
+
+    # Persistence-only compatibility fix for the trained duration heads used
+    # by forward V1 inference. This leaves V1 model/routing behavior untouched.
+    if reg_start is not None:
+        reg_start.booster_.save_model(out_dir / "reg_start.txt")
+        reg_start.booster_.save_model(version_dir / "reg_start.txt")
+    if cameo_min_global is not None:
+        cameo_min_global.booster_.save_model(out_dir / "cameo_minutes_global.txt")
+        cameo_min_global.booster_.save_model(version_dir / "cameo_minutes_global.txt")
+    for pos_tag, model in cameo_min_by_pos.items():
+        model.booster_.save_model(out_dir / f"cameo_minutes_{pos_tag}.txt")
+        model.booster_.save_model(version_dir / f"cameo_minutes_{pos_tag}.txt")
 
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (version_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))

@@ -20,6 +20,7 @@ fpl-player-profiles = "fpl_assistant.providers.fpl.pipelines.player_profiles:mai
 fpl-archetypes = "fpl_assistant.archetypes.cli:main"
 fpl-archetype-publish = "fpl_assistant.archetypes.publish_cli:main"
 fpl-archetype-validate = "fpl_assistant.archetypes.validation_cli:main"
+fpl-minutes-v2 = "fpl_assistant.minutes_v2.cli:main"
 
 [project.optional-dependencies]
 app = [
