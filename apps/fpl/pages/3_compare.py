@@ -10,7 +10,12 @@ from apps.fpl.catalog import FPL_ROOT, discover_leagues, discover_seasons, fpl_s
 from apps.fpl.app_data import archetypes, forecast, raw_fixtures, raw_teams, season_players
 from apps.fpl.state import comparison, query_value, set_comparison, shortlist, switch_page, toggle_shortlist, update_query
 from apps.fpl.ui import apply_chart_style, empty_state, file_freshness, inject_global_styles, page_header
-from fpl_assistant.apps.viewmodels.dashboard import comparison_table, enrich_current_players, fixture_rows
+from fpl_assistant.apps.viewmodels.dashboard import (
+    comparison_table,
+    enrich_current_players,
+    fixture_rows,
+    upcoming_fixture_rows,
+)
 
 
 st.set_page_config(page_title="Compare FPL Players", page_icon="⚖️", layout="wide")
@@ -163,7 +168,9 @@ def main() -> None:
     apply_chart_style(figure, height=max(300, len(table) * 85))
     st.plotly_chart(figure, width="stretch")
 
-    fixtures = fixture_rows(raw_fixtures(league, season), raw_teams(league, season))
+    fixtures = upcoming_fixture_rows(
+        fixture_rows(raw_fixtures(league, season), raw_teams(league, season))
+    )
     st.markdown("### Fixture comparison")
     fixture_columns = st.columns(min(4, len(selected)))
     for container, row in zip(fixture_columns, selected.to_dict("records")):

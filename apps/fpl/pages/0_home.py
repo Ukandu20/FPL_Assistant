@@ -44,9 +44,24 @@ gameweek_deadline = dashboard_viewmodels.gameweek_deadline
 player_watchlist = dashboard_viewmodels.player_watchlist
 stat_leaders = dashboard_viewmodels.stat_leaders
 team_fixture_outlook = dashboard_viewmodels.team_fixture_outlook
+upcoming_fixture_rows = dashboard_viewmodels.upcoming_fixture_rows
 
 
 st.set_page_config(page_title="FPL Gameweek Hub", page_icon="⚽", layout="wide")
+
+
+HUB_ROW_OPTIONS = [5, 10, 20, "All"]
+
+
+def _saved_option(saved: dict[str, object], name: str, options: list, default: object) -> object:
+    """Return a valid persisted control value without trusting stale state."""
+    value = saved.get(name, default)
+    return value if value in options else default
+
+
+def _table_rows(frame: pd.DataFrame, row_limit: int | None) -> pd.DataFrame:
+    """Apply the hub-wide table limit; ``None`` means show every row."""
+    return frame if row_limit is None else frame.head(row_limit)
 
 
 def _previous_season(seasons: list[str], season: str) -> str | None:
@@ -100,6 +115,21 @@ def main() -> None:
     season = st.sidebar.selectbox("Season", seasons, index=season_index, key="hub_season")
     update_query(league=league, season=season)
 
+    saved_filters = st.session_state.get("hub_filter_state", {})
+    reset_version = st.session_state.get("hub_filter_reset_version", 0)
+    saved_rows = _saved_option(saved_filters, "rows", HUB_ROW_OPTIONS, 10)
+    row_choice = st.sidebar.selectbox(
+        "Rows per table",
+        HUB_ROW_OPTIONS,
+        index=HUB_ROW_OPTIONS.index(saved_rows),
+        key=f"hub_rows_{reset_version}",
+    )
+    row_limit = None if row_choice == "All" else int(row_choice)
+    if st.sidebar.button("Reset hub filters", key=f"hub_reset_{reset_version}"):
+        st.session_state.pop("hub_filter_state", None)
+        st.session_state["hub_filter_reset_version"] = reset_version + 1
+        st.rerun()
+
     current = season_players(league, season)
     previous_name = _previous_season(seasons, season)
     previous = season_players(league, previous_name) if previous_name else pd.DataFrame()
@@ -112,7 +142,7 @@ def main() -> None:
     forecast_data, forecast_path = forecast(season)
 
     rows = fixture_rows(fixtures, teams)
-    unfinished = rows.loc[~rows.get("finished", False).fillna(False).astype(bool)] if not rows.empty else rows
+    unfinished = upcoming_fixture_rows(rows)
     current_gw = pd.to_numeric(unfinished.get("GW"), errors="coerce").min() if not unfinished.empty else pd.NA
     next_kickoff = unfinished["Kickoff"].min() if not unfinished.empty else pd.NaT
     deadline, deadline_source = gameweek_deadline(events, fixtures, current_gw)
@@ -176,10 +206,11 @@ def main() -> None:
         )
 
     enriched = enrich_current_players(current, previous, archetype_data)
+    result_limit = len(enriched) if row_limit is None else row_limit
     watchlist = (
-        forecast_watchlist(enriched, forecast_data, limit=12)
+        forecast_watchlist(enriched, forecast_data, limit=result_limit)
         if not forecast_data.empty
-        else player_watchlist(enriched, limit=12)
+        else player_watchlist(enriched, limit=result_limit)
     )
     watchlist_title = "Decision candidates" if forecast_path else "Preseason watchlist"
     st.markdown(f"### {watchlist_title}")
@@ -208,8 +239,8 @@ def main() -> None:
             captain_column, transfer_column = st.columns(2)
             with captain_column:
                 st.markdown("#### Captain candidates")
-                captain_source = watchlist.head(6).reset_index(drop=True)
-                captain_display = display.head(6).reset_index(drop=True)
+                captain_source = _table_rows(watchlist, row_limit).reset_index(drop=True)
+                captain_display = _table_rows(display, row_limit).reset_index(drop=True)
                 event = st.dataframe(
                     style_availability_table(
                         captain_display.drop(columns=["player_id"], errors="ignore")
@@ -221,7 +252,9 @@ def main() -> None:
                 _open_selected_player(event, captain_source, season)
             with transfer_column:
                 st.markdown("#### Transfer targets by forecast value")
-                transfer_source = watchlist.sort_values("Forecast value", ascending=False).head(6).reset_index(drop=True)
+                transfer_source = _table_rows(
+                    watchlist.sort_values("Forecast value", ascending=False), row_limit
+                ).reset_index(drop=True)
                 transfer_display = transfer_source.rename(
                     columns={
                         "name": "Player", "team": "Team", "fpl_pos": "Position",
@@ -253,27 +286,47 @@ def main() -> None:
 
     st.markdown("### Stat leaders")
     leader_controls = st.columns([1.35, 1.1, 1.15, 0.8, 1.15])
+    metric_options = ["Points", "Points / £m", "Goals", "Assists", "Defensive contributions", "DefCon hit rate"]
+    saved_metric = _saved_option(saved_filters, "metric", metric_options, "Points")
     leader_metric = leader_controls[0].selectbox(
-        "Metric",
-        ["Points", "Points / £m", "Goals", "Assists", "Defensive contributions", "DefCon hit rate"],
-        key=f"hub_leader_metric_{season}",
+        "Metric", metric_options, index=metric_options.index(saved_metric),
+        key=f"hub_leader_metric_{season}_{reset_version}",
     )
     basis_options = ["Rate"] if leader_metric == "DefCon hit rate" else ["Total", "Per appearance", "Per 90"]
+    saved_basis = _saved_option(saved_filters, "basis", basis_options, basis_options[0])
     leader_basis = leader_controls[1].selectbox(
-        "Basis", basis_options, key=f"hub_leader_basis_{season}"
+        "Basis", basis_options, index=basis_options.index(saved_basis),
+        key=f"hub_leader_basis_{season}_{reset_version}"
     )
+    period_options = ["Season", "Current GW", "Last 5 appearances"]
+    saved_period = _saved_option(saved_filters, "period", period_options, "Season")
     leader_period = leader_controls[2].selectbox(
-        "Period", ["Season", "Current GW", "Last 5 appearances"], key=f"hub_leader_period_{season}"
+        "Period", period_options, index=period_options.index(saved_period),
+        key=f"hub_leader_period_{season}_{reset_version}"
     )
+    position_options = ["All", "GKP", "DEF", "MID", "FWD"]
+    saved_position = _saved_option(saved_filters, "position", position_options, "All")
     leader_position = leader_controls[3].selectbox(
-        "Position", ["All", "GKP", "DEF", "MID", "FWD"], key=f"hub_leader_position_{season}"
+        "Position", position_options, index=position_options.index(saved_position),
+        key=f"hub_leader_position_{season}_{reset_version}"
     )
+    sample_options = ["Played", "3 appearances", "5 appearances", "450 minutes"]
+    default_sample = "Played" if leader_period == "Current GW" else "5 appearances"
+    saved_sample = _saved_option(saved_filters, "sample", sample_options, default_sample)
     sample_label = leader_controls[4].selectbox(
         "Minimum sample",
-        ["Played", "3 appearances", "5 appearances", "450 minutes"],
-        index=0 if leader_period == "Current GW" else 2,
-        key=f"hub_leader_sample_{season}",
+        sample_options,
+        index=sample_options.index(saved_sample),
+        key=f"hub_leader_sample_{season}_{reset_version}",
     )
+    st.session_state["hub_filter_state"] = {
+        "rows": row_choice,
+        "metric": leader_metric,
+        "basis": leader_basis,
+        "period": leader_period,
+        "position": leader_position,
+        "sample": sample_label,
+    }
     min_apps = {"Played": 1, "3 appearances": 3, "5 appearances": 5, "450 minutes": 0}[sample_label]
     min_mins = 450 if sample_label == "450 minutes" else 0
     leaders = stat_leaders(
@@ -286,7 +339,7 @@ def main() -> None:
         min_appearances=min_apps,
         min_minutes=min_mins,
         current_gameweek=current_gw,
-        limit=15,
+        limit=result_limit,
     )
     if leaders.empty:
         empty_state(
@@ -330,11 +383,11 @@ def main() -> None:
         strong_column, difficult_column = st.columns(2)
         with strong_column:
             st.markdown("#### Best upcoming runs")
-            st.dataframe(fixture_summary.head(5), hide_index=True, width="stretch")
+            st.dataframe(_table_rows(fixture_summary, row_limit), hide_index=True, width="stretch")
         with difficult_column:
             st.markdown("#### Most difficult runs")
             st.dataframe(
-                fixture_summary.sort_values("Average FDR", ascending=False).head(5),
+                _table_rows(fixture_summary.sort_values("Average FDR", ascending=False), row_limit),
                 hide_index=True,
                 width="stretch",
             )
@@ -353,7 +406,7 @@ def main() -> None:
             column for column in ["name", "team", "fpl_pos", "status", "Usage", "Risk"] if column in risk_rows
         ]].rename(columns={"name": "Player", "team": "Team", "fpl_pos": "Position", "status": "Status"})
         st.dataframe(
-            style_availability_table(risk_display.head(20)),
+            style_availability_table(_table_rows(risk_display, row_limit)),
             hide_index=True,
             width="stretch",
         )
@@ -368,7 +421,7 @@ def main() -> None:
         )
     else:
         st.dataframe(
-            changes[[column for column in ["name", "team", "Change", "Archetype", "Family", "Confidence"] if column in changes]],
+            _table_rows(changes, row_limit)[[column for column in ["name", "team", "Change", "Archetype", "Family", "Confidence"] if column in changes]],
             hide_index=True,
             width="stretch",
         )
@@ -383,7 +436,7 @@ def main() -> None:
             icon="☆",
         )
     else:
-        shortlist_display = shortlisted[[
+        shortlist_display = _table_rows(shortlisted, row_limit)[[
             column for column in ["player_id", "name", "team", "fpl_pos", "now_cost", "Production profile", "Usage", "Risk"] if column in shortlisted
         ]]
         event = st.dataframe(

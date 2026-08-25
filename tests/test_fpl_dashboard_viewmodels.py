@@ -16,6 +16,7 @@ from fpl_assistant.apps.viewmodels.dashboard import (
     gameweek_deadline,
     stat_leaders,
     team_fixture_outlook,
+    upcoming_fixture_rows,
 )
 
 
@@ -180,6 +181,33 @@ def test_fixture_outlook_expands_both_teams_and_ranks_easier_runs() -> None:
     assert len(rows) == 4
     assert outlook.loc[outlook.Team.eq("AAA"), "Average FDR"].iloc[0] == 2
     assert outlook.loc[outlook.Team.eq("BBB"), "Average FDR"].iloc[0] == 4
+
+
+def test_provisionally_finished_fixture_is_not_upcoming() -> None:
+    fixtures = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "event": [1, 2],
+            "finished": [False, False],
+            "finished_provisional": [True, False],
+            "started": [True, False],
+            "minutes": [90, 0],
+            "kickoff_time": ["2026-08-21T19:00:00Z", "2026-08-28T19:00:00Z"],
+            "team_h": [1, 1],
+            "team_a": [2, 2],
+            "team_h_difficulty": [2, 3],
+            "team_a_difficulty": [4, 3],
+        }
+    )
+    teams = pd.DataFrame(
+        {"id": [1, 2], "name": ["Alpha", "Bravo"], "short_name": ["AAA", "BBB"]}
+    )
+
+    rows = fixture_rows(fixtures, teams)
+    upcoming = upcoming_fixture_rows(rows)
+
+    assert rows.loc[rows["GW"].eq(1), "finished"].all()
+    assert set(upcoming["GW"]) == {2}
 
 
 def test_deadline_prefers_official_event_and_labels_fixture_fallback() -> None:

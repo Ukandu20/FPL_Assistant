@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 
 LEADER_METRICS = {
@@ -15,6 +16,17 @@ LEADER_METRICS = {
     "Defensive contributions": "defcon",
     "DefCon hit rate": "defcon_hit_rate",
 }
+
+
+def _to_bool_mask(values: pd.Series) -> pd.Series:
+    """Normalize boolean-like CSV values without treating ``"False"`` as true."""
+    if is_bool_dtype(values):
+        return values.fillna(False)
+    if is_numeric_dtype(values):
+        return values.fillna(0).astype(float).ne(0)
+    return values.astype("string").str.strip().str.lower().isin(
+        {"1", "1.0", "true", "t", "yes", "y"}
+    )
 
 
 def gameweek_deadline(
@@ -46,6 +58,28 @@ def gameweek_deadline(
             return kickoffs.min() - pd.Timedelta(minutes=90), "estimated"
 
     return pd.NaT, "unavailable"
+
+
+def fixture_finished_mask(fixtures: pd.DataFrame) -> pd.Series:
+    """Return FPL fixtures that are complete enough to exclude from previews."""
+    finished = pd.Series(False, index=fixtures.index)
+    for column in ("finished", "finished_provisional"):
+        if column in fixtures:
+            finished |= _to_bool_mask(fixtures[column])
+    if {"started", "minutes"}.issubset(fixtures.columns):
+        finished |= _to_bool_mask(fixtures["started"]) & pd.to_numeric(
+            fixtures["minutes"], errors="coerce"
+        ).ge(90)
+    return finished
+
+
+def upcoming_fixture_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Return fixture view rows that have not completed."""
+    if rows.empty:
+        return rows.copy()
+    if "finished" not in rows:
+        return rows.copy()
+    return rows.loc[~_to_bool_mask(rows["finished"])].copy()
 
 
 def stat_leaders(
@@ -491,8 +525,10 @@ def fixture_rows(fixtures: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
         ids = pd.to_numeric(teams["id"], errors="coerce")
         names = dict(zip(ids, teams.get("name", teams.get("short_name", ids))))
         short_names = dict(zip(ids, teams.get("short_name", teams.get("name", ids))))
+    source = fixtures.copy()
+    source["_app_finished"] = fixture_finished_mask(source)
     rows: list[dict[str, object]] = []
-    for fixture in fixtures.to_dict("records"):
+    for fixture in source.to_dict("records"):
         home = pd.to_numeric(fixture.get("team_h"), errors="coerce")
         away = pd.to_numeric(fixture.get("team_a"), errors="coerce")
         if pd.isna(home) or pd.isna(away):
@@ -501,7 +537,7 @@ def fixture_rows(fixtures: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
             "fixture_id": fixture.get("id"),
             "GW": fixture.get("event"),
             "Kickoff": fixture.get("kickoff_time"),
-            "finished": fixture.get("finished", False),
+            "finished": fixture.get("_app_finished", False),
         }
         rows.extend(
             [
@@ -529,7 +565,7 @@ def fixture_rows(fixtures: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
 def team_fixture_outlook(rows: pd.DataFrame, *, fixtures_per_team: int = 5) -> pd.DataFrame:
     if rows.empty:
         return pd.DataFrame()
-    upcoming = rows.loc[~rows["finished"].fillna(False).astype(bool)].copy()
+    upcoming = upcoming_fixture_rows(rows)
     upcoming = upcoming.groupby("Team", group_keys=False).head(fixtures_per_team)
     summary = (
         upcoming.groupby("Team", as_index=False)

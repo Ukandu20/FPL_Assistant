@@ -43,6 +43,7 @@ from fpl_assistant.apps.viewmodels.dashboard import (
     FAMILY_DESCRIPTIONS,
     active_archetype_tags,
     archetype_reason,
+    fixture_finished_mask,
 )
 from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
 
@@ -142,12 +143,52 @@ RANKED_METRICS = {
     if source not in {"season", "name", "team", "fpl_pos"}
 }
 
+GOALKEEPER_ONLY_METRICS = {
+    "shots_on_target_against",
+    "saves",
+    "goals_against",
+    "save_pct",
+    "penalties_faced",
+    "penalties_allowed",
+    "penalties_saved",
+    "penalty_save_pct",
+}
+
+OUTFIELD_ONLY_METRICS = {
+    "blocks",
+    "interceptions",
+    "clearances",
+    "tackles_won",
+    "recoveries",
+    "defcon",
+    "xg",
+    "xa",
+}
+
 PER_90_METRICS = set(RANKED_METRICS) - {
     "minutes",
     "selected_by_percent",
     "now_cost",
     "save_pct",
     "penalty_save_pct",
+}
+
+DISCOVERY_METRICS = {
+    "minutes": "Minutes",
+    "total_points": "Points",
+    "goals_scored": "Goals",
+    "assists": "Assists",
+    "xg": "xG",
+    "xa": "xA",
+    "clean_sheets": "Clean sheets",
+    "bonus": "Bonus",
+    "bps": "BPS",
+    "defcon": "DefCon",
+    "clearances": "Clearances",
+    "blocks": "Blocks",
+    "interceptions": "Interceptions",
+    "tackles_won": "Tackles won",
+    "recoveries": "Recoveries",
 }
 
 # These metrics describe adverse outcomes. A lower value therefore deserves a
@@ -339,23 +380,67 @@ def render_price_metric_card(price: object, category_detail: object) -> None:
 
 def historical_fpl_version(
     league: str,
-) -> tuple[tuple[str, tuple[int, int] | None], ...]:
-    """Build the cache version for all season-level player files."""
+) -> tuple[
+    tuple[str, tuple[int, int] | None, tuple[int, int] | None], ...
+]:
+    """Build the cache version for season rosters and gameweek evidence."""
     return tuple(
         (
             season,
-            file_version(
-                fpl_season_path(league, season)
-            ),
+            file_version(fpl_season_path(league, season)),
+            file_version(fpl_gameweeks_path(league, season)),
         )
         for season in discover_seasons(league)
     )
 
 
+def coalesce_gameweek_season_stats(
+    players: pd.DataFrame, gameweeks: pd.DataFrame
+) -> pd.DataFrame:
+    """Fill season metrics from official FPL match rows when providers lag."""
+    if players.empty or gameweeks.empty or "player_id" not in gameweeks:
+        return players.copy()
+    mappings = {
+        "expected_goals": "xg",
+        "expected_assists": "xa",
+        "defensive_contribution": "defcon",
+    }
+    available = [column for column in mappings if column in gameweeks]
+    if not available:
+        return players.copy()
+
+    work = gameweeks[["player_id", *available]].copy()
+    work["player_id"] = work["player_id"].astype("string")
+    for column in available:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    totals = work.groupby("player_id", as_index=True)[available].agg(
+        lambda values: values.sum(min_count=1)
+    )
+
+    output = players.copy()
+    ids = output["player_id"].astype("string")
+    for source, target in mappings.items():
+        if source not in totals:
+            continue
+        official = ids.map(totals[source])
+        existing = pd.to_numeric(
+            output.get(target, pd.Series(index=output.index, dtype="float64")),
+            errors="coerce",
+        )
+        output[target] = (
+            official.combine_first(existing)
+            if target == "defcon"
+            else existing.combine_first(official)
+        )
+    return output
+
+
 @st.cache_data(show_spinner=False)
 def load_historical_fpl(
     league: str,
-    data_version: tuple[tuple[str, tuple[int, int] | None], ...] = (),
+    data_version: tuple[
+        tuple[str, tuple[int, int] | None, tuple[int, int] | None], ...
+    ] = (),
 ) -> pd.DataFrame:
     """Load and combine all player-season files for the selected league."""
     del data_version  # Used by Streamlit as a file-change-aware cache key.
@@ -364,6 +449,11 @@ def load_historical_fpl(
     for season in discover_seasons(league):
         csv_path = fpl_season_path(league, season)
         season_data = pd.read_csv(csv_path)
+        gameweek_path = fpl_gameweeks_path(league, season)
+        if gameweek_path.is_file():
+            season_data = coalesce_gameweek_season_stats(
+                season_data, pd.read_csv(gameweek_path, low_memory=False)
+            )
         season_data["season"] = season
         season_frames.append(season_data)
 
@@ -401,7 +491,7 @@ def load_historical_fpl(
             ),
             errors="coerce",
         )
-        players["defcon"] = calculated_defcon.combine_first(existing_defcon)
+        players["defcon"] = existing_defcon.combine_first(calculated_defcon)
 
     return players
 
@@ -550,9 +640,7 @@ def load_fixture_schedule(
     if not required_metadata.issubset(metadata) or not required_fixtures.issubset(fixtures):
         return pd.DataFrame()
 
-    if "finished" in fixtures:
-        finished = fixtures["finished"].astype("string").str.lower().eq("true")
-        fixtures = fixtures.loc[~finished].copy()
+    fixtures = fixtures.loc[~fixture_finished_mask(fixtures)].copy()
     fixture_columns = [
         column
         for column in [
@@ -768,11 +856,24 @@ def build_player_history(
     history = ranked_players.loc[
         ranked_players["player_id"] == str(player_id)
     ].copy()
+    latest_position = ""
+    if not history.empty and "fpl_pos" in history:
+        latest = history.sort_values("season", ascending=False, kind="stable")
+        latest_position = str(latest.iloc[0].get("fpl_pos", "")).strip().upper()
+    goalkeeper = is_goalkeeper_position(latest_position)
 
     output_columns = []
     output_names = {}
     for source, label in PLAYER_HISTORY_COLUMNS.items():
         if source not in history.columns:
+            continue
+        if goalkeeper and source in OUTFIELD_ONLY_METRICS:
+            continue
+        if not goalkeeper and source in GOALKEEPER_ONLY_METRICS:
+            continue
+        if source in RANKED_METRICS and pd.to_numeric(
+            history[source], errors="coerce"
+        ).notna().sum() == 0:
             continue
 
         output_columns.append(source)
@@ -803,6 +904,11 @@ def build_player_history(
         history["Price"] = history["Price"].map(
             lambda price: f"£{price:.1f}m" if pd.notna(price) else ""
         )
+
+    if per_90:
+        for source, label in RANKED_METRICS.items():
+            if source in PER_90_METRICS and label in history.columns:
+                history[label] = pd.to_numeric(history[label], errors="coerce").round(2)
 
     return history.sort_values("Season", ascending=False).reset_index(drop=True)
 
@@ -868,6 +974,8 @@ def build_metric_percentile_table(
         for label in RANKED_METRICS.values():
             if label not in record:
                 continue
+            if pd.isna(record[label]):
+                continue
             source = next(
                 source for source, source_label in RANKED_METRICS.items()
                 if source_label == label
@@ -890,7 +998,7 @@ def build_metric_percentile_table(
                 }
             )
 
-    return pd.DataFrame(
+    output = pd.DataFrame(
         rows,
         columns=[
             "Season",
@@ -900,6 +1008,25 @@ def build_metric_percentile_table(
             "League Percentile",
         ],
     )
+    if per_90 and not output.empty:
+        per_90_rows = output["Metric"].astype("string").str.endswith(" /90")
+        output.loc[per_90_rows, "Value"] = pd.to_numeric(
+            output.loc[per_90_rows, "Value"], errors="coerce"
+        ).round(2)
+    return output
+
+
+def format_per_90_table_values(table: pd.DataFrame) -> pd.DataFrame:
+    """Format row-oriented per-90 values with exactly two decimal places."""
+    output = table.copy()
+    if output.empty or not {"Metric", "Value"}.issubset(output.columns):
+        return output
+    per_90_rows = output["Metric"].astype("string").str.endswith(" /90")
+    output["Value"] = output["Value"].astype("object")
+    output.loc[per_90_rows, "Value"] = pd.to_numeric(
+        output.loc[per_90_rows, "Value"], errors="coerce"
+    ).map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
+    return output
 
 
 def format_metric_percentile_delta(record: pd.Series, metric: str) -> str:
@@ -941,11 +1068,6 @@ def build_player_labels(players: pd.DataFrame) -> dict[str, str]:
 
     labels = {}
     for player in selectable_players.itertuples():
-        team = (
-            str(player.team)
-            if pd.notna(player.team) and str(player.team).strip()
-            else "No team"
-        )
         labels[str(player.player_id)] = f"{player.name}"
 
     return labels
@@ -1000,25 +1122,143 @@ def filter_player_pool(
     return pool
 
 
-def render_overview_tab(
+def discovery_evidence_season(
+    players: pd.DataFrame, selected_season: str, seasons: list[str]
+) -> str:
+    """Use the selected season once it has played data, otherwise a prior season."""
+    if selected_season not in seasons:
+        return selected_season
+    candidates = seasons[seasons.index(selected_season):]
+    for season in candidates:
+        season_rows = players.loc[players["season"].eq(season)]
+        minutes = pd.to_numeric(
+            season_rows.get(
+                "minutes", pd.Series(index=season_rows.index, dtype="float64")
+            ),
+            errors="coerce",
+        ).fillna(0)
+        if minutes.gt(0).any():
+            return season
+    return selected_season
+
+
+def defensive_contribution_hit_rates(gameweeks: pd.DataFrame) -> pd.DataFrame:
+    """Return match-level DefCon hit rates and position percentiles by player."""
+    required = {"player_id", "minutes", "fpl_pos", "defensive_contribution"}
+    if gameweeks.empty or not required.issubset(gameweeks.columns):
+        return pd.DataFrame(
+            columns=["player_id", "DefCon hit rate", "DefCon hit rate Pctl"]
+        )
+    work = gameweeks.copy()
+    work["minutes"] = pd.to_numeric(work["minutes"], errors="coerce")
+    work = work.loc[work["minutes"].gt(0)].copy()
+    if work.empty:
+        return pd.DataFrame(
+            columns=["player_id", "DefCon hit rate", "DefCon hit rate Pctl"]
+        )
+    work["player_id"] = work["player_id"].astype("string")
+    work["fpl_pos"] = work["fpl_pos"].astype("string").str.upper()
+    contributions = pd.to_numeric(work["defensive_contribution"], errors="coerce")
+    thresholds = work["fpl_pos"].map({"DEF": 10, "MID": 12, "FWD": 12})
+    work["_observed"] = contributions.notna() & thresholds.notna()
+    work["_hit"] = contributions.ge(thresholds) & work["_observed"]
+    rates = (
+        work.groupby("player_id", as_index=False)
+        .agg(
+            fpl_pos=("fpl_pos", "last"),
+            _hits=("_hit", "sum"),
+            _observations=("_observed", "sum"),
+        )
+    )
+    rates["DefCon hit rate"] = rates["_hits"].div(
+        rates["_observations"].where(rates["_observations"].gt(0))
+    ).mul(100)
+    rates["DefCon hit rate Pctl"] = (
+        rates["DefCon hit rate"]
+        .groupby(rates["fpl_pos"])
+        .rank(method="average", pct=True, ascending=True, na_option="keep")
+        .mul(100)
+        .round(1)
+    )
+    return rates[["player_id", "DefCon hit rate", "DefCon hit rate Pctl"]]
+
+
+def build_player_discovery_table(
+    current_pool: pd.DataFrame,
+    all_players: pd.DataFrame,
+    evidence_season: str,
+    gameweeks: pd.DataFrame,
+    *,
+    per_90: bool = False,
+) -> pd.DataFrame:
+    """Attach evidence-season metrics and position percentiles to the current pool."""
+    if current_pool.empty:
+        return pd.DataFrame()
+    evidence = all_players.loc[all_players["season"].eq(evidence_season)].copy()
+    ranked = add_metric_percentiles(evidence, per_90=per_90)
+    evidence_columns = ["player_id"]
+    for source in DISCOVERY_METRICS:
+        if source in ranked.columns:
+            evidence_columns.append(source)
+        percentile = f"{source}_position_percentile"
+        if percentile in ranked.columns:
+            evidence_columns.append(percentile)
+    evidence_values = ranked[evidence_columns].drop_duplicates("player_id", keep="last")
+    evidence_values["player_id"] = evidence_values["player_id"].astype("string")
+
+    current = current_pool.copy()
+    current["player_id"] = current["player_id"].astype("string")
+    current_columns = [
+        column for column in [
+            "player_id", "name", "team", "fpl_pos", "now_cost",
+            "selected_by_percent", "status",
+        ] if column in current
+    ]
+    output = current[current_columns].merge(
+        evidence_values, on="player_id", how="left", validate="one_to_one"
+    )
+    rates = defensive_contribution_hit_rates(gameweeks)
+    if not rates.empty:
+        output = output.merge(rates, on="player_id", how="left", validate="one_to_one")
+
+    display = pd.DataFrame(
+        {
+            "player_id": output["player_id"],
+            "Player": output.get("name"),
+            "Team": output.get("team"),
+            "Position": output.get("fpl_pos"),
+            "Price": pd.to_numeric(output.get("now_cost"), errors="coerce").div(10),
+            "Ownership": pd.to_numeric(output.get("selected_by_percent"), errors="coerce"),
+            "Status": output.get("status"),
+            "Evidence season": evidence_season,
+        }
+    )
+    for source, label in DISCOVERY_METRICS.items():
+        if source not in output:
+            continue
+        display_label = f"{label} /90" if per_90 and source in PER_90_METRICS else label
+        display[display_label] = pd.to_numeric(output[source], errors="coerce")
+        percentile = f"{source}_position_percentile"
+        if percentile in output:
+            display[f"{display_label} Pctl"] = pd.to_numeric(
+                output[percentile], errors="coerce"
+            )
+    for column in ("DefCon hit rate", "DefCon hit rate Pctl"):
+        if column in output:
+            display[column] = pd.to_numeric(output[column], errors="coerce")
+    return display
+
+
+def render_player_bio(
     player_name: str,
     selected_season: str,
     selected_record: pd.Series,
     raw_record: pd.Series,
-    gameweek_history: pd.DataFrame,
-    fixtures: pd.DataFrame,
-    forecast: pd.DataFrame,
-    profile: pd.Series | None,
-    profile_season: str | None,
-    profile_is_carryover: bool,
-    profile_trend_data: dict[str, float | str],
     player_details: pd.Series | None,
     team_badges: dict[int, str],
-    alternatives: pd.DataFrame,
-    data_freshness: dict[str, str],
     archetypes: pd.DataFrame,
 ) -> None:
-    """Render a player-first, decision-oriented landing page."""
+    """Render the player identity and market context shared by every view."""
 
     def number(value: object) -> float:
         return pd.to_numeric(value, errors="coerce")
@@ -1106,6 +1346,29 @@ def render_overview_tab(
             "Ownership", "—" if pd.isna(ownership) else f"{ownership:.1f}%"
         )
         st.caption(str(selected_record.get("Price Category", "Uncategorized")).replace(" Â· ", " · "))
+
+
+def render_overview_tab(
+    player_name: str,
+    selected_season: str,
+    selected_record: pd.Series,
+    raw_record: pd.Series,
+    gameweek_history: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    forecast: pd.DataFrame,
+    profile: pd.Series | None,
+    profile_season: str | None,
+    profile_is_carryover: bool,
+    profile_trend_data: dict[str, float | str],
+    player_details: pd.Series | None,
+    team_badges: dict[int, str],
+    alternatives: pd.DataFrame,
+    data_freshness: dict[str, str],
+) -> None:
+    """Render the decision-oriented overview content."""
+
+    def number(value: object) -> float:
+        return pd.to_numeric(value, errors="coerce")
 
     st.markdown("### Next fixture")
     with st.container(border=True):
@@ -1442,7 +1705,7 @@ def render_performance_tab(
         percentile_table["Season"].eq(selected_season)
     ] if not percentile_table.empty else percentile_table
     ui.table(
-        data=season_percentiles,
+        data=format_per_90_table_values(season_percentiles),
         caption=f"Metric values and percentiles for {player_name} in {selected_season}",
         key=f"performance_{player_name}_{selected_season}",
         max_height=520,
@@ -1467,7 +1730,7 @@ def render_forecast_tab(
     chart["Fixture"] = (
         chart.get("opponent", pd.Series("—", index=chart.index)).astype(str)
         + chart.get("is_home", pd.Series(False, index=chart.index)).map(
-            {True: " (H)", False: " (A)", 1: " (H)", 0: " (A)"}
+            {True: " (H)", False: " (A)"}
         ).fillna("")
     )
     figure = px.bar(
@@ -1536,13 +1799,16 @@ def render_history_tab(
     ]
     regular_history = history[regular_columns].copy()
     if per_90:
-        regular_history = regular_history.rename(
-            columns={
-                label: f"{label} /90"
-                for source, label in RANKED_METRICS.items()
-                if source in PER_90_METRICS and label in regular_history.columns
-            }
-        )
+        per_90_columns = {
+            label: f"{label} /90"
+            for source, label in RANKED_METRICS.items()
+            if source in PER_90_METRICS and label in regular_history.columns
+        }
+        regular_history = regular_history.rename(columns=per_90_columns)
+        for column in per_90_columns.values():
+            regular_history[column] = pd.to_numeric(
+                regular_history[column], errors="coerce"
+            ).map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
     ui.table(
         data=regular_history,
         caption=f"All available FPL seasons for {player_name}",
@@ -1554,8 +1820,9 @@ def render_history_tab(
         "for the metric, and per-90 percentiles require at least "
         f"{MIN_PER_90_MINUTES} minutes."
     )
+    percentile_display = format_per_90_table_values(percentile_table)
     ui.table(
-        data=percentile_table,
+        data=percentile_display,
         caption=f"Metric values and percentiles by season for {player_name}",
         key=f"history_{player_id}",
         max_height=500,
@@ -2219,33 +2486,45 @@ def main() -> None:
                         player=row.get("player_id"), view="Overview",
                     )
         st.markdown("### Player discovery")
+        evidence_season = discovery_evidence_season(players, selected_season, seasons)
+        evidence_path = fpl_gameweeks_path(league, evidence_season)
+        evidence_gameweeks = load_gameweek_fpl(
+            league, evidence_season, file_version(evidence_path)
+        )
+        evidence_note = (
+            f"Using {evidence_season} evidence because {selected_season} has no "
+            "completed-match data yet."
+            if evidence_season != selected_season
+            else f"Using completed-match evidence from {selected_season}."
+        )
         st.caption(
-            "Select any row to open a player card. In preseason, ownership and price "
-            "provide the most useful current-roster discovery signals."
+            "Select any row to open a player card. Percentiles compare each player "
+            f"with others in the same FPL position. {evidence_note} Players without "
+            "a matching evidence-season record remain visible with blank evidence."
         )
-        discovery = filtered_players.copy()
-        discovery["_ownership"] = pd.to_numeric(
-            discovery.get("selected_by_percent"), errors="coerce"
+        discovery_pool = filtered_players.copy()
+        discovery = build_player_discovery_table(
+            discovery_pool,
+            players,
+            evidence_season,
+            evidence_gameweeks,
+            per_90=per_90,
         )
-        discovery["_price"] = pd.to_numeric(discovery.get("now_cost"), errors="coerce").div(10)
         if selected_archetype != "All archetypes":
-            discovery["_archetype_score"] = discovery["player_id"].astype(str).map(
+            discovery["Archetype score"] = discovery["player_id"].astype(str).map(
                 selected_archetype_scores
             )
-        discovery = discovery.sort_values(
-            ["_ownership", "_price"], ascending=False, na_position="last"
-        ).head(30)
-        discovery_columns = {
-            "Player": discovery.get("name"),
-            "Team": discovery.get("team"),
-            "Position": discovery.get("fpl_pos"),
-            "Price": discovery["_price"],
-            "Ownership": discovery["_ownership"],
-            "Status": discovery.get("status"),
+        discovery_display = discovery.drop(columns="player_id")
+        column_config = {
+            "Price": st.column_config.NumberColumn(format="£%.1fm"),
+            "Ownership": st.column_config.NumberColumn(format="%.1f%%"),
+            "DefCon hit rate": st.column_config.NumberColumn(format="%.1f%%"),
         }
-        if selected_archetype != "All archetypes":
-            discovery_columns["Archetype score"] = discovery["_archetype_score"]
-        discovery_display = pd.DataFrame(discovery_columns)
+        for column in discovery_display:
+            if column.endswith(" Pctl"):
+                column_config[column] = st.column_config.NumberColumn(format="%.0f")
+            elif column.endswith(" /90") or column in {"xG", "xA"}:
+                column_config[column] = st.column_config.NumberColumn(format="%.2f")
         selection = st.dataframe(
             style_availability_table(discovery_display),
             hide_index=True,
@@ -2254,8 +2533,7 @@ def main() -> None:
             selection_mode="single-row",
             key=f"player_discovery_{selected_season}_{reset_version}",
             column_config={
-                "Price": st.column_config.NumberColumn(format="£%.1fm"),
-                "Ownership": st.column_config.NumberColumn(format="%.1f%%"),
+                **column_config,
                 "Archetype score": st.column_config.ProgressColumn(
                     label=f"{selected_archetype} score",
                     format="%.1f",
@@ -2495,6 +2773,16 @@ def main() -> None:
         "forecast": updated_label(forecast_path),
     }
 
+    render_player_bio(
+        player_name,
+        selected_season,
+        selected_record,
+        raw_record,
+        selected_details,
+        team_badges,
+        selected_v1_archetypes,
+    )
+
     if selected_view == "Overview":
         render_overview_tab(
             player_name,
@@ -2512,7 +2800,6 @@ def main() -> None:
             team_badges,
             alternatives,
             data_freshness,
-            selected_v1_archetypes,
         )
     elif selected_view == "Form & Forecast":
         render_performance_tab(

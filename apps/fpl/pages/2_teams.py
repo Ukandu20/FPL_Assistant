@@ -34,7 +34,11 @@ from apps.fpl.catalog import (
     fpl_season_path,
     understat_team_season_path,
 )
-from fpl_assistant.apps.viewmodels.dashboard import enrich_current_players, fixture_rows
+from fpl_assistant.apps.viewmodels.dashboard import (
+    enrich_current_players,
+    fixture_rows,
+    upcoming_fixture_rows,
+)
 from fpl_assistant.apps.viewmodels.player_card import team_badge_url
 
 
@@ -239,7 +243,9 @@ def main() -> None:
         for container, (label, value, digits) in zip([*first_metrics, *second_metrics], values):
             container.metric(label, format_number(value, digits))
 
-    all_fixture_rows = fixture_rows(raw_fixtures(league, season), raw_team_data)
+    all_fixture_rows = upcoming_fixture_rows(
+        fixture_rows(raw_fixtures(league, season), raw_team_data)
+    )
     team_numeric = pd.to_numeric(enriched_team.get("fpl_team_numeric_id"), errors="coerce").dropna()
     team_fixtures = (
         all_fixture_rows.loc[all_fixture_rows["team_numeric_id"].eq(team_numeric.iloc[0])].head(5)
