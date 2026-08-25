@@ -255,6 +255,20 @@ python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
   --log-level INFO
 ```
 
+After scraping Understat, clean the raw season before building the enriched
+calendar. This produces the required processed `schedule.csv` and applies the
+league-scoped FPL player aliases.
+
+```powershell
+python -m fpl_assistant.providers.understat.clean.clean_understat_raw `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --in-root "data/raw/understat" `
+  --out-root "data/processed/understat" `
+  --fpl-root "data/processed/fpl/ENG-Premier League" `
+  --verbose
+```
+
 After WhoScored and Understat publish completed-match data, build the enriched
 calendar without FDR. FPL supplies fixture IDs, gameweeks, and the scheduled
 calendar. FBref is consulted only when its optional schedule exists.

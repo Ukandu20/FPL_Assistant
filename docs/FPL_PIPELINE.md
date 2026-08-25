@@ -343,6 +343,7 @@ python -m fpl_assistant.providers.fpl.pipelines.eligibility_backfill `
   --raw-fpl-root "data/raw/fpl/ENG-Premier League" `
   --fixtures-root "data/processed/registry/fixtures" `
   --registry-root "data/processed/registry" `
+  --season "2026-2027" `
   --force `
   --log-level INFO
 ```
