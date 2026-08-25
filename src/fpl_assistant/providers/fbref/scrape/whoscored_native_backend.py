@@ -36,6 +36,13 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+BLOCK_PAGE_MARKERS = (
+    "Attention Required! | Cloudflare",
+    "Just a moment...",
+    "/cdn-cgi/challenge-platform/",
+    "/cdn-cgi/styles/cf.errors.css",
+)
+
 
 @dataclass(frozen=True)
 class CompetitionConfig:
@@ -148,20 +155,30 @@ def _balanced_fragment(text: str, start: int) -> Optional[str]:
 
 
 def extract_json_after_marker(text: str, marker: str) -> Optional[Any]:
-    idx = text.find(marker)
-    if idx < 0:
-        return None
-    brace_positions = [pos for pos in (text.find("{", idx), text.find("[", idx)) if pos >= 0]
-    if not brace_positions:
-        return None
-    start = min(brace_positions)
-    fragment = _balanced_fragment(text, start)
-    if not fragment:
-        return None
-    try:
-        return json.loads(fragment)
-    except Exception:
-        return None
+    search_from = 0
+    decoder = json.JSONDecoder()
+    while (idx := text.find(marker, search_from)) >= 0:
+        cursor = idx + len(marker)
+        if cursor < len(text) and text[cursor] in ('"', "'"):
+            cursor += 1
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] not in (":", "="):
+            search_from = idx + len(marker)
+            continue
+        cursor += 1
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        try:
+            payload, _ = decoder.raw_decode(text, cursor)
+            return payload
+        except json.JSONDecodeError:
+            search_from = idx + len(marker)
+    return None
+
+
+def _is_block_page(text: str) -> bool:
+    return any(marker in text for marker in BLOCK_PAGE_MARKERS)
 
 
 def parse_tiers_json(data: Any) -> Dict[str, Dict[str, int]]:
@@ -469,14 +486,38 @@ class NativeWhoScoredBackend:
         competition = self.competitions[league]
         region_id, tournament_id = self._resolve_competition_ids(competition)
         url = f"{WHOSCORED_URL}/Regions/{region_id}/Tournaments/{tournament_id}"
-        html_text = self._fetch_text(
-            url,
-            self.cache_dir / "pages" / league / "tournament.html",
-        )
-        records = parse_season_options(html_text, competition=competition)
+        try:
+            html_text = self._fetch_text(
+                url,
+                self.cache_dir / "pages" / league / "tournament.html",
+            )
+            records = parse_season_options(html_text, competition=competition)
+        except RuntimeError as exc:
+            LOG.warning("Season discovery failed for %s: %s", league, exc)
+            records = []
         if explicit_seasons:
             wanted = {str(_to_season_int(value)) for value in explicit_seasons}
             records = [record for record in records if record.season in wanted]
+            resolved = {record.season for record in records}
+            for season in sorted(wanted - resolved):
+                season_dir = self.cache_dir / "pages" / league / season
+                candidates = [season_dir / "season.html", *sorted(season_dir.glob("stage_*.html"))]
+                for path in candidates:
+                    if not path.is_file():
+                        continue
+                    match = re.search(r'["\']?seasonId["\']?\s*:\s*(\d+)', path.read_text(encoding="utf-8"))
+                    if match:
+                        records.append(
+                            SeasonRecord(
+                                league=league,
+                                season=season,
+                                season_id=int(match.group(1)),
+                                region_id=region_id,
+                                tournament_id=tournament_id,
+                                season_label=season,
+                            )
+                        )
+                        break
         if not records:
             raise RuntimeError(f"Could not resolve seasons for {league}")
         df = pd.DataFrame([record.__dict__ for record in records]).set_index(["league", "season"])
@@ -732,6 +773,11 @@ class NativeWhoScoredBackend:
                 data = self._fetch_text_with_browser(url)
             else:
                 raise RuntimeError(f"Request failed for {url}: {exc}") from exc
+        if _is_block_page(data):
+            if self.browser_fallback:
+                data = self._fetch_text_with_browser(url)
+            if _is_block_page(data):
+                raise RuntimeError(f"WhoScored blocked the request for {url}")
         if not self.no_store:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(data, encoding="utf-8")

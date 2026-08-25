@@ -72,6 +72,25 @@ def test_to_ws_season_int_formats():
     assert ws._to_ws_season_int("2025") == 2025
 
 
+def test_raw_season_folder_uses_compact_split_year_code():
+    assert ws._raw_season_folder("2026-2027") == "2627"
+    assert ws._raw_season_folder("2627") == "2627"
+    assert ws._raw_season_folder(2026) == "2627"
+
+
+def test_saved_schedule_falls_back_to_legacy_season_folder(tmp_path):
+    legacy_dir = tmp_path / "WhoScored" / "ENG-Premier League" / "2026"
+    legacy_dir.mkdir(parents=True)
+    _schedule_df().to_csv(legacy_dir / "ws_schedule.csv", index=False)
+
+    schedule = ws._read_saved_schedule(tmp_path, "ENG-Premier League", "2026-2027")
+
+    assert schedule["game_id"].tolist() == [123456]
+    assert schedule["season"].tolist() == [2025]
+    assert not {"index", "level_0"}.intersection(schedule.columns)
+    assert not any(str(column).startswith("Unnamed:") for column in schedule.columns)
+
+
 def test_resolve_competitions_supports_explicit_and_groups():
     leagues = ws.resolve_competitions(
         explicit_leagues=["ENG-Premier League"],
@@ -297,6 +316,20 @@ def test_extract_match_centre_payload():
     assert payload == {"matchId": 123456, "events": []}
 
 
+def test_extract_match_centre_payload_does_not_consume_event_type_dictionary():
+    html = """
+    <script>
+      require.config.params['args'] = {
+        matchId: 123456,
+        matchCentreData: null,
+        matchCentreEventTypeJson: {"shotSixYardBox": 0, "shotPenaltyArea": 1}
+      };
+    </script>
+    """
+
+    assert extract_match_centre_payload(html) is None
+
+
 def test_parse_calendar_mask_from_js_object():
     html = """
     <script>
@@ -416,6 +449,69 @@ def test_native_fetch_text_uses_browser_after_remote_disconnect(tmp_path, monkey
 
     url = "https://www.whoscored.com/test"
     assert backend._fetch_text(url, tmp_path / "unused.html") == f"<html>{url}</html>"
+
+
+def test_native_fetch_text_uses_browser_for_cloudflare_page(tmp_path, monkeypatch):
+    competition = CompetitionConfig(
+        key="ENG-Premier League",
+        source_name="England - Premier League",
+        region_id=252,
+        tournament_id=2,
+        competition_type="club",
+        season_mode="split-year",
+    )
+    backend = NativeWhoScoredBackend(
+        competitions={competition.key: competition},
+        cache_dir=tmp_path,
+        browser_fallback=True,
+        no_cache=True,
+        no_store=True,
+    )
+
+    class BlockedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"<title>Attention Required! | Cloudflare</title>"
+
+    class BlockedOpener:
+        def open(self, _request, *, timeout):
+            assert timeout == 30
+            return BlockedResponse()
+
+    backend._opener = BlockedOpener()
+    monkeypatch.setattr(backend, "_fetch_text_with_browser", lambda _url: "<html>usable</html>")
+
+    assert backend._fetch_text("https://www.whoscored.com/test", tmp_path / "unused.html") == "<html>usable</html>"
+
+
+def test_native_resolve_seasons_recovers_explicit_season_from_cache(tmp_path, monkeypatch):
+    competition = CompetitionConfig(
+        key="ENG-Premier League",
+        source_name="England - Premier League",
+        region_id=252,
+        tournament_id=2,
+        competition_type="club",
+        season_mode="split-year",
+    )
+    backend = NativeWhoScoredBackend(
+        competitions={competition.key: competition},
+        cache_dir=tmp_path,
+        browser_fallback=False,
+        no_cache=True,
+    )
+    season_page = tmp_path / "pages" / competition.key / "2026" / "season.html"
+    season_page.parent.mkdir(parents=True)
+    season_page.write_text('<script>window.data = {"seasonId":11141};</script>', encoding="utf-8")
+    monkeypatch.setattr(backend, "_fetch_text", lambda *_args: (_ for _ in ()).throw(RuntimeError("blocked")))
+
+    seasons = backend.resolve_seasons(competition.key, ["2026-2027"])
+
+    assert seasons.loc[(competition.key, "2026"), "season_id"] == 11141
 
 
 def test_legacy_whoscored_scraper_delegates(monkeypatch):

@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - optional dependency during tests
     sd = None  # type: ignore[assignment]
 
 from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId, record_last_run
-from scripts.fbref_pipeline.scrape.whoscored_native_backend import (
+from fpl_assistant.providers.fbref.scrape.whoscored_native_backend import (
     NativeWhoScoredBackend,
     extract_report_json_blobs,
     load_native_competitions,
@@ -497,6 +497,45 @@ def _to_ws_season_int(season: Union[str, int]) -> int:
         raise ValueError(f"Unrecognized season format: {season!r}") from e
 
 
+def _soccerdata_season_start(season: Any) -> int:
+    value = str(season).strip()
+    if re.fullmatch(r"\d{4}", value) and value[:2] != "20":
+        return 2000 + int(value[:2])
+    return _to_ws_season_int(value)
+
+
+def _raw_season_folder(season: Any) -> str:
+    start = _soccerdata_season_start(season)
+    if start < 2021:
+        return str(start)
+    return f"{start % 100:02d}{(start + 1) % 100:02d}"
+
+
+def _drop_csv_index_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    cleaned = frame.copy()
+    expected = pd.Series(range(len(cleaned)), index=cleaned.index, dtype="int64")
+    for column in list(cleaned.columns):
+        if column != "index" and column != "level_0" and not str(column).startswith("Unnamed:"):
+            continue
+        values = pd.to_numeric(cleaned[column], errors="coerce")
+        if values.notna().all() and values.astype("int64").equals(expected):
+            cleaned = cleaned.drop(columns=column)
+    return cleaned
+
+
+def _read_saved_schedule(out_base: Path, league: str, season: Any) -> pd.DataFrame:
+    start = _soccerdata_season_start(season)
+    folder_names = [_raw_season_folder(start), str(start)]
+    for folder_name in dict.fromkeys(folder_names):
+        schedule = _read_existing_csv(
+            out_base / "WhoScored" / league / folder_name / "ws_schedule"
+        )
+        if not schedule.empty:
+            schedule = _drop_csv_index_columns(schedule)
+            return _drop_csv_index_columns(_normalize(schedule, league, start))
+    return _normalize(_schema_only_schedule(), league, start)
+
+
 def _normalize(df: pd.DataFrame, league: str, season_int: int) -> pd.DataFrame:
     if isinstance(df.index, (pd.MultiIndex, pd.Index)):
         try:
@@ -659,7 +698,7 @@ def _resolve_seasons_for_league(
 
     ws = _build_ws(
         league,
-        None,
+        list(explicit_seasons) if explicit_seasons else None,
         proxy=proxy,
         no_cache=no_cache,
         no_store=no_store,
@@ -737,7 +776,7 @@ def _resolve_seasons_frame_for_league(
 ) -> pd.DataFrame:
     ws = _build_ws(
         league,
-        None,
+        list(explicit_seasons) if explicit_seasons else None,
         proxy=proxy,
         no_cache=no_cache,
         no_store=no_store,
@@ -746,13 +785,22 @@ def _resolve_seasons_frame_for_league(
     )
     try:
         _attach_cached_read_leagues(ws)
-        seasons_df = ws.read_seasons()
+        cached_seasons = Path(getattr(ws, "data_dir")) / "seasons" / f"{league}.html"
+        restore_no_cache = bool(getattr(ws, "no_cache", False))
+        if explicit_seasons and cached_seasons.is_file():
+            ws.no_cache = False
+        try:
+            seasons_df = ws.read_seasons()
+        finally:
+            ws.no_cache = restore_no_cache
         if not isinstance(seasons_df, pd.DataFrame) or seasons_df.empty:
             raise RuntimeError(f"Could not resolve seasons for {league}")
         if explicit_seasons:
-            wanted = {str(_to_ws_season_int(season)) for season in explicit_seasons}
-            idx = seasons_df.index.get_level_values("season").astype(str)
+            wanted = {_to_ws_season_int(season) for season in explicit_seasons}
+            idx = seasons_df.index.get_level_values("season").map(_soccerdata_season_start)
             seasons_df = seasons_df[idx.isin(wanted)]
+            if seasons_df.empty:
+                raise RuntimeError(f"Could not resolve requested seasons {sorted(wanted)} for {league}")
         return seasons_df.copy()
     finally:
         _close_ws(ws)
@@ -760,7 +808,12 @@ def _resolve_seasons_frame_for_league(
 
 def _event_cache_dir(ws: Any, league: str, season_int: int) -> Path:
     data_dir = Path(getattr(ws, "data_dir", _soccerdata_config_dir().parent / "WhoScored"))
-    return data_dir / "events" / f"{league}_{season_int}"
+    season_codes = [str(value) for value in getattr(ws, "seasons", [])]
+    season_code = next(
+        (value for value in season_codes if _soccerdata_season_start(value) == season_int),
+        f"{season_int % 100:02d}{(season_int + 1) % 100:02d}",
+    )
+    return data_dir / "events" / f"{league}_{season_code}"
 
 
 def _load_cached_raw_payloads(
@@ -791,6 +844,49 @@ def _load_cached_raw_payloads(
     return payloads
 
 
+def _fetch_soccerdata_match_payloads(
+    *,
+    ws: Any,
+    league: str,
+    season_int: int,
+    match_ids: Sequence[int],
+    live: bool,
+    retry_missing: bool,
+    on_error: str,
+) -> Dict[int, Dict[str, Any]]:
+    cache_dir = _event_cache_dir(ws, league, season_int)
+    payloads: Dict[int, Dict[str, Any]] = {}
+    variable = "require.config.params['args'].matchCentreData"
+    for match_id in match_ids:
+        path = cache_dir / f"{int(match_id)}.json"
+        try:
+            reader = ws.get(
+                f"https://www.whoscored.com/Matches/{int(match_id)}/Live",
+                path,
+                var=variable,
+                no_cache=live,
+            )
+            raw = reader.read()
+            if retry_missing and raw in (b"", b"null"):
+                reader = ws.get(
+                    f"https://www.whoscored.com/Matches/{int(match_id)}/Live",
+                    path,
+                    var=variable,
+                    no_cache=True,
+                )
+                raw = reader.read()
+            payload = json.loads(raw)
+            if isinstance(payload, Mapping):
+                payloads[int(match_id)] = dict(payload)
+        except Exception:
+            if on_error == "raise":
+                raise
+            logging.getLogger("whoscored").warning(
+                "Skipping failed WhoScored match %s", match_id, exc_info=True
+            )
+    return payloads
+
+
 def _archive_raw_payloads(raw_dir: Path, payloads: Mapping[int, Mapping[str, Any]]) -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
     for game_id, payload in payloads.items():
@@ -806,6 +902,28 @@ def _build_schedule_lookup(schedule_df: pd.DataFrame) -> Dict[int, Dict[str, Any
         if game_id is not None:
             out[game_id] = row.to_dict()
     return out
+
+
+def _completed_match_ids(
+    schedule_df: pd.DataFrame, *, now: Optional[pd.Timestamp] = None
+) -> List[int]:
+    if schedule_df.empty or "game_id" not in schedule_df.columns:
+        return []
+    frame = schedule_df.copy()
+    completed = pd.Series(False, index=frame.index)
+    if {"home_score", "away_score"}.issubset(frame.columns):
+        completed |= frame["home_score"].notna() & frame["away_score"].notna()
+    if "status" in frame.columns:
+        statuses = frame["status"].astype(str).str.strip().str.lower()
+        completed |= statuses.isin({"ft", "aet", "pen", "finished", "full time", "full-time"})
+    time_column = "start_time" if "start_time" in frame.columns else "date" if "date" in frame.columns else None
+    if time_column is not None:
+        kickoff = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
+        reference = now if now is not None else pd.Timestamp.now(tz="UTC")
+        reference = reference.tz_localize("UTC") if reference.tzinfo is None else reference.tz_convert("UTC")
+        completed |= kickoff.le(reference - pd.Timedelta(hours=3))
+    ids = pd.to_numeric(frame.loc[completed, "game_id"], errors="coerce").dropna().astype(int)
+    return ids.drop_duplicates().tolist()
 
 
 def _home_away_team_map(payload: Mapping[str, Any]) -> Dict[int, Tuple[str, str]]:
@@ -1597,6 +1715,21 @@ def _attach_cached_read_seasons(ws: Any, seasons_frame: Optional[pd.DataFrame]) 
         pass
 
 
+def _attach_existing_schedule(ws: Any, schedule_df: pd.DataFrame) -> None:
+    required = {"league", "season", "game", "game_id"}
+    if schedule_df.empty or not required.issubset(schedule_df.columns):
+        return
+    cached = schedule_df.copy().set_index(["league", "season", "game"]).sort_index()
+
+    def _cached_read_schedule(force_cache: bool = False) -> pd.DataFrame:
+        return cached.copy()
+
+    try:
+        ws.read_schedule = _cached_read_schedule  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
 def _native_backend(
     *,
     browser_fallback: bool,
@@ -1661,8 +1794,8 @@ def scrape_one_native(
     seasons_frame: pd.DataFrame,
 ) -> Dict[str, Any]:
     log = logging.getLogger("whoscored")
-    season_int = _to_ws_season_int(season)
-    out_dir = out_base / "WhoScored" / league / str(season_int)
+    season_int = _soccerdata_season_start(season)
+    out_dir = out_base / "WhoScored" / league / _raw_season_folder(season_int)
     events_dir = out_dir / "events"
     derived_dir = out_dir / "derived"
     stats_dir = out_dir / "stats"
@@ -1699,21 +1832,46 @@ def scrape_one_native(
     schedule_path = out_dir / "ws_schedule"
     schedule_df = pd.DataFrame()
     if "schedule" in tables:
-        if skip_existing and _csv_exists(schedule_path):
-            schedule_df = _normalize(_read_existing_csv(schedule_path), league, season_int)
-            summary["schedule"] = "skipped_existing"
+        saved_schedule = _read_saved_schedule(out_base, league, season_int)
+        if skip_existing and not saved_schedule.empty:
+            schedule_df = saved_schedule
+            if not _csv_exists(schedule_path):
+                safe_write(schedule_df, schedule_path)
+                summary["schedule"] = "migrated_existing"
+            else:
+                summary["schedule"] = "skipped_existing"
         else:
-            schedule_df = backend.read_schedule(
-                league=league,
-                season_record=season_record,
-                match_ids=match_ids,
-            )
-            schedule_df = _normalize(schedule_df, league, season_int)
+            try:
+                schedule_df = backend.read_schedule(
+                    league=league,
+                    season_record=season_record,
+                    match_ids=match_ids,
+                )
+                schedule_df = _normalize(schedule_df, league, season_int)
+                if schedule_df.empty and not saved_schedule.empty:
+                    log.warning(
+                        "Schedule refresh returned no rows for %s %s; reusing saved schedule",
+                        league,
+                        season_int,
+                    )
+                    schedule_df = saved_schedule
+                    summary["schedule"] = "reused_existing"
+            except Exception as exc:
+                if saved_schedule.empty:
+                    raise
+                log.warning(
+                    "Schedule refresh failed for %s %s; reusing saved schedule: %s",
+                    league,
+                    season_int,
+                    exc,
+                )
+                schedule_df = saved_schedule
+                summary["schedule"] = "reused_existing"
             if not schedule_df.empty:
                 if match_limit:
                     schedule_df = schedule_df.head(match_limit).reset_index(drop=True)
                 safe_write(schedule_df, schedule_path)
-                summary["schedule"] = "scraped_ok"
+                summary["schedule"] = summary["schedule"] or "scraped_ok"
             else:
                 empty = _normalize(_schema_only_schedule(), league, season_int)
                 safe_write(empty, schedule_path)
@@ -1851,6 +2009,7 @@ def scrape_one(
     derived_tables: Sequence[str],
     archive_raw_events: bool,
     raw_match_dir_layout: str,
+    stats_mode: str,
     seasons_frame: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     log = logging.getLogger("whoscored")
@@ -1870,10 +2029,13 @@ def scrape_one(
     )
     _attach_cached_read_seasons(ws, seasons_frame)
 
-    out_dir = out_base / "WhoScored" / league / str(season_int)
+    out_dir = out_base / "WhoScored" / league / _raw_season_folder(season_int)
     events_dir = out_dir / "events"
     derived_dir = out_dir / "derived"
+    stats_dir = out_dir / "stats"
     raw_dir = events_dir / "raw"
+    existing_schedule = _read_saved_schedule(out_base, league, season_int)
+    _attach_existing_schedule(ws, existing_schedule)
 
     summary: Dict[str, Any] = {
         "schedule": None,
@@ -1882,6 +2044,7 @@ def scrape_one(
         "events_format": events_format,
         "raw_archive": None,
         "derived": {},
+        "stats": {},
     }
     schedule_df = pd.DataFrame()
 
@@ -1906,10 +2069,15 @@ def scrape_one(
                         season_int,
                         e,
                     )
-                    empty = _schema_only_schedule()
-                    empty = _normalize(empty, league, season_int)
-                    safe_write(empty, out_path)
-                    summary["schedule"] = "schema_only"
+                    if existing_schedule.empty:
+                        empty = _schema_only_schedule()
+                        empty = _normalize(empty, league, season_int)
+                        safe_write(empty, out_path)
+                        summary["schedule"] = "schema_only"
+                    else:
+                        schedule_df = existing_schedule
+                        safe_write(schedule_df, out_path)
+                        summary["schedule"] = "reused_existing"
                 polite_sleep(delay)
 
         if "missing_players" in tables:
@@ -1979,6 +2147,35 @@ def scrape_one(
                 summary["derived"] = {name: "skipped_existing" for name in derived_tables}
             else:
                 try:
+                    raw_payloads = _load_cached_raw_payloads(
+                        ws=ws,
+                        league=league,
+                        season_int=season_int,
+                        match_ids=match_ids,
+                    )
+                    if match_ids is not None:
+                        fetch_ids = list(match_ids) if live else [
+                            match_id for match_id in match_ids if int(match_id) not in raw_payloads
+                        ]
+                        if fetch_ids:
+                            raw_payloads.update(
+                                _fetch_soccerdata_match_payloads(
+                                    ws=ws,
+                                    league=league,
+                                    season_int=season_int,
+                                    match_ids=fetch_ids,
+                                    live=live,
+                                    retry_missing=retry_missing,
+                                    on_error=on_error,
+                                )
+                            )
+                    use_cached_payloads = bool(raw_payloads) and match_ids is not None and not live and all(
+                        int(match_id) in raw_payloads for match_id in match_ids
+                    )
+                    if match_ids is not None and all(
+                        int(match_id) in raw_payloads for match_id in match_ids
+                    ):
+                        use_cached_payloads = True
                     if events_format == "none":
                         ws.read_events(
                             match_id=match_ids,
@@ -1990,22 +2187,27 @@ def scrape_one(
                         )
                         summary["events"] = "cached_only"
                     else:
-                        normalized = ws.read_events(
-                            match_id=match_ids,
-                            force_cache=force_cache,
-                            live=live,
-                            output_fmt="events",
-                            retry_missing=retry_missing,
-                            on_error=on_error,
-                        )
-                        normalized_df = normalized if isinstance(normalized, pd.DataFrame) else pd.DataFrame()
-                        if normalized_df.empty:
-                            raw_payloads = _load_cached_raw_payloads(
-                                ws=ws,
-                                league=league,
-                                season_int=season_int,
-                                match_ids=match_ids,
+                        normalized_df = pd.DataFrame()
+                        if not use_cached_payloads:
+                            normalized = ws.read_events(
+                                match_id=match_ids,
+                                force_cache=force_cache,
+                                live=live,
+                                output_fmt="events",
+                                retry_missing=retry_missing,
+                                on_error=on_error,
                             )
+                            normalized_df = (
+                                normalized if isinstance(normalized, pd.DataFrame) else pd.DataFrame()
+                            )
+                        if normalized_df.empty:
+                            if not use_cached_payloads:
+                                raw_payloads = _load_cached_raw_payloads(
+                                    ws=ws,
+                                    league=league,
+                                    season_int=season_int,
+                                    match_ids=match_ids,
+                                )
                             schedule_lookup = _build_schedule_lookup(schedule_support)
                             parts = [
                                 _normalize_events_from_payload(
@@ -2037,12 +2239,13 @@ def scrape_one(
                             extra_df = _normalize(extra_df, league, season_int)
                             safe_write(extra_df, extra_events_path)
 
-                    raw_payloads = _load_cached_raw_payloads(
-                        ws=ws,
-                        league=league,
-                        season_int=season_int,
-                        match_ids=match_ids,
-                    )
+                    if not raw_payloads:
+                        raw_payloads = _load_cached_raw_payloads(
+                            ws=ws,
+                            league=league,
+                            season_int=season_int,
+                            match_ids=match_ids,
+                        )
                     if archive_raw_events and raw_match_dir_layout == "per-match":
                         _archive_raw_payloads(raw_dir, raw_payloads)
                         summary["raw_archive"] = "scraped_ok"
@@ -2059,6 +2262,20 @@ def scrape_one(
                         )
                         _write_derived_tables(derived_dir, derived_outputs)
                         summary["derived"] = {name: "scraped_ok" for name in derived_tables}
+
+                    stats_outputs = build_match_stats_tables(
+                        payloads=raw_payloads,
+                        report_blobs={},
+                        schedule_df=schedule_support,
+                        league=league,
+                        season_int=season_int,
+                        stats_mode=stats_mode,
+                    )
+                    _write_stats_tables(stats_dir, stats_outputs)
+                    summary["stats"] = {
+                        name: ("scraped_ok" if not df.empty else "schema_only")
+                        for name, df in stats_outputs.items()
+                    }
                     polite_sleep(delay)
                 except Exception as e:
                     log.warning(
@@ -2085,6 +2302,13 @@ def scrape_one(
                         safe_write(empty, derived_dir / name)
                     summary["events"] = "schema_only"
                     summary["derived"] = {name: "schema_only" for name in derived_tables}
+                    empty_stats = {
+                        "team_match_stats": _schema_only_team_match_stats(),
+                        "player_match_stats": _schema_only_player_match_stats(),
+                        "match_fact_stats": _schema_only_match_fact_stats(),
+                    }
+                    _write_stats_tables(stats_dir, empty_stats)
+                    summary["stats"] = {name: "schema_only" for name in empty_stats}
 
     finally:
         try:
@@ -2233,6 +2457,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional limit for matches per league-season, useful for safe testing.",
     )
     p.add_argument("--match-ids", action="append", help="Match IDs (comma-separated ok).")
+    p.add_argument(
+        "--completed-only",
+        action="store_true",
+        help="Scrape only completed matches inferred from the saved schedule.",
+    )
     p.add_argument("--delay", type=float, default=0.75)
     p.add_argument("--proxy", default=None, help="e.g. 'tor' or http://user:pass@host:port")
     p.add_argument("--no-cache", action="store_true")
@@ -2305,6 +2534,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
     match_ids_raw = _parse_list(args.match_ids)
     match_ids = [int(x) for x in match_ids_raw] if match_ids_raw else None
+    if args.completed_only and match_ids is not None:
+        raise SystemExit("--completed-only and --match-ids are mutually exclusive.")
     derived_tables = [] if args.no_derived_tables else list(args.derived_tables)
 
     out_base = Path(args.out_dir)
@@ -2334,6 +2565,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         seasons = seasons_frame.index.get_level_values("season").astype(str).unique().tolist()
         log.info("Resolved seasons for %s: %s", league, seasons)
         for s in seasons:
+            output_season = (
+                _to_ws_season_int(s)
+                if args.backend == "native"
+                else _soccerdata_season_start(s)
+            )
+            selected_match_ids = match_ids
+            if args.completed_only:
+                schedule_path = out_base / "WhoScored" / league / _raw_season_folder(output_season) / "ws_schedule"
+                selected_match_ids = _completed_match_ids(
+                    _read_saved_schedule(out_base, league, output_season)
+                )
+                if not selected_match_ids:
+                    raise RuntimeError(
+                        f"No completed matches found in {schedule_path.with_suffix('.csv')}"
+                    )
+                log.info("Selected %d completed match(es)", len(selected_match_ids))
             season_frame = seasons_frame[
                 seasons_frame.index.get_level_values("season").astype(str) == str(s)
             ].copy()
@@ -2349,7 +2596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     headless=args.headless,
                     tables=args.tables,
                     events_format=args.events_format,
-                    match_ids=match_ids,
+                    match_ids=selected_match_ids,
                     skip_existing=args.skip_existing,
                     derived_tables=derived_tables,
                     archive_raw_events=args.archive_raw_events and "events" in args.tables,
@@ -2374,7 +2621,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     headless=args.headless,
                     tables=args.tables,
                     events_format=args.events_format,
-                    match_ids=match_ids,
+                    match_ids=selected_match_ids,
                     skip_existing=args.skip_existing,
                     live=args.live,
                     retry_missing=args.retry_missing,
@@ -2382,13 +2629,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     derived_tables=derived_tables,
                     archive_raw_events=args.archive_raw_events and "events" in args.tables,
                     raw_match_dir_layout=args.raw_match_dir_layout,
+                    stats_mode=args.stats_mode,
                     seasons_frame=season_frame,
                 )
 
             job = ScrapeJobId(
                 scraper="whoscored_match",
                 league=league,
-                season=str(_to_ws_season_int(s)),
+                season=str(output_season),
                 levels="tables",
             )
             run_info = {

@@ -441,6 +441,14 @@ def _provider_id(value: Any) -> str:
 
 def normalize_season(value: str) -> tuple[str, str]:
     text = str(value).strip()
+    compact_match = re.fullmatch(r"(\d{2})(\d{2})", text)
+    if compact_match and compact_match.group(1) != "20":
+        start = 2000 + int(compact_match.group(1))
+        end = 2000 + int(compact_match.group(2))
+        if end != start + 1:
+            raise ValueError(f"Expected a split-year domestic season, got {value!r}")
+        return f"{start:04d}-{end:04d}", str(start)
+
     match = re.fullmatch(r"(\d{4})(?:[-/](\d{2}|\d{4}))?", text)
     if not match:
         raise ValueError(f"Unsupported season value: {value!r}")
@@ -455,6 +463,23 @@ def normalize_season(value: str) -> tuple[str, str]:
     if end != start + 1:
         raise ValueError(f"Expected a split-year domestic season, got {value!r}")
     return f"{start:04d}-{end:04d}", provider
+
+
+def _raw_season_directory_names(provider_season: str) -> list[str]:
+    start = int(provider_season)
+    compact = f"{start % 100:02d}{(start + 1) % 100:02d}"
+    # Compact codes through 2021 collide with legacy start-year directory names.
+    return [compact, provider_season] if start >= 2021 else [provider_season]
+
+
+def _resolve_raw_season_dir(raw_root: Path, league: str, provider_season: str) -> Path:
+    league_dir = raw_root / "WhoScored" / league
+    candidates = [league_dir / name for name in _raw_season_directory_names(provider_season)]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    expected = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"WhoScored raw season directory not found; checked: {expected}")
 
 
 def _load_json(path: Path) -> Any:
@@ -2602,9 +2627,7 @@ def clean_whoscored_season(
     force: bool = False,
 ) -> CleanResult:
     canonical_season, provider_season = normalize_season(season)
-    source_dir = raw_root / "WhoScored" / league / provider_season
-    if not source_dir.is_dir():
-        raise FileNotFoundError(source_dir)
+    source_dir = _resolve_raw_season_dir(raw_root, league, provider_season)
     output_dir = out_root / league / canonical_season
     if output_dir.exists() and any(output_dir.rglob("*.csv")) and not force:
         raise FileExistsError(f"WhoScored output already exists at {output_dir}; pass --force to replace tables.")
@@ -3019,6 +3042,7 @@ def clean_whoscored_season(
         "league": league,
         "season": canonical_season,
         "provider_season": provider_season,
+        "raw_season_folder": source_dir.name,
         "source_dir": str(source_dir),
         "output_dir": str(output_dir),
         "official_fpl_positions_path": str(official_fpl_path),

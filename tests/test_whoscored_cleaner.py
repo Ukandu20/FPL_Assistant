@@ -15,6 +15,7 @@ from fpl_assistant.providers.whoscored.clean.whoscored_cleaner import (
     _player_resolution,
     _pivot_stats,
     _resolve_player_positions,
+    _resolve_raw_season_dir,
     _season_table,
     _set_piece_roles,
     normalize_season,
@@ -42,6 +43,24 @@ IDENTITY_COLUMNS = [
 def test_normalize_whoscored_split_season():
     assert normalize_season("2025") == ("2025-2026", "2025")
     assert normalize_season("2025-2026") == ("2025-2026", "2025")
+    assert normalize_season("2627") == ("2026-2027", "2026")
+
+
+def test_raw_season_directory_prefers_compact_name(tmp_path: Path):
+    league_dir = tmp_path / "WhoScored" / "ENG-Premier League"
+    legacy = league_dir / "2026"
+    compact = league_dir / "2627"
+    legacy.mkdir(parents=True)
+    compact.mkdir()
+
+    assert _resolve_raw_season_dir(tmp_path, "ENG-Premier League", "2026") == compact
+
+
+def test_raw_season_directory_falls_back_to_legacy_name(tmp_path: Path):
+    legacy = tmp_path / "WhoScored" / "ENG-Premier League" / "2026"
+    legacy.mkdir(parents=True)
+
+    assert _resolve_raw_season_dir(tmp_path, "ENG-Premier League", "2026") == legacy
 
 
 def test_team_stat_pivot_preserves_text_metadata_without_suffix_columns():
