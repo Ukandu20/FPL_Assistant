@@ -112,6 +112,69 @@ def test_modern_sources_leave_unmatched_active_players_null():
     assert audit["incomplete_active_count"] == 1
 
 
+def test_modern_sources_use_official_fpl_metric_fallbacks():
+    tmp_path = _case_dir("modern_official_fallback")
+    whoscored_root = tmp_path / "whoscored"
+    understat_root = tmp_path / "understat"
+    season = "2026-2027"
+    _write_csv(
+        whoscored_root / LEAGUE / season / "player_season" / "defense.csv",
+        [
+            {
+                "player_id": "alex",
+                "blocks": 1,
+                "interceptions": 1,
+                "clearances": 0,
+                "tackles_won": 2,
+                "recoveries": 6,
+            }
+        ],
+    )
+    _write_csv(
+        understat_root / LEAGUE / season / "player_season.csv",
+        [{"player_id": "alex", "xg": 0.0, "xa": None}],
+    )
+    players = pd.DataFrame(
+        [
+            {
+                "player_id": "alex",
+                "name": "Alex",
+                "team": "BOU",
+                "fpl_pos": "MID",
+                "minutes": 90,
+                "expected_goals": 0.01,
+                "expected_assists": 0.01,
+                "defensive_contribution": 11,
+            },
+            {
+                "player_id": "pedro",
+                "name": "Pedro",
+                "team": "CHE",
+                "fpl_pos": "FWD",
+                "minutes": 90,
+                "expected_goals": 0.63,
+                "expected_assists": 0.06,
+                "defensive_contribution": 3,
+            },
+        ]
+    )
+
+    result, _ = enrich_player_season_stats(
+        players,
+        season,
+        LEAGUE,
+        whoscored_root=whoscored_root,
+        understat_root=understat_root,
+    )
+
+    assert result.loc[0, ["xg", "xa", "defcon"]].tolist() == [0.0, 0.01, 11]
+    assert result.loc[1, ["xg", "xa", "defcon"]].tolist() == [0.63, 0.06, 3]
+    assert result.loc[1, "expected_stats_source"] == "fpl.official.expected_metrics"
+    assert result.loc[1, "defensive_stats_source"] == (
+        "fpl.official.defensive_contribution"
+    )
+
+
 def test_future_season_without_provider_files_remains_unavailable():
     tmp_path = _case_dir("future_missing")
     players = pd.DataFrame(
@@ -312,6 +375,40 @@ def test_duplicate_provider_keys_fail_instead_of_multiplying_rows():
             LEAGUE,
             fbref_root=fbref_root,
         )
+
+
+def test_unresolved_provider_keys_do_not_block_valid_player_matches():
+    tmp_path = _case_dir("unresolved_provider_keys")
+    understat_root = tmp_path / "understat"
+    season = "2026-2027"
+    _write_csv(
+        understat_root / LEAGUE / season / "player_season.csv",
+        [
+            {"player_id": "p1", "xg": 1.2, "xa": 0.4},
+            {"player_id": None, "xg": 0.0, "xa": 0.0},
+            {"player_id": None, "xg": 0.0, "xa": 0.0},
+        ],
+    )
+
+    result, audit = enrich_player_season_stats(
+        pd.DataFrame(
+            [
+                {
+                    "player_id": "p1",
+                    "name": "Player",
+                    "team": "ARS",
+                    "fpl_pos": "MID",
+                    "minutes": 90,
+                }
+            ]
+        ),
+        season,
+        LEAGUE,
+        understat_root=understat_root,
+    )
+
+    assert result.loc[0, ["xg", "xa"]].tolist() == [1.2, 0.4]
+    assert audit["matched_rows"]["expected"] == 1
 
 
 def test_stats_only_backfill_writes_audit_and_preserves_roster_count():

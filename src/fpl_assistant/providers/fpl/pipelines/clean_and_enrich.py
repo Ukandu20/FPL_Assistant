@@ -42,6 +42,7 @@ FPL_POS_ALIASES = {
 FPL_TO_FBREF_POS = {"GKP": "GK", "DEF": "DF", "MID": "MF", "FWD": "FW"}
 SEASON_CUMULATIVE_COLUMNS = {
     "assists", "bonus", "bps", "clean_sheets", "creativity",
+    "defensive_contribution",
     "expected_assists", "expected_goal_involvements", "expected_goals",
     "expected_goals_conceded", "goals_conceded", "goals_scored",
     "ict_index", "influence", "minutes", "own_goals", "penalties_missed",
@@ -234,8 +235,11 @@ def attach_fpl_context(df: pd.DataFrame, season_dir: Path) -> pd.DataFrame:
             "news",
             "code",
             "opta_code",
+            "expected_goals",
+            "expected_assists",
+            "defensive_contribution",
         )
-        if c in players.columns
+        if c in players.columns and c not in df.columns
     ]
     context = players[
         ["first_name", "second_name", "id", "team", "element_type", *optional]
@@ -351,6 +355,15 @@ def _source_lookup(
         if column == "team":
             prepared[column] = prepared[column].str.upper()
 
+    valid_keys = prepared[key_columns].notna().all(axis=1)
+    invalid_key_count = int((~valid_keys).sum())
+    if invalid_key_count:
+        logging.warning(
+            "%s: ignoring %d row(s) with unresolved join keys",
+            source_name,
+            invalid_key_count,
+        )
+    prepared = prepared.loc[valid_keys].copy()
     duplicate_mask = prepared.duplicated(key_columns, keep=False)
     duplicate_keys = (
         prepared.loc[duplicate_mask, key_columns]
@@ -366,8 +379,6 @@ def _source_lookup(
     lookup: Dict[tuple, dict] = {}
     for record in prepared.to_dict("records"):
         key = tuple(record[column] for column in key_columns)
-        if any(value is None for value in key):
-            continue
         lookup[key] = {
             output: pd.to_numeric(record[source_column], errors="coerce")
             for source_column, output in metric_mapping.items()
@@ -710,11 +721,38 @@ def enrich_player_season_stats(
             "derived.zero_minutes"
         )
 
+    official_xg = pd.to_numeric(
+        result.get("expected_goals", pd.Series(index=result.index, dtype="float64")),
+        errors="coerce",
+    )
+    official_xa = pd.to_numeric(
+        result.get("expected_assists", pd.Series(index=result.index, dtype="float64")),
+        errors="coerce",
+    )
+    expected_fallback = result["xg"].isna() & official_xg.notna()
+    expected_fallback |= result["xa"].isna() & official_xa.notna()
+    result["xg"] = result["xg"].combine_first(official_xg)
+    result["xa"] = result["xa"].combine_first(official_xa)
+    result.loc[expected_fallback, "expected_stats_source"] = (
+        "fpl.official.expected_metrics"
+    )
+
     base_defcon = result[base_defcon_columns].sum(axis=1, min_count=4)
     midfield_forward = normalized_positions.isin(["MID", "FWD"])
     result["defcon"] = base_defcon
     result.loc[midfield_forward, "defcon"] = (
         base_defcon + result["recoveries"]
+    )
+    official_defcon = pd.to_numeric(
+        result.get(
+            "defensive_contribution",
+            pd.Series(index=result.index, dtype="float64"),
+        ),
+        errors="coerce",
+    )
+    result["defcon"] = official_defcon.combine_first(result["defcon"])
+    result.loc[official_defcon.notna(), "defensive_stats_source"] = (
+        "fpl.official.defensive_contribution"
     )
     defense_complete = result[base_defcon_columns].notna().all(axis=1) & (
         ~midfield_forward | result["recoveries"].notna()

@@ -442,6 +442,31 @@ def clean_gw_df(df: pd.DataFrame,
     team_hex_from_code = team_code_from_name.map(lambda c: code2hex.get(c) if isinstance(c, str) else None)
     team_hex = team_hex_from_name.fillna(team_hex_from_code)
 
+    # The season roster is keyed by the immutable FPL element ID and already
+    # carries canonical team identity. Use it when name/code registries are
+    # incomplete or ambiguous for a newly promoted team.
+    if element_roster and "element" in df.columns:
+        element_keys = pd.to_numeric(df["element"], errors="coerce").astype("Int64")
+
+        def roster_value(element: object, *columns: str) -> object:
+            if pd.isna(element):
+                return None
+            record = element_roster.get(int(element), {})
+            for column in columns:
+                value = record.get(column)
+                if pd.notna(value) and str(value).strip():
+                    return value
+            return None
+
+        roster_team_code = element_keys.map(
+            lambda element: roster_value(element, "team", "fpl_team")
+        )
+        roster_team_id = element_keys.map(
+            lambda element: roster_value(element, "team_id")
+        )
+        team_code_from_name = team_code_from_name.fillna(roster_team_code)
+        team_hex = team_hex.fillna(roster_team_id)
+
     # --- map OPPONENT by NUMERIC first, then by NAME, then by CODE-like strings
     def _safe_map(series, mapping):
         return series.map(lambda i: mapping.get(int(i)) if pd.notna(i) and int(i) in mapping else None)

@@ -96,3 +96,47 @@ def test_official_gw_position_beats_a_later_registry_position():
     )
 
     assert cleaned.loc[0, "fpl_pos"] == "MID"
+
+
+def test_official_element_roster_fills_missing_canonical_team_id():
+    source = pd.DataFrame(
+        [{
+            "element": 607,
+            "name": "Luka Lynch",
+            "team": "Coventry",
+            "opponent_team": 1,
+            "was_home": False,
+            "round": 1,
+            "fixture": 1,
+        }]
+    )
+    element_roster = {
+        607: {
+            "player_id": "40e4fe8b",
+            "name": "Luka Lynch",
+            "team": "COV",
+            "team_id": "ce4d980327c7",
+            "fpl_pos": "MID",
+        }
+    }
+
+    cleaned, unmatched, _ = clean_gw_df(
+        source,
+        "2026-2027",
+        {},
+        {},
+        {},
+        {1: "Arsenal"},
+        {1: "ARS"},
+        {1: "1dd1f33c"},
+        {"coventry": "COV", "arsenal": "ARS"},
+        {"arsenal": "1dd1f33c"},
+        {"ARS": "1dd1f33c"},
+        1,
+        element_roster,
+    )
+
+    assert unmatched == []
+    assert cleaned.loc[0, "team_code"] == "COV"
+    assert cleaned.loc[0, "team_id"] == "ce4d980327c7"
+    assert cleaned.loc[0, "away_id"] == "ce4d980327c7"
