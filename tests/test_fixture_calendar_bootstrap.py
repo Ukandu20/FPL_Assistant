@@ -3,6 +3,8 @@ import json
 import pandas as pd
 
 from fpl_assistant.providers.fbref.integrate.fixtures_meta_builder import (
+    _fixture_finished_mask,
+    _observed_match_mask,
     build_bootstrap_fixture_calendar,
 )
 from fpl_assistant.canonical.identity import stable_canonical_id
@@ -76,3 +78,41 @@ def test_bootstrap_calendar_uses_only_fpl_and_stable_team_pair_identity():
     )
     rerun = pd.read_csv(out_root / "2026-2027" / "fixture_calendar.csv")
     assert rerun.loc[0, "match_id"] == first_match_id
+
+
+def test_observed_match_mask_ignores_provisional_schedule_rows():
+    rows = pd.DataFrame(
+        [
+            {
+                "is_result": False,
+                "has_data": False,
+                "team_goals": None,
+                "opp_goals": None,
+                "team_xg": None,
+                "opp_xg": None,
+            },
+            {
+                "is_result": True,
+                "has_data": True,
+                "team_goals": 2,
+                "opp_goals": 1,
+                "team_xg": 1.7,
+                "opp_xg": 0.8,
+            },
+        ]
+    )
+
+    assert _observed_match_mask(rows).tolist() == [False, True]
+
+
+def test_fixture_finished_mask_accepts_provisional_and_elapsed_matches():
+    fixtures = pd.DataFrame(
+        {
+            "finished": [False, False, False],
+            "finished_provisional": [True, False, False],
+            "started": [True, True, False],
+            "minutes": [90, 90, 0],
+        }
+    )
+
+    assert _fixture_finished_mask(fixtures).tolist() == [True, True, False]

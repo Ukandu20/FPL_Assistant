@@ -663,6 +663,13 @@ def expand_player_fixture_calendar(
     completed = status.isin(FINISHED_STATUSES) | output.get(
         "date_played", pd.Series("", index=output.index)
     ).astype(str).ne("")
+    if {"team_h_score", "team_a_score"}.issubset(fpl_keyed.columns):
+        home_score = pd.to_numeric(fpl_keyed["team_h_score"], errors="coerce")
+        away_score = pd.to_numeric(fpl_keyed["team_a_score"], errors="coerce")
+        completed |= pd.Series(
+            home_score.notna().to_numpy() & away_score.notna().to_numpy(),
+            index=output.index,
+        )
     output["minutes"] = pd.to_numeric(output.get("minutes"), errors="coerce")
     minutes = output["minutes"]
     output.loc[~completed, "minutes"] = pd.NA

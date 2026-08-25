@@ -75,6 +75,19 @@ def _to_bool_mask(s: pd.Series) -> pd.Series:
     tokens_true = {"1","1.0","true","t","yes","y"}
     return s.astype(str).str.strip().str.lower().isin(tokens_true)
 
+
+def _fixture_finished_mask(fixtures: pd.DataFrame) -> pd.Series:
+    """Recognize finalized and provisionally completed FPL fixtures."""
+    finished = pd.Series(False, index=fixtures.index)
+    for column in ("finished", "finished_provisional"):
+        if column in fixtures:
+            finished |= _to_bool_mask(fixtures[column])
+    if {"started", "minutes"}.issubset(fixtures.columns):
+        finished |= _to_bool_mask(fixtures["started"]) & pd.to_numeric(
+            fixtures["minutes"], errors="coerce"
+        ).ge(90)
+    return finished
+
 def _venue_to_is_home_int8(venue: pd.Series) -> pd.Series:
     """Map FBref venue → is_home:Int8 (1=home, 0=away, <NA>=neutral/unknown)."""
     v = venue.astype(str).str.strip().str.lower()
@@ -86,6 +99,22 @@ def _venue_to_is_home_int8(venue: pd.Series) -> pd.Series:
 def _naeq(a: pd.Series, b: pd.Series) -> pd.Series:
     """NA-safe equality: True if equal OR both NA."""
     return (a == b) | (a.isna() & b.isna())
+
+
+def _observed_match_mask(frame: pd.DataFrame) -> pd.Series:
+    """Identify rows backed by a played result, not a provisional schedule."""
+    observed = pd.Series(False, index=frame.index)
+    for column in ("is_result", "has_data"):
+        if column in frame.columns:
+            observed |= _to_bool_mask(frame[column])
+    result_columns = [
+        column
+        for column in ("team_goals", "opp_goals", "team_xg", "opp_xg")
+        if column in frame.columns
+    ]
+    if result_columns:
+        observed |= frame[result_columns].notna().any(axis=1)
+    return observed
 
 def read_fixture_calendar(out_dir: Path, season: str) -> pd.DataFrame:
     fp = out_dir / season / "fixture_calendar.csv"
@@ -122,6 +151,7 @@ def build_bootstrap_fixture_calendar(
 
     _, _, code2hex = build_maps(load_json(team_map_fp), load_json(short_map_fp))
     fixtures = pd.read_csv(fpl_csv, parse_dates=["kickoff_time"])
+    fixtures["is_finished_app"] = _fixture_finished_mask(fixtures)
     teams = pd.read_csv(teams_csv)
     required_fixtures = {"id", "event", "kickoff_time", "team_h", "team_a"}
     required_teams = {"id", "name", "short_name"}
@@ -165,7 +195,7 @@ def build_bootstrap_fixture_calendar(
         )
         kickoff = pd.to_datetime(fixture.kickoff_time, utc=True, errors="coerce")
         date_sched = kickoff.tz_convert(None).floor("D") if pd.notna(kickoff) else pd.NaT
-        status = "finished" if bool(getattr(fixture, "finished", False)) else "scheduled"
+        status = "finished" if bool(fixture.is_finished_app) else "scheduled"
         base = {
             "fpl_id": fixture.id,
             "match_id": match_id,
@@ -421,7 +451,9 @@ def build_fixture_calendar(
         columns={"id": "fpl_id", "event": "gw_orig", "team_h": "home_id_fpl", "team_a": "away_id_fpl"}
     )
     fpl["_fpl_row"]   = np.arange(len(fpl), dtype=np.int64)
-    fpl["status"]     = np.where(fpl.get("finished", False), "finished", "scheduled")
+    fpl["status"]     = np.where(
+        _fixture_finished_mask(fpl), "finished", "scheduled"
+    )
     fpl["date_sched"] = normalise_date(fpl["kickoff_time"])
     fpl["sched_missing"] = 1  # will be corrected after joining
 
@@ -495,12 +527,16 @@ def build_fixture_calendar(
                 len(provider_ids),
             )
 
-    metrics = und[
-        join_key + [
-            "opp_id", "team_goals", "opp_goals", "team_xg", "opp_xg",
-            "result", "game_date",
-        ]
-    ].rename(columns={"game_date": "_understat_game_date"})
+    metric_columns = [
+        "opp_id", "team_goals", "opp_goals", "team_xg", "opp_xg",
+        "result", "game_date",
+    ]
+    metric_columns.extend(
+        column for column in ("is_result", "has_data") if column in und.columns
+    )
+    metrics = und[join_key + metric_columns].rename(
+        columns={"game_date": "_understat_game_date"}
+    )
     fb = ws.merge(metrics, on=join_key, how="left", validate="one_to_one")
 
     missing_metrics = fb["opp_id"].isna()
@@ -518,11 +554,20 @@ def build_fixture_calendar(
 
     ws_dates = normalise_date(fb["game_date"])
     und_dates = normalise_date(fb["_understat_game_date"])
-    date_conflicts = ws_dates.notna() & und_dates.notna() & ws_dates.ne(und_dates)
+    all_date_conflicts = ws_dates.notna() & und_dates.notna() & ws_dates.ne(und_dates)
+    observed_rows = _observed_match_mask(fb)
+    date_conflicts = all_date_conflicts & observed_rows
     if date_conflicts.any():
         raise ValueError(
             "WhoScored/Understat game dates conflict on "
             f"{int(date_conflicts.sum())} rows"
+        )
+    provisional_conflicts = all_date_conflicts & ~observed_rows
+    if provisional_conflicts.any():
+        logging.info(
+            "%s • allowing %d provisional WhoScored/Understat date conflicts",
+            season,
+            int(provisional_conflicts.sum()),
         )
     fb["date_played"] = ws_dates.fillna(und_dates)
     fb["is_away"] = (~_to_bool_mask(fb["is_home"])).astype("Int8")

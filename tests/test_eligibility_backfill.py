@@ -153,6 +153,49 @@ def test_pending_preseason_rows_keep_unknown_minutes_and_apply_snapshot_status()
     assert audit["pending_rows"] == 2
 
 
+def test_official_fpl_scores_mark_lagging_scheduled_fixture_as_completed():
+    fixtures = _fixtures(status="scheduled").iloc[:2].copy()
+    universe = pd.DataFrame(
+        [
+            {
+                "_fixture_key": "1",
+                "fixture": 1,
+                "player_id": player_id,
+                "team_id": "ars",
+                "name": name,
+                "position": "MF",
+                "minutes": minutes,
+                "starts": int(minutes > 0),
+                "team_h_score": 3,
+                "team_a_score": 0,
+            }
+            for player_id, name, minutes in (
+                ("p1", "Starter", 90),
+                ("p2", "Eligible DNP", 0),
+            )
+        ]
+    )
+
+    panel, audit = expand_player_fixture_calendar(
+        "2026-2027",
+        fixtures=fixtures,
+        universe=universe,
+        observed=pd.DataFrame(),
+        availability=None,
+        information_timestamp="2026-08-25T00:00:00Z",
+        eligibility_source="fpl_merged_gws_retrospective",
+        timestamp_safe=False,
+    )
+
+    assert panel.set_index("player_id")["observation_status"].to_dict() == {
+        "p1": "played",
+        "p2": "not_in_matchday_squad",
+    }
+    assert audit["played_rows"] == 1
+    assert audit["not_in_matchday_squad_rows"] == 1
+    assert audit["pending_rows"] == 0
+
+
 def test_effective_membership_splits_when_team_fixture_sequence_has_a_gap():
     fixtures = _fixtures()
     panel = pd.DataFrame(
