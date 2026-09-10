@@ -2,7 +2,7 @@ import json
 
 import pandas as pd
 
-from fpl_assistant.providers.fbref.integrate.fixtures_meta_builder import (
+from fpl_assistant.pipelines.integrate.fixtures_meta_builder import (
     _fixture_finished_mask,
     _observed_match_mask,
     build_bootstrap_fixture_calendar,

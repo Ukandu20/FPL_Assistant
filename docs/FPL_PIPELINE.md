@@ -25,12 +25,10 @@ files only.
 
 ## Complete cleaning suite
 
-The maintained FPL entry points live under `fpl_assistant.providers.fpl`. The
-similarly named modules under `scripts/fpl_pipeline` are legacy compatibility
-copies and should not be used in new jobs. Canonical fixture bootstrapping is a
-cross-provider integration command and therefore lives under
-`fpl_assistant.providers.fbref.integrate` despite reading only FPL inputs in
-bootstrap mode.
+The maintained FPL entry points live under `fpl_assistant.providers.fpl`.
+Canonical fixture bootstrapping and combined player/team features live under
+`fpl_assistant.pipelines.integrate`. Run package commands from the repository
+root after installing with `python -m pip install -e .`.
 
 The complete sequence is:
 
@@ -38,7 +36,7 @@ The complete sequence is:
    player history, and available gameweek data into the league-scoped raw tree.
 2. `pipelines.clean_and_enrich`: attach official FPL context, resolve canonical
    player/team IDs, and publish the season roster.
-3. `fbref.integrate.fixtures_meta_builder --bootstrap`: publish the canonical
+3. `fpl_assistant.pipelines.integrate.fixtures_meta_builder --bootstrap`: publish the canonical
    fixture calendar directly from the official FPL teams and fixtures. This
    mode does not require cleaned FBref, WhoScored, or Understat data.
 4. `clean.gw_stats_cleaner`: clean individual and merged gameweek rows and
@@ -236,7 +234,7 @@ scraped. Bootstrap mode reads only FPL inputs; it does not depend on cleaned
 WhoScored, Understat, or FBref schedules.
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+python -m fpl_assistant.pipelines.integrate.fixtures_meta_builder `
   --bootstrap `
   --league "ENG-Premier League" `
   --season "2026-2027" `
@@ -310,6 +308,37 @@ This writes
 `data/processed/clubelo/ENG-Premier League/2026-2027/schedule.csv` with dynamic
 pre-match Elo fields and season-frozen preseason Elo fields.
 
+### Scrape and clean Understat data
+
+Run these commands from the project root (`C:\dev\FPL_Assistant`). Scrape
+Understat before cleaning its data for downstream FPL enrichment:
+
+```powershell
+python -m fpl_assistant.providers.understat.scrape.understat_stats_scraper `
+  --league EPL `
+  --seasons 2026 `
+  --verbose
+```
+
+`2026` selects the 2026-2027 season. Use `--seasons 2023 2024 2025 2026`
+for multiple seasons, or omit `--seasons` to discover seasons from Understat.
+Add `--no-cache` to fetch fresh data. Raw output defaults to
+`data/raw/understat`.
+
+Then clean the downloaded season:
+
+```powershell
+python -m fpl_assistant.providers.understat.clean.clean_understat_raw `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --fpl-root "data/processed/fpl/ENG-Premier League" `
+  --verbose
+```
+
+Omit `--season` from the cleaner command to clean all discovered seasons.
+The cleaner reads `data/raw/understat` and writes to
+`data/processed/understat` by default.
+
 ## 4. Clean gameweek data
 
 Run this after at least one gameweek file exists:
@@ -343,6 +372,7 @@ python -m fpl_assistant.providers.fpl.pipelines.eligibility_backfill `
   --raw-fpl-root "data/raw/fpl/ENG-Premier League" `
   --fixtures-root "data/processed/registry/fixtures" `
   --registry-root "data/processed/registry" `
+  --understat-root "data/processed/understat/ENG-Premier League" `
   --season "2026-2027" `
   --force `
   --log-level INFO
@@ -352,6 +382,16 @@ Historical zero-minute FPL observations become explicit DNP rows. A preseason
 season such as 2026-2027 instead receives pending roster-by-fixture rows with
 null minutes. The command also publishes effective-dated eligibility,
 availability history, fixture schedule snapshots, and reconstruction audits.
+The provider calendar builder writes only `player_fixture_calendar_observed.csv`;
+this eligibility stage is the sole writer of the expanded
+`player_fixture_calendar.csv`, so a forced provider rebuild cannot temporarily
+replace the modelling registry.
+
+In the expanded player calendar, fixture context is explicitly named
+`team_gf`, `team_ga`, `team_xg`, and `team_xga`. Player outcomes and attacking
+evidence use `goals`, `assists`, `xg`, and `xa`; the latter fields are joined
+from canonical Understat player-match rows when available. `gls` and `ast`
+remain compatibility aliases for existing model code.
 See [FPL_ELIGIBILITY_BACKFILL.md](FPL_ELIGIBILITY_BACKFILL.md) for the data and
 timestamp-safety contract.
 

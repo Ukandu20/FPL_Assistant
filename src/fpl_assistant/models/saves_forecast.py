@@ -19,7 +19,7 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 
-from scripts.utils.validate import validate_df
+from fpl_assistant.utils.validate import validate_df
 
 # ----------------------------- tiny utils ------------------------------------
 

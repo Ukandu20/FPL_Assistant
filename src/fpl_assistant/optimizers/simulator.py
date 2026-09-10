@@ -15,7 +15,7 @@ Output schema (per row; consumed by mc.py):
 ]
 
 USAGE (single candidate):
-py -m scripts.optimizers.simulator ^
+py -m fpl_assistant.optimizers.simulator ^
   --team-state data/state/team_state.json ^
   --minutes data/predictions/minutes/2025-2026/GW4_6.csv ^
   --goals-assists data/predictions/goals_assists/2025-2026/GW4_6.csv ^
@@ -27,7 +27,7 @@ py -m scripts.optimizers.simulator ^
   --out-format parquet
 
 USAGE (batch: many candidates at once; candidate label inferred from parent dir name):
-py -m scripts.optimizers.simulator ^
+py -m fpl_assistant.optimizers.simulator ^
   --team-state-glob data/state/candidates/*/team_state.json ^
   --candidate-subdir hold ^
   --minutes data/predictions/minutes/2025-2026/GW4_6.csv ^

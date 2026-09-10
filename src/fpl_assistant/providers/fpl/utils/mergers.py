@@ -23,7 +23,7 @@ def clean_players_name_string(df, col='name'):
     #replace _ with space in name column
     df[col] = df[col].str.replace('_', ' ')
     #remove number in name column
-    df[col] = df[col].str.replace('\d+', '')
+    df[col] = df[col].str.replace(r'\d+', '')
     #trim name column
     df[col] = df[col].str.strip()
     return df

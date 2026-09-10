@@ -22,7 +22,7 @@ Key features
 
 CLI (example)
 -------------
-py -m scripts.models.captain_ranker \
+py -m fpl_assistant.models.captain_ranker \
   --xp-csv data/models/expected_points/v1/expected_points.csv \
   --actual-csv data/processed/fpl/2024-2025/gws/merged_gws.csv \
   --season 2024-2025 \

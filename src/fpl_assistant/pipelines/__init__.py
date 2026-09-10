@@ -1,2 +1,2 @@
-"""Pipeline package placeholder for staged migration from scripts.* orchestration."""
+"""End-to-end pipeline orchestration."""
 

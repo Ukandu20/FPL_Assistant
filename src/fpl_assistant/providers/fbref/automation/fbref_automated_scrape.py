@@ -1,4 +1,4 @@
-# scripts/fbref_pipeline/automation/run_fbref_automated_scrapes.py
+# FBref automated scrape jobs
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import List, Literal
 
-from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId
-from scripts.fbref_pipeline.utils.scrape_meta import should_run  # if you moved should_run elsewhere, adjust import
+from fpl_assistant.platform.scrape_runs import ScrapeJobId
+from fpl_assistant.platform.scrape_runs import should_run
 
 META_PATH = Path("data/meta/scraper_runs.json")
 
@@ -53,10 +53,10 @@ JOBS: List[AutoJob] = [
 
 
 def build_command(job: AutoJob) -> List[str]:
-    base = ["py", "-m"]
+    base = [sys.executable, "-m"]
 
     if job.scraper == "match":
-        module = "scripts.fbref_pipeline.scrape.match_stats_scraper"
+        module = "fpl_assistant.providers.fbref.scrape.match_stats_scraper"
         cmd = base + [module]
         cmd += [
             "--league", job.league,
@@ -72,7 +72,7 @@ def build_command(job: AutoJob) -> List[str]:
         return cmd
 
     if job.scraper == "season":
-        module = "scripts.fbref_pipeline.scrape.season_stats_scraper"
+        module = "fpl_assistant.providers.fbref.scrape.season_stats_scraper"
         cmd = base + [module]
         cmd += [
             "--league", job.league,

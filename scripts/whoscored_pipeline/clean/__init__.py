@@ -1,1 +1,0 @@
-"""WhoScored cleaning command wrappers."""

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts.fpl_pipeline.clean.gw_stats_cleaner
+fpl_assistant.providers.fpl.clean.gw_stats_cleaner
 
 Cleans FPL game-week CSVs into per-GW cleaned files + merged_gws.csv and
 emits manual-review assets including a suggestions JSON you can paste into overrides.

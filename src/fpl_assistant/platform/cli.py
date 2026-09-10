@@ -1,4 +1,4 @@
-# scripts/common/cli.py
+# src/fpl_assistant/platform/cli.py
 from __future__ import annotations
 import argparse, sys, os, logging
 from pathlib import Path

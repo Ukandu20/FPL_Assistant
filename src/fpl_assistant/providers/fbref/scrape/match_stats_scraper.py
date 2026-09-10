@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/fbref_pipeline/scrape/match_stats_scraper.py
+# src/fpl_assistant/providers/fbref/scrape/match_stats_scraper.py
 """
 FBref match-level scraper (network-friendly, cache-first)
 
@@ -77,7 +77,7 @@ from .fbref_robust import (
     team_match_from_soccerdata_fallback,
 )
 
-from ..automation.auto_scrape import ScrapeJobId, record_last_run
+from fpl_assistant.platform.scrape_runs import ScrapeJobId, record_last_run
 from fpl_assistant.providers.fbref.capabilities import (
     LEVEL_SUPPLEMENTARY,
     coverage_record,

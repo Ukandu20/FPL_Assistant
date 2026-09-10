@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/clubelo_pipeline/scrape/clubelo_scraper.py
+# src/fpl_assistant/providers/clubelo/scrape/clubelo_scraper.py
 """
 ClubElo scraper (CSV API, cache-first)
 
@@ -33,7 +33,7 @@ except Exception:
     def unidecode(value: str) -> str:
         return value
 
-from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId, record_last_run
+from fpl_assistant.platform.scrape_runs import ScrapeJobId, record_last_run
 
 CLUB_ELO_API = "http://api.clubelo.com"
 DEFAULT_CACHE_DIR = Path("data/_clubelo_cache/ClubElo")

@@ -1,4 +1,4 @@
-from scripts.fpl_pipeline.utils.mergers import *
+from fpl_assistant.providers.fpl.utils.mergers import *
 
 def merge_data():
     """ Merge all the data and export to a new file

@@ -104,7 +104,7 @@ def main(argv=None) -> None:
 
     # 1) MINUTES
     minutes_argv = [
-        py, "-m", "scripts.models.minutes_forecast",
+        py, "-m", "fpl_assistant.models.minutes_forecast",
         "--history-seasons", args.history_seasons,
         "--future-season", args.future_season,
         "--as-of", args.as_of, "--as-of-tz", args.as_of_tz, "--as-of-gw", str(args.as_of_gw),
@@ -127,7 +127,7 @@ def main(argv=None) -> None:
 
     # 2) GOALS & ASSISTS
     ga_argv = [
-        py, "-m", "scripts.models.goals_assists_forecast",
+        py, "-m", "fpl_assistant.models.goals_assists_forecast",
         "--history-seasons", args.history_seasons,
         "--future-season", args.future_season,
         "--as-of", args.as_of, "--as-of-tz", args.as_of_tz, "--as-of-gw", str(args.as_of_gw),
@@ -148,7 +148,7 @@ def main(argv=None) -> None:
 
     # 3) DEFENSE
     defense_argv = [
-        py, "-m", "scripts.models.defense_forecast",
+        py, "-m", "fpl_assistant.models.defense_forecast",
         "--history-seasons", args.history_seasons,
         "--future-season", args.future_season,
         "--as-of", args.as_of, "--as-of-tz", args.as_of_tz, "--as-of-gw", str(args.as_of_gw),
@@ -166,7 +166,7 @@ def main(argv=None) -> None:
 
     # 4) SAVES
     saves_argv = [
-        py, "-m", "scripts.models.saves_forecast",
+        py, "-m", "fpl_assistant.models.saves_forecast",
         "--history-seasons", args.history_seasons,
         "--future-season", args.future_season,
         "--as-of", args.as_of, "--as-of-tz", args.as_of_tz, "--as-of-gw", str(args.as_of_gw),
@@ -186,7 +186,7 @@ def main(argv=None) -> None:
 
     # 5) POINTS (your exact CLI)
     points_argv = [
-        py, "-m", "scripts.models.points_forecast",
+        py, "-m", "fpl_assistant.models.points_forecast",
         "--out-dir", str(points_outdir),
         "--future-season", args.future_season,
         "--as-of-gw", str(args.as_of_gw), "--n-future", str(args.n_future),

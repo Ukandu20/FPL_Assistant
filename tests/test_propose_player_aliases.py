@@ -1,7 +1,7 @@
 import pandas as pd
 
-from scripts.understat_pipeline.clean.clean_understat_raw import build_player_lookup
-from scripts.understat_pipeline.clean.propose_player_aliases import (
+from fpl_assistant.providers.understat.clean.clean_understat_raw import build_player_lookup
+from fpl_assistant.providers.understat.clean.propose_player_aliases import (
     build_lookup_bucket,
     build_review_df,
     propose_for_player,

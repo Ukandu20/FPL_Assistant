@@ -1,4 +1,4 @@
-# scripts/utils/validate.py
+# src/fpl_assistant/utils/validate.py
 from __future__ import annotations
 import re
 from typing import Dict, Any, Iterable, List, Optional

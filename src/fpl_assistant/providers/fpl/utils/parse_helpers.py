@@ -1,6 +1,6 @@
 import csv 
 import os
-from scripts.fpl_pipeline.utils.utility import uprint
+from fpl_assistant.providers.fpl.utils.utility import uprint
 import pandas as pd
 
 def extract_stat_names(dict_of_stats):

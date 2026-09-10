@@ -2151,7 +2151,7 @@ def _build_player_match(
     roster = pd.concat(
         [roster.drop(columns=list(derived_metrics.columns), errors="ignore"), derived_metrics],
         axis=1,
-    )
+    ).copy()
 
     # Minutes from lineup/substitution state, capped at the regulation match duration.
     sub = events[events["type"].isin(["SubstitutionOn", "SubstitutionOff"])].copy()
@@ -2178,7 +2178,12 @@ def _build_player_match(
         "provider_away_team_id", "home", "away", "home_score", "away_score",
         "status",
     ]
-    roster = roster.merge(meta[[c for c in keep if c in meta]], on="provider_match_id", how="left", validate="many_to_one")
+    roster = roster.merge(
+        meta[[c for c in keep if c in meta]],
+        on="provider_match_id",
+        how="left",
+        validate="many_to_one",
+    ).copy()
     roster["opponent_id"] = np.where(roster["team_id"].eq(roster["home_team_id"]), roster["away_team_id"], roster["home_team_id"])
     roster["provider_opponent_team_id"] = np.where(
         roster["provider_team_id"].eq(roster["provider_home_team_id"]),
@@ -2270,6 +2275,7 @@ def _build_team_match(
                     ["provider_match_id", "provider_team_id"], dropna=False
                 )[event_available]
                 .sum(min_count=1)
+                .copy()
                 .reset_index()
                 .rename(
                     columns={metric: f"{metric}_events" for metric in event_available}

@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cmd_minutes(cfg: Dict[str, Any], pybin: str) -> List[str]:
     cmd = [
-        pybin, "-m", "scripts.models.minutes_model_builder",
+        pybin, "-m", "fpl_assistant.models.minutes_model_builder",
         "--seasons", str(cfg["seasons"]),
         "--first-test-gw", str(cfg["first_test_gw"]),
         "--fix-root", str(cfg["fix_root"]),
@@ -215,7 +215,7 @@ def _cmd_minutes(cfg: Dict[str, Any], pybin: str) -> List[str]:
 
 def _cmd_ga(cfg: Dict[str, Any], pybin: str) -> List[str]:
     cmd = [
-        pybin, "-m", "scripts.models.goals_assists_model_builder",
+        pybin, "-m", "fpl_assistant.models.goals_assists_model_builder",
         "--seasons", str(cfg["seasons"]),
         "--first-test-gw", str(cfg["first_test_gw"]),
         "--features-root", str(cfg["features_root"]),
@@ -237,7 +237,7 @@ def _cmd_ga(cfg: Dict[str, Any], pybin: str) -> List[str]:
 
 def _cmd_defense(cfg: Dict[str, Any], pybin: str) -> List[str]:
     cmd = [
-        pybin, "-m", "scripts.models.defense_model_builder",
+        pybin, "-m", "fpl_assistant.models.defense_model_builder",
         "--seasons", str(cfg["seasons"]),
         "--first-test-gw", str(cfg["first_test_gw"]),
         "--features-root", str(cfg["features_root"]),
@@ -261,7 +261,7 @@ def _cmd_defense(cfg: Dict[str, Any], pybin: str) -> List[str]:
 
 def _cmd_saves(cfg: Dict[str, Any], pybin: str) -> List[str]:
     cmd = [
-        pybin, "-m", "scripts.models.saves_model_builder",
+        pybin, "-m", "fpl_assistant.models.saves_model_builder",
         "--seasons", str(cfg["seasons"]),
         "--first-test-gw", str(cfg["first_test_gw"]),
         "--features-root", str(cfg["features_root"]),

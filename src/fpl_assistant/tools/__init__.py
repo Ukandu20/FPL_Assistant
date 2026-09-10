@@ -1,1 +1,1 @@
-"""Package marker for staged scripts copy."""
+"""Package for tools."""

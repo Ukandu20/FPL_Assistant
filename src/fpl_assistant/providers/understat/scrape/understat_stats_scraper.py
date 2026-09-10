@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/understat_pipeline/scrape/understat_stats_scraper.py
+# src/fpl_assistant/providers/understat/scrape/understat_stats_scraper.py
 """
 Understat scraper (API endpoints, cache-first)
 
@@ -28,7 +28,7 @@ import pandas as pd
 import requests
 from requests.exceptions import HTTPError
 
-from scripts.fbref_pipeline.automation.auto_scrape import ScrapeJobId, record_last_run
+from fpl_assistant.platform.scrape_runs import ScrapeJobId, record_last_run
 
 _GLOBAL = {"net_calls": 0}
 

@@ -383,7 +383,7 @@ with tabs[3]:
         st.subheader("Forecasters")
         f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
         if f_col1.button("Minutes"):
-            cmd = [sys.executable, "-m", "scripts.models.minutes_forecast",
+            cmd = [sys.executable, "-m", "fpl_assistant.models.minutes_forecast",
                    "--future-season", season, "--as-of", "now", "--as-of-tz", "Africa/Lagos",
                    "--as-of-gw", str(as_of_gw), "--n-future", str(n_future),
                    "--out-format", "both", "--confirm"]
@@ -392,7 +392,7 @@ with tabs[3]:
             st.toast("Minutes run complete." if rc == 0 else "Minutes run failed.", icon="✅" if rc==0 else "❌")
 
         if f_col2.button("Goals & Assists"):
-            cmd = [sys.executable, "-m", "scripts.models.goals_assists_forecast",
+            cmd = [sys.executable, "-m", "fpl_assistant.models.goals_assists_forecast",
                    "--future-season", season, "--as-of", "now", "--as-of-tz", "Africa/Lagos",
                    "--as-of-gw", str(as_of_gw), "--n-future", str(n_future),
                    "--out-format", "both", "--confirm", "--apply-calibration", "--skip-gk"]
@@ -401,7 +401,7 @@ with tabs[3]:
             st.toast("GA run complete." if rc == 0 else "GA run failed.", icon="✅" if rc==0 else "❌")
 
         if f_col3.button("Defense"):
-            cmd = [sys.executable, "-m", "scripts.models.defense_forecast",
+            cmd = [sys.executable, "-m", "fpl_assistant.models.defense_forecast",
                    "--future-season", season, "--as-of", "now", "--as-of-tz", "Africa/Lagos",
                    "--as-of-gw", str(as_of_gw), "--n-future", str(n_future),
                    "--out-format", "both", "--confirm"]
@@ -410,7 +410,7 @@ with tabs[3]:
             st.toast("DEF run complete." if rc == 0 else "DEF run failed.", icon="✅" if rc==0 else "❌")
 
         if f_col4.button("Saves"):
-            cmd = [sys.executable, "-m", "scripts.models.saves_forecast",
+            cmd = [sys.executable, "-m", "fpl_assistant.models.saves_forecast",
                    "--future-season", season, "--as-of", "now", "--as-of-tz", "Africa/Lagos",
                    "--as-of-gw", str(as_of_gw), "--n-future", str(n_future),
                    "--out-format", "both", "--confirm"]
@@ -419,7 +419,7 @@ with tabs[3]:
             st.toast("SAV run complete." if rc == 0 else "SAV run failed.", icon="✅" if rc==0 else "❌")
 
         if f_col5.button("Expected Points"):
-            cmd = [sys.executable, "-m", "scripts.models.points_forecast",
+            cmd = [sys.executable, "-m", "fpl_assistant.models.points_forecast",
                    "--future-season", season, "--as-of", "now", "--as-of-tz", "Africa/Lagos",
                    "--as-of-gw", str(as_of_gw), "--n-future", str(n_future),
                    "--out-format", "both", "--confirm"]
@@ -432,7 +432,7 @@ with tabs[3]:
         if mode == "Single-GW":
             gw = st.number_input("GW to optimize", value=as_of_gw, step=1, min_value=1, max_value=60)
             if st.button("Run Single-GW plan"):
-                cmd = [sys.executable, "-m", "scripts.optimizers.single_gw",
+                cmd = [sys.executable, "-m", "fpl_assistant.optimizers.single_gw",
                        "--gw", str(gw), "--season", season, "--confirm"]
                 if profile_path.strip(): cmd += ["--profile", profile_path]
                 rc = run_cli_stream(cmd, live_area, "Running single_gw...")
@@ -442,7 +442,7 @@ with tabs[3]:
             gw_to   = st.number_input("GW to", value=as_of_gw+2, step=1, min_value=1, max_value=60)
             k_sweep = st.selectbox("K sweep", ["K1","K3","K5","K6"], index=0)
             if st.button("Run Multi-GW (hold)"):
-                cmd = [sys.executable, "-m", "scripts.optimizers.multi_gw_hold",
+                cmd = [sys.executable, "-m", "fpl_assistant.optimizers.multi_gw_hold",
                        "--gw-from", str(gw_from), "--gw-to", str(gw_to),
                        "--season", season, "--k", k_sweep, "--confirm"]
                 if profile_path.strip(): cmd += ["--profile", profile_path]

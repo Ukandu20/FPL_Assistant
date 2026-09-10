@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts.fpl_pipeline.utils.file_utils
+fpl_assistant.providers.fpl.utils.file_utils
 
 intended use:
 

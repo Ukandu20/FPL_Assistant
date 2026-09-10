@@ -36,7 +36,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from scripts.utils.validate import validate_df
+from fpl_assistant.utils.validate import validate_df
 
 
 # ───────────────────────────── Helpers ─────────────────────────────

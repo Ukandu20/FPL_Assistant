@@ -1,4 +1,4 @@
-# scripts/fbref_utils.py
+# Shared FBref reader utilities
 from __future__ import annotations
 import logging, time
 from pathlib import Path

@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.transfermarkt_pipeline.scrape.manager_history_scraper import (
+from fpl_assistant.providers.transfermarkt.scrape.manager_history_scraper import (
     build_output_path,
     parse_manager_history_html,
 )

@@ -245,7 +245,7 @@ before WhoScored, Understat, or FBref has published match data and gives their
 cleaners a stable canonical `match_id` to resolve against.
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+python -m fpl_assistant.pipelines.integrate.fixtures_meta_builder `
   --bootstrap `
   --league "ENG-Premier League" `
   --season "2026-2027" `
@@ -254,6 +254,93 @@ python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
   --force `
   --log-level INFO
 ```
+
+Scrape the current WhoScored schedule first. This discovery step is required
+before `--completed-only` can infer match IDs without a manual list:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.scrape.whoscored_match_stats_scraper `
+  --backend native `
+  --league "ENG-Premier League" `
+  --seasons "2026-2027" `
+  --out-dir "data/raw/whoscored" `
+  --tables schedule missing_players `
+  --browser-fallback `
+  --delay 0.75 `
+  --headless `
+  --retry-missing `
+  --on-error raise `
+  --no-cache `
+  --meta-path "data/meta/scraper_runs.json" `
+  --run-mode manual `
+  --verbose
+```
+
+Then scrape all completed matches currently present in that schedule. The
+command writes normalized events, derived match tables, per-match raw payloads,
+and the visible match-stat tables:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.scrape.whoscored_match_stats_scraper `
+  --backend native `
+  --league "ENG-Premier League" `
+  --seasons "2026-2027" `
+  --out-dir "data/raw/whoscored" `
+  --tables schedule missing_players events `
+  --events-format events `
+  --derived-tables match_info incidents player_dictionary lineups formations `
+  --archive-raw-events `
+  --raw-match-dir-layout per-match `
+  --browser-fallback `
+  --stats-mode all-visible `
+  --raw-artifacts `
+  --retry-failed-matches `
+  --completed-only `
+  --delay 0.75 `
+  --headless `
+  --retry-missing `
+  --on-error raise `
+  --no-cache `
+  --meta-path "data/meta/scraper_runs.json" `
+  --run-mode manual `
+  --verbose
+```
+
+The native backend tries direct HTTP first and falls back to Chrome when
+needed. Add `--browser "C:\Program Files\Google\Chrome\Application\chrome.exe"`
+if Chrome cannot be discovered automatically. For 2026-2027, raw files are
+stored under `data/raw/whoscored/WhoScored/ENG-Premier League/2627`; the cleaner
+still receives the canonical split-year season `2026-2027`. On later
+incremental runs, add `--skip-existing` to retain match artifacts already
+downloaded successfully.
+
+Before cleaning WhoScored, rerun the FPL season roster publication whenever
+the live FPL roster has changed. The WhoScored cleaner uses that processed
+roster to resolve newly added players to canonical IDs; a stale roster causes
+the strict identity check to fail even when the players exist in
+`players_raw.csv`.
+
+Clean the scraped WhoScored season and rebuild its registry bridges. During an
+active season, `--allow-partial` permits publication of completed matches while
+keeping strict team, match, and player identity validation enabled:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.clean.whoscored_cleaner `
+  --raw-root "data/raw/whoscored" `
+  --out-root "data/processed/whoscored" `
+  --league "ENG-Premier League" `
+  --season "2026-2027" `
+  --registry-root "data/processed/registry" `
+  --rebuild-provider-bridges `
+  --allow-partial `
+  --force `
+  --log-level INFO
+```
+
+Identity resolution is strict by default. If it reports unresolved players,
+review the emitted identity audit and update the alias/registry mappings before
+rerunning. Use `--no-strict-identities` only for a partial diagnostic run, not
+for the production publication.
 
 After scraping Understat, clean the raw season before building the enriched
 calendar. This produces the required processed `schedule.csv` and applies the
@@ -274,7 +361,7 @@ calendar without FDR. FPL supplies fixture IDs, gameweeks, and the scheduled
 calendar. FBref is consulted only when its optional schedule exists.
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+python -m fpl_assistant.pipelines.integrate.fixtures_meta_builder `
   --season "2026-2027" `
   --fpl-root "data/raw/fpl/ENG-Premier League" `
   --whoscored-league-dir "data/processed/whoscored/ENG-Premier League" `
@@ -322,7 +409,7 @@ gameweek remain separate fields.
 ## 9. Build team form and optional FDR view
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.team_form_builder `
+python -m fpl_assistant.pipelines.integrate.team_form_builder `
   --season "2026-2027" `
   --fixtures-root "data/processed/registry/fixtures" `
   --out-dir "data/processed/registry/features" `
@@ -339,7 +426,7 @@ view is needed.
 ## 10. Build the player-fixture calendar
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.calendar_builder `
+python -m fpl_assistant.pipelines.integrate.calendar_builder `
   --fixtures-root "data/processed/registry/fixtures" `
   --whoscored-root "data/processed/whoscored/ENG-Premier League" `
   --fpl-root "data/processed/fpl/ENG-Premier League" `
@@ -356,7 +443,7 @@ diagnostic escape hatch.
 ## 11. Build player form
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.player_form_builder `
+python -m fpl_assistant.pipelines.integrate.player_form_builder `
   --season "2026-2027" `
   --fixtures-root "data/processed/registry/fixtures" `
   --out-dir "data/processed/registry/features" `

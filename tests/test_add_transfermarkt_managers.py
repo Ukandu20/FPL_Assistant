@@ -6,7 +6,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.clubelo_pipeline.enrich.add_transfermarkt_managers import (
+from fpl_assistant.providers.clubelo.enrich.add_transfermarkt_managers import (
     add_manager_columns,
     process_pair,
 )

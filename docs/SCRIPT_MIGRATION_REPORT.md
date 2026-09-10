@@ -1,278 +1,157 @@
-# `scripts/` to `src/fpl_assistant/` migration report
+# Architecture consolidation report
 
-Date: 2026-08-14
+Date: 2026-09-10
 
-Status: audit and proposed migration plan only. No file in `scripts/` has been moved or deleted as part of this report.
+## Final directory ownership
 
-## Executive summary
+- `src/fpl_assistant/providers/<provider>/`: provider-specific scraping, cleaning,
+  enrichment, and FPL season publication.
+- `src/fpl_assistant/pipelines/integrate/`: canonical fixture calendars and
+  combined player/team feature builders, formerly housed under FBref.
+- `src/fpl_assistant/platform/scrape_runs.py`: shared scrape job identity,
+  run metadata, and scheduling. Reads structured run records and historical
+  timestamp-only records without rewriting existing data.
+- `src/fpl_assistant/domain/team_state.py`: the single team-state implementation.
+- `models/`, `minutes_v2/`, `archetypes/`, `optimizers/`, `qa/`, `apps/`, and
+  `testing/` remain separate responsibilities within the application package.
+- `tests/`: regression tests plus the relocated optimizer/data/golden checks.
+- `scripts/`: only the archetype sample generator; no production implementations.
 
-The repository contains 105 Python files under `scripts/`.
+The cleanup preserves the worktree's existing data, model behavior, canonical
+identity changes, and in-progress user edits. It does not regenerate datasets,
+train models, launch scrapers, or publish new artifacts into production folders.
 
-| Classification | Files | Proposed treatment |
-|---|---:|---|
-| Byte-for-byte duplicate with an existing packaged destination | 75 | Keep the `src/fpl_assistant/` copy; update references; then delete the `scripts/` copy |
-| Duplicate except for line endings | 1 | Keep the `src/fpl_assistant/` copy; normalize through the normal formatter; then delete the `scripts/` copy |
-| Exact duplicate with a non-name-matching packaged destination (`scripts/app/index.py`) | 1 | Keep `src/fpl_assistant/apps/control_panel.py`; update the app launcher; then delete the script copy |
-| Full implementation exists only in `scripts/` | 1 | Migrate the implementation into `src/fpl_assistant/`, replacing the current reverse wrapper |
-| `scripts/` compatibility wrapper pointing to `src` | 1 | Delete only after callers use the package path |
-| Functional implementations have diverged | 16 | Reconcile into the package destination while preserving every newer change and update from both copies; never replace newer behavior with an older implementation |
-| Package `__init__.py` metadata differs | 6 | Keep the package initializer; remove the legacy initializer with its directory |
-| Script-only test/evaluation files | 4 | Relocate rather than discard; see the test disposition section |
-| **Total** | **105** | |
+## Commands that moved
 
-The migration is not ready for deletion yet. There are 30 active `from scripts...` imports inside `src`, 16 more in the main `tests/` tree, and executable subprocess/module references to `scripts.*` in the control panel and pipeline orchestrators.
-
-## Destination rules
-
-The proposed canonical mapping is:
-
-| Legacy area | Canonical destination |
+| Old module or file | Maintained location |
 |---|---|
-| `scripts/clubelo_pipeline/` | `src/fpl_assistant/providers/clubelo/` |
-| `scripts/fbref_pipeline/` | `src/fpl_assistant/providers/fbref/` |
-| `scripts/fotmob_pipeline/` | `src/fpl_assistant/providers/fotmob/` |
-| `scripts/fpl_pipeline/` | `src/fpl_assistant/providers/fpl/` |
-| `scripts/transfermarkt_pipeline/` | `src/fpl_assistant/providers/transfermarkt/` |
-| `scripts/understat_pipeline/` | `src/fpl_assistant/providers/understat/` |
-| `scripts/whoscored_pipeline/` | `src/fpl_assistant/providers/whoscored/` |
-| `scripts/models/` | `src/fpl_assistant/models/` |
-| `scripts/optimizers/` | `src/fpl_assistant/optimizers/` |
-| `scripts/pipelines/` | `src/fpl_assistant/pipelines/` |
-| `scripts/infer/` | `src/fpl_assistant/infer/` |
-| `scripts/qa/` | `src/fpl_assistant/qa/` |
-| `scripts/tools/` | `src/fpl_assistant/tools/` |
-| `scripts/utils/` | `src/fpl_assistant/utils/` |
-| `scripts/cleaners/` | `src/fpl_assistant/cleaners/` |
-| `scripts/common/cli.py` | `src/fpl_assistant/platform/cli.py` |
-| `scripts/app/index.py` | `src/fpl_assistant/apps/control_panel.py` |
+| `scripts.<provider>_pipeline.*` | `fpl_assistant.providers.<provider>.*`, subject to the moves below |
+| `fpl_assistant.providers.fbref.scrape.whoscored_*` | `fpl_assistant.providers.whoscored.scrape.whoscored_*` |
+| `fpl_assistant.providers.fbref.integrate.*` | `fpl_assistant.pipelines.integrate.*` |
+| `scripts.models.*` | `fpl_assistant.models.*` |
+| `scripts.models.minutes_v2` | `fpl_assistant.minutes_v2.cli` |
+| `scripts.optimizers.team_state` / `fpl_assistant.optimizers.team_state` | `fpl_assistant.domain.team_state` |
+| `scripts.optimizers.*` | `fpl_assistant.optimizers.*` |
+| `scripts.pipelines.*` | `fpl_assistant.pipelines.*` |
+| `scripts.app.index` | `fpl_assistant.apps.control_panel` |
+| `scripts.tests.backtest_harness` | `fpl_assistant.testing.backtest_harness` |
+| `scripts/tests/{data_inputs,optimizer_invariants,regression_golden}.py` | `tests/test_{data_inputs,optimizer_invariants,regression_golden}.py` |
 
-## Files requiring migration or merge
+Use `python -m <module>` for CLI modules. The Streamlit control panel launches
+with `streamlit run src/fpl_assistant/apps/control_panel.py`. External scheduled
+jobs using removed paths must adopt the mappings above. Repository call sites,
+runbooks, and notebook source references are updated.
 
-### Migrate the script implementation into `src`
+WhoScored's main entry point retains native and soccerdata backend selection.
+Its schedule-only CLI is a small argument adapter; its soccerdata adapter now
+forwards shell arguments correctly. The unused duplicate schedule scraping body
+was removed. Native JSON extraction, blocked-page handling, and cached season
+recovery from the newer package implementation are retained.
 
-| Source | Destination | Finding | Proposed operation |
-|---|---|---|---|
-| `scripts/clubelo_pipeline/clean/clubelo_understat_enricher.py` | `src/fpl_assistant/providers/clubelo/clean/clubelo_understat_enricher.py` | The source is the full implementation (about 1,025 lines); the destination is a three-line reverse wrapper importing `scripts.*` | Move the implementation to the destination, convert imports to package imports, test it, then delete the source |
+## Reconciliation evidence
 
-This is the one file that must not be deleted on the assumption that the package copy already contains the implementation.
+The initial inventory contained 107 Python files under `scripts/`: 73 byte-identical
+package counterparts, 29 different counterparts (including wrappers and metadata),
+and five unique files. Exact duplicates retain the packaged implementation.
+The sample generator stays in place; the other four unique files were relocated.
 
-### Keep the packaged implementation and remove the legacy wrapper
+For divergent pairs, current source differences and Git history were inspected.
+The package implementation was retained except for the ClubElo enricher, whose
+full implementation was copied out of its reverse wrapper. No legacy-only
+function/class definitions were found in the other divergent implementations.
+Changes retained include FPL league scoping and official element mappings,
+`events.csv`, `GKP` normalization, preseason and cumulative-stat enrichment,
+canonical FBref match identity, Understat aliases/bridges, package imports,
+and the newer WhoScored native backend. Minutes-builder differences were comments.
 
-| Legacy wrapper | Packaged implementation | Proposed operation |
+| Legacy source | Destination | Last legacy / package commits reviewed |
 |---|---|---|
-| `scripts/whoscored_pipeline/clean/whoscored_cleaner.py` | `src/fpl_assistant/providers/whoscored/clean/whoscored_cleaner.py` | Update callers to the package module, test the package command, then delete the wrapper |
+| `scripts/clubelo_pipeline/clean/__init__.py` | `src/fpl_assistant/providers/clubelo/clean/__init__.py` | dc6b620 2026-06-06 feat: add provider ingestion pipelines / 2fa6ddc 2026-08-07 feat: preserve canonical IDs in ClubElo enrichment |
+| `scripts/clubelo_pipeline/clean/clubelo_understat_enricher.py` | `src/fpl_assistant/providers/clubelo/clean/clubelo_understat_enricher.py` | 075df8e 2026-08-14 feat(fixtures): bootstrap preseason provider schedules / 2fa6ddc 2026-08-07 feat: preserve canonical IDs in ClubElo enrichment |
+| `scripts/fbref_pipeline/clean/csv_cleaner.py` | `src/fpl_assistant/providers/fbref/clean/csv_cleaner.py` | 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage / 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage |
+| `scripts/fbref_pipeline/integrate/calendar_builder.py` | `src/fpl_assistant/pipelines/integrate/calendar_builder.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral |
+| `scripts/fbref_pipeline/integrate/fixtures_meta_builder.py` | `src/fpl_assistant/pipelines/integrate/fixtures_meta_builder.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / e02fc6c 2026-08-25 fix(fixtures): recognize completed current-season matches |
+| `scripts/fbref_pipeline/integrate/player_form_builder.py` | `src/fpl_assistant/pipelines/integrate/player_form_builder.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral |
+| `scripts/fbref_pipeline/integrate/team_form_builder.py` | `src/fpl_assistant/pipelines/integrate/team_form_builder.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral |
+| `scripts/fbref_pipeline/scrape/fbref_adapter.py` | `src/fpl_assistant/providers/fbref/scrape/fbref_adapter.py` | 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage / 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage |
+| `scripts/fbref_pipeline/scrape/match_stats_scraper.py` | `src/fpl_assistant/providers/fbref/scrape/match_stats_scraper.py` | 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage / 20e4a6a 2026-08-07 feat: adapt FBref pipeline to reduced coverage |
+| `scripts/fbref_pipeline/scrape/season_stats_scraper.py` | `src/fpl_assistant/providers/fbref/scrape/season_stats_scraper.py` | 909a021 2026-07-30 feat: add canonical data architecture / 909a021 2026-07-30 feat: add canonical data architecture |
+| `scripts/fbref_pipeline/scrape/whoscored_match_stats_scraper.py` | `src/fpl_assistant/providers/whoscored/scrape/whoscored_match_stats_scraper.py` | 1782662 2026-08-25 fix(whoscored): recover current-season match data / 1782662 2026-08-25 fix(whoscored): recover current-season match data |
+| `scripts/fbref_pipeline/scrape/whoscored_native_backend.py` | `src/fpl_assistant/providers/whoscored/scrape/whoscored_native_backend.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / 1782662 2026-08-25 fix(whoscored): recover current-season match data |
+| `scripts/fbref_pipeline/utils/fbref_utils.py` | `src/fpl_assistant/providers/fbref/utils/fbref_utils.py` | 909a021 2026-07-30 feat: add canonical data architecture / 909a021 2026-07-30 feat: add canonical data architecture |
+| `scripts/fpl_pipeline/__init__.py` | `src/fpl_assistant/providers/fpl/__init__.py` | 76de103 2025-08-02 updated directories and namings for scrapers and cleaners / dc6b620 2026-06-06 feat: add provider ingestion pipelines |
+| `scripts/fpl_pipeline/clean/assign_game_ids.py` | `src/fpl_assistant/providers/fpl/clean/assign_game_ids.py` | 66bc72b 2026-08-21 feat(fpl): publish timestamp-safe roster eligibility / 66bc72b 2026-08-21 feat(fpl): publish timestamp-safe roster eligibility |
+| `scripts/fpl_pipeline/clean/gw_stats_cleaner.py` | `src/fpl_assistant/providers/fpl/clean/gw_stats_cleaner.py` | 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline / 9d621ac 2026-08-25 fix(fpl): fill canonical teams and official player metrics |
+| `scripts/fpl_pipeline/master/consolidate_master.py` | `src/fpl_assistant/providers/fpl/master/consolidate_master.py` | 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline / 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline |
+| `scripts/fpl_pipeline/pipelines/clean_and_enrich.py` | `src/fpl_assistant/providers/fpl/pipelines/clean_and_enrich.py` | 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline / 9d621ac 2026-08-25 fix(fpl): fill canonical teams and official player metrics |
+| `scripts/fpl_pipeline/pipelines/prices_from_merged.py` | `src/fpl_assistant/providers/fpl/pipelines/prices_from_merged.py` | 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline / 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline |
+| `scripts/fpl_pipeline/scrape/season_scraper.py` | `src/fpl_assistant/providers/fpl/scrape/season_scraper.py` | 93cb804 2026-08-10 feat(fpl): harden league-scoped preseason pipeline / 020f0d1 2026-08-21 feat(fpl): enhance gameweek hub insights |
+| `scripts/models/__init__.py` | `src/fpl_assistant/models/__init__.py` | 61b6766 2025-08-04 Refactor team form builder to support both defensive and attacking metrics; update schema to v1.3 and enhance rolling calculations. Add calendar builder script for generating player minutes calendar from fixture data and player rosters. Create init file for models package and implement predicted minutes model for training and evaluation of expected minutes for FPL players. / 2f826c4 2026-06-06 feat: add forecasting and optimizer workflows |
+| `scripts/models/minutes_model_builder.py` | `src/fpl_assistant/models/minutes_model_builder.py` | b139a40 2026-08-21 feat(minutes): implement hardened expected-minutes v2 / b139a40 2026-08-21 feat(minutes): implement hardened expected-minutes v2 |
+| `scripts/models/minutes_v2.py` | `src/fpl_assistant/minutes_v2/cli.py` | b139a40 2026-08-21 feat(minutes): implement hardened expected-minutes v2 / b139a40 2026-08-21 feat(minutes): implement hardened expected-minutes v2 |
+| `scripts/optimizers/__init__.py` | `src/fpl_assistant/optimizers/__init__.py` | 44f7e49 2025-09-06 feat(team_state): end-to-end team_state CLI with master_fpl integration + idempotent seeding / 2f826c4 2026-06-06 feat: add forecasting and optimizer workflows |
+| `scripts/qa/assurance.py` | `src/fpl_assistant/qa/assurance.py` | f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral / f06394b 2026-08-21 refactor(fbref): make fixture integration provider-neutral |
+| `scripts/transfermarkt_pipeline/__init__.py` | `src/fpl_assistant/providers/transfermarkt/__init__.py` | 9bea48d 2026-04-06 feat: add transfermarkt manager history scraper / dc6b620 2026-06-06 feat: add provider ingestion pipelines |
+| `scripts/understat_pipeline/clean/clean_understat_raw.py` | `src/fpl_assistant/providers/understat/clean/clean_understat_raw.py` | a197bc6 2026-08-07 feat: harden Understat scraping and normalization / a197bc6 2026-08-07 feat: harden Understat scraping and normalization |
+| `scripts/whoscored_pipeline/clean/__init__.py` | `src/fpl_assistant/providers/whoscored/clean/__init__.py` | 64bfe23 2026-08-07 feat: add native WhoScored cleaning pipeline / 64bfe23 2026-08-07 feat: add native WhoScored cleaning pipeline |
+| `scripts/whoscored_pipeline/clean/whoscored_cleaner.py` | `src/fpl_assistant/providers/whoscored/clean/whoscored_cleaner.py` | 64bfe23 2026-08-07 feat: add native WhoScored cleaning pipeline / 1782662 2026-08-25 fix(whoscored): recover current-season match data |
 
-### Merge/reconcile functional differences
+## Other duplicated or historical code
 
-For these files, `src/fpl_assistant/` is the required destination. Reconciliation must preserve **all of the latest changes and updates** made in either copy. The current `src` differences contain the newer canonical-ID, league-scoped-path, provider-capability, position-schema, and package-import work, so those updates are mandatory and must not be rolled back.
+- Tracked bytecode belonging to the removed source locations was deleted.
+- The identical team-state implementation under `optimizers/` was removed in
+  favor of `domain/team_state.py`.
+- The old FBref `clean/new.py` registry cleaner was superseded by `csv_cleaner.py`;
+  all its function names already exist in the maintained cleaner.
+- `src/extras/scrape_fpl.py` moved to `providers/fpl/scrape/archive_scraper.py`.
+  Its distinct Wayback/historical JSON workflow is retained.
+- Archived JSON loaders/export live under `providers/fpl/clean/archive_tables.py`
+  and `archive_export.py`. Importing the exporter no longer writes files.
+- The player/team rename-rule cleaners are consolidated into
+  `providers/fbref/clean/table_cleaner.py`; use `--entity player` (default) or
+  `--entity team`. Team mode retains the `pl` -> `no_of_players_used` rename.
+- The two historical FBref bulk exporters are one
+  `tools/legacy/fbref_bulk_export.py` implementation with `--players-only`.
+- Distinct historical-format tools (numeric-ID registries, rule-based registry
+  imports, override matching, FantasyNutmeg history) are named explicitly under
+  `tools/legacy/`. They are not used by current provider pipelines. These have
+  different schemas/behavior and are not interchangeable with canonical tools.
+- Ancillary files found during deletion were preserved: the fixture notebook
+  moved to `notebooks/game_id.ipynb`, the TOML profile to
+  `config/profiles/2025-2026.toml`, and the optimizer draft text to
+  `docs/archive/optimizer_single_gw_prototype.txt`.
 
-The merge policy for every file in this section is:
+## Verification
 
-1. Start with the current packaged implementation at the `src/fpl_assistant/` destination.
-2. Compare the complete Git history and the current diff for both copies, not only file modification timestamps.
-3. Retain every newer functional change already present in `src`.
-4. Port any later or still-relevant change that exists only in `scripts/` into the packaged destination.
-5. Resolve conflicts in favor of the newest intended behavior while retaining compatible improvements from both sides.
-6. Do not restore obsolete paths, imports, schemas, or entry-point delegation merely because they remain in the legacy copy.
-7. Add or update regression tests for each reconciled behavior before the legacy source is eligible for deletion.
+- Before cleanup: 309 tests passed.
+- After initial package migration: 312 passed, three artifact-dependent checks
+  skipped (their optional input artifacts were absent).
+- Final verification after deleting legacy implementations: **324 passed, three
+  skipped**, with no warnings.
+  Command: `python -m pytest -q -p no:cacheprovider --basetemp artifacts/test_runs/architecture_cleanup_verified --tb=short`.
+- All **74 argparse CLI entry points** returned help successfully, without
+  scraping, training, or changing production data.
+- An offline wheel build passed; its Python sources match the current package,
+  with no stale modules or historical model/data directories included.
+- All 107 original script inventory entries have a retained destination; 106
+  legacy Python source files were removed (the sample generator remains).
+- Architecture regression tests check retired imports/launch targets, mirrored
+  implementations, and the absence of production code in `scripts/`.
+- Scheduling tests cover current and historical metadata; adapter tests preserve
+  WhoScored command-line arguments.
 
-Therefore, “keep `src`” in the table below means “keep the packaged file as the destination and preserve its latest updates, then merge any newer non-obsolete legacy-only update into it.” It does not mean blindly discarding unique changes from `scripts/`, and it does not permit overwriting the packaged file with an older script copy.
+## Pre-existing limitation found by CLI verification
 
-| Legacy source | Packaged destination | Important difference | Proposed result |
-|---|---|---|---|
-| `fbref_pipeline/clean/csv_cleaner.py` | `providers/fbref/clean/csv_cleaner.py` | Packaged version preserves canonical match identity and includes formatting cleanup | Preserve the latest packaged identity work; port any newer compatible script-only changes; verify identity-related tests |
-| `fbref_pipeline/integrate/calendar_builder.py` | `providers/fbref/integrate/calendar_builder.py` | Packaged version switches player-match inputs toward WhoScored and changes metric/position handling | Preserve the latest provider and schema changes; merge any newer compatible legacy behavior; validate calendar and player-form outputs |
-| `fbref_pipeline/integrate/fixtures_meta_builder.py` | `providers/fbref/integrate/fixtures_meta_builder.py` | Packaged version adds preseason fixture-calendar bootstrap and stable canonical IDs | Preserve bootstrap and canonical-ID updates; merge any newer compatible script-only change; run fixture bootstrap tests |
-| `fbref_pipeline/integrate/player_form_builder.py` | `providers/fbref/integrate/player_form_builder.py` | Packaged version standardizes goalkeeper position from `GK` to `GKP` | Preserve the latest `GKP` schema; merge newer compatible calculations without restoring the old schema; validate downstream schemas |
-| `fbref_pipeline/scrape/fbref_adapter.py` | `providers/fbref/scrape/fbref_adapter.py` | Package imports and stable capability aliases | Preserve the latest package imports and capability aliases; port any newer compatible adapter changes |
-| `fbref_pipeline/scrape/match_stats_scraper.py` | `providers/fbref/scrape/match_stats_scraper.py` | Relative package imports and first-class lineup/event capabilities | Preserve the latest capability and package-import work; merge newer compatible scraper behavior; update callers and tests |
-| `fbref_pipeline/scrape/season_stats_scraper.py` | `providers/fbref/scrape/season_stats_scraper.py` | Relative package imports | Preserve the latest package imports; port any newer compatible scraping changes |
-| `fbref_pipeline/scrape/whoscored_match_stats_scraper.py` | `providers/fbref/scrape/whoscored_match_stats_scraper.py` | Packaged version uses central platform paths | Preserve central path handling; merge any newer compatible scraper updates |
-| `fbref_pipeline/utils/fbref_utils.py` | `providers/fbref/utils/fbref_utils.py` | Correct installed-package and relative imports | Preserve installed-package behavior; port any newer compatible utility updates |
-| `fpl_pipeline/clean/assign_game_ids.py` | `providers/fpl/clean/assign_game_ids.py` | Packaged version replaces stale IDs with canonical FBref IDs and writes bridge records | Preserve all canonical-ID and bridge updates; merge any newer compatible assignment logic; run canonical bridge tests |
-| `fpl_pipeline/clean/gw_stats_cleaner.py` | `providers/fpl/clean/gw_stats_cleaner.py` | Packaged version adds league scoping, official element mapping, and `GKP` normalization | Preserve all latest league, identity, and position updates; port newer compatible cleaning logic; run FPL cleaner tests |
-| `fpl_pipeline/master/consolidate_master.py` | `providers/fpl/master/consolidate_master.py` | Packaged version uses league-scoped roots and owns its `main()` | Preserve the latest package CLI and league paths; port any newer compatible consolidation updates; replace old commands |
-| `fpl_pipeline/pipelines/clean_and_enrich.py` | `providers/fpl/pipelines/clean_and_enrich.py` | Packaged version is substantially newer, with cumulative-stat, preseason, identity, and league-scoping work | Preserve every latest packaged pipeline update; merge any newer non-obsolete legacy-only behavior; regression-test the full pipeline |
-| `fpl_pipeline/pipelines/prices_from_merged.py` | `providers/fpl/pipelines/prices_from_merged.py` | Packaged CLI and league-scoped paths | Preserve the latest package CLI and league paths; port any newer compatible pricing changes |
-| `fpl_pipeline/scrape/season_scraper.py` | `providers/fpl/scrape/season_scraper.py` | Packaged version uses league-scoped raw paths | Preserve the latest league-scoped behavior; port newer compatible scraper updates; replace remaining `scripts.*` imports |
-| `understat_pipeline/clean/clean_understat_raw.py` | `providers/understat/clean/clean_understat_raw.py` | Packaged version adds official FPL aliases and canonical bridge integration | Preserve all latest alias and bridge updates; merge newer compatible cleaning behavior; run Understat and bridge tests |
+The historical strategy evaluator expects an external `mc_sim_v01` module with
+`SimConfig` and `run_sim`. That engine is absent from the repository, archives,
+and its tracked Git history. The packaged `optimizers/mc.py` exposes a different
+simulation contract, so replacing the engine would change the model and was not
+part of this structural cleanup. Model and optimizer package exports are lazy;
+this missing optional engine no longer prevents independent optimizer commands
+from running. The strategy evaluator explains the dependency when evaluation is
+requested, and its help remains available. No claim is made that this historical
+strategy workflow or live external scraping has been exercised end to end.
 
-### Package initializer differences
-
-These are not competing implementations. The packaged initializers contain package exports or updated descriptions and should be retained:
-
-- `clubelo_pipeline/clean/__init__.py`
-- `fpl_pipeline/__init__.py`
-- `models/__init__.py`
-- `optimizers/__init__.py`
-- `transfermarkt_pipeline/__init__.py`
-- `whoscored_pipeline/clean/__init__.py`
-
-The corresponding `scripts/` initializers can be deleted with their legacy directories after imports have been migrated.
-
-## Direct duplicate deletion candidates
-
-These files already have byte-identical packaged copies. They are deletion candidates only after all imports, subprocess module names, documentation, and tests point to the packaged locations.
-
-### ClubElo
-
-- `enrich/add_fbref_pl_matches.py`
-- `enrich/add_pl_season_bands.py`
-- `enrich/add_transfermarkt_managers.py`
-- `scrape/clubelo_scraper.py`
-
-### FBref
-
-- `automation/auto_scrape.py`
-- `automation/fbref_automated_scrape.py`
-- `clean/new.py`
-- `clean/world_cup_cleaner.py`
-- `scrape/__init__.py`
-- `scrape/fbref_robust.py`
-- `scrape/roster_fetcher.py`
-- `scrape/whoscored_match_stats_scraper_soccerdata.py`
-- `scrape/whoscored_native_backend.py`
-- `scrape/whoscored_scraper.py`
-- `utils/scrape_meta.py`
-
-`integrate/team_form_builder.py` is also functionally identical; its only current difference is line endings.
-
-### FPL provider
-
-- `analysis/__init__.py`
-- `analysis/aggregated_points_goals.py`
-- `analysis/gw_data_collector.py`
-- `clean/__init__.py`
-- `clean/cleaners.py`
-- `master/__init__.py`
-- `pipelines/__init__.py`
-- `scrape/__init__.py`
-- `scrape/api_client.py`
-- `scrape/cron_generator.py`
-- `scrape/gameweek.py`
-- `scrape/teams_scraper.py`
-- `scrape/top_managers.py`
-- `scrape/top_players.py`
-- `utils/__init__.py`
-- `utils/file_utils.py`
-- `utils/global_merger.py`
-- `utils/mergers.py`
-- `utils/parse_helpers.py`
-- `utils/position_checker.py`
-- `utils/utility.py`
-
-### Models and inference
-
-- `infer/predict_upcoming_minutes.py`
-- `models/captain_ranker.py`
-- `models/defense_forecast.py`
-- `models/defense_model_builder.py`
-- `models/discipline_model_builder.py`
-- `models/expected_points_aggregator.py`
-- `models/goals_assists_forecast.py`
-- `models/goals_assists_model_builder.py`
-- `models/minutes_forecast.py`
-- `models/minutes_model_builder.py`
-- `models/points_forecast.py`
-- `models/predicted_minutes.py`
-- `models/saves_forecast.py`
-- `models/saves_model_builder.py`
-- `models/squad_optimizer.py`
-- `models/three_gw_optimizer.py`
-- `models/total_points_combiner.py`
-
-### Optimizers and orchestration
-
-- `optimizers/availability.py`
-- `optimizers/build_optimizer.py`
-- `optimizers/mc.py`
-- `optimizers/multi_gw.py`
-- `optimizers/multi_gw_hold.py`
-- `optimizers/simulator.py`
-- `optimizers/single_gw.py`
-- `optimizers/strategy.py`
-- `optimizers/team_state.py`
-- `pipelines/forecaster.py`
-- `pipelines/model_builder.py`
-
-### Other providers and utilities
-
-- `cleaners/clean_players.py`
-- `common/cli.py`
-- `fotmob_pipeline/scrape/fotmob_stats_scraper.py`
-- `qa/__init__.py`
-- `qa/assurance.py`
-- `tools/apply_transfers.py`
-- `transfermarkt_pipeline/scrape/__init__.py`
-- `transfermarkt_pipeline/scrape/manager_history_scraper.py`
-- `understat_pipeline/clean/propose_player_aliases.py`
-- `understat_pipeline/scrape/understat_stats_scraper.py`
-- `utils/validate.py`
-
-### App
-
-- `scripts/app/index.py` is byte-identical to `src/fpl_assistant/apps/control_panel.py`, despite the different filename. Keep the packaged control panel and update the launch command before deleting `scripts/app/index.py`.
-
-## Script-only test and evaluation files
-
-These four files do not have current package counterparts and must not be deleted without relocation:
-
-| File | Type | Recommended destination |
-|---|---|---|
-| `scripts/tests/backtest_harness.py` | Executable evaluation harness | `src/fpl_assistant/testing/backtest_harness.py`, plus a package CLI entry if it is still used |
-| `scripts/tests/data_inputs.py` | Pytest data-quality suite | `tests/test_data_inputs.py` |
-| `scripts/tests/optimizer_invariants.py` | Pytest optimizer-invariant suite | `tests/test_optimizer_invariants.py` |
-| `scripts/tests/regression_golden.py` | Pytest golden regression suite | `tests/test_regression_golden.py` |
-
-The three pytest files should remain in the repository test tree rather than becoming production package modules. The backtest harness is executable application logic and fits the existing `fpl_assistant.testing` package.
-
-## References that block deletion
-
-### Active imports
-
-- 30 active `from scripts...` or `import scripts...` lines remain under `src/`.
-- 16 active legacy imports remain under `tests/`.
-- Important affected areas include model validation imports, FPL utilities and scrapers, FBref automation, WhoScored adapters, and the ClubElo/FotMob/Understat scrape metadata hook.
-
-All `src` imports must be rewritten to `fpl_assistant.*` or safe relative package imports. Tests must then import the packaged modules so that the tests exercise the code that will actually ship.
-
-### Executable module names
-
-The following runtime orchestration still launches legacy modules:
-
-- `src/fpl_assistant/apps/control_panel.py`: five model forecast commands and two optimizer commands.
-- `src/fpl_assistant/pipelines/forecaster.py`: five model forecast commands.
-- `src/fpl_assistant/pipelines/model_builder.py`: four model-builder commands.
-- `src/fpl_assistant/providers/fbref/automation/fbref_automated_scrape.py`: two dynamically selected scraper module names.
-
-These strings must be changed to `fpl_assistant.*` before `scripts/` is removed.
-
-### Documentation and examples
-
-Legacy paths also remain in docstrings and documentation, including `docs/FPL_PIPELINE.md`, `docs/MODEL_EVALUATION_REPORT.md`, and command examples inside several packaged model, optimizer, and tool modules. These do not all break imports, but leaving them unchanged would direct users back to deleted commands.
-
-## Proposed migration sequence
-
-1. Move the full ClubElo–Understat enricher implementation into its package destination.
-2. Make `src/fpl_assistant/` self-contained by replacing all 30 active imports from `scripts.*`.
-3. Replace subprocess and dynamic module names with `fpl_assistant.*` module paths.
-4. Reconcile the 16 divergent implementations using the recency-preserving merge policy above: retain every latest packaged update, port every newer non-obsolete script-only change, and verify each preserved behavior with tests.
-5. Move the four script-only test/evaluation files to their recommended destinations.
-6. Update the 16 legacy imports in `tests/` and update documentation/command examples.
-7. Run focused provider, canonical-ID, FPL-cleaning, model, optimizer, and app tests.
-8. Run the complete test suite from an environment where `scripts/` is temporarily unavailable or renamed. This is the strongest check that no hidden dependency remains.
-9. Present the resulting diff and test evidence for approval.
-10. Only after approval, delete the obsolete `scripts/` files/directories in a separate, clearly scoped change.
-
-## Deletion gate
-
-No `scripts/` file should be deleted until all of the following are true:
-
-- `rg` finds no active Python import of `scripts.*` outside the legacy tree.
-- No subprocess or dynamic module name launches `scripts.*`.
-- Tests import `fpl_assistant.*` and pass.
-- The ClubElo–Understat implementation exists in `src`, not behind a reverse wrapper.
-- Every divergent pair has a documented Git-history/diff review showing that all newer changes from both copies were preserved in `src`.
-- The four script-only test/evaluation files have approved destinations.
-- Documentation points to packaged commands.
-- A full test run passes with the legacy tree unavailable.
+Historical trained artifacts already under `src/data/` are preserved. Package
+discovery is explicitly restricted to `fpl_assistant*`, keeping these artifacts
+out of the wheel. Current workflows use the unchanged configured data locations.

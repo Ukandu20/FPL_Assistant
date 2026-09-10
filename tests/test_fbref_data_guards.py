@@ -5,14 +5,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.fbref_pipeline.clean.csv_cleaner import (
+from fpl_assistant.providers.fbref.clean.csv_cleaner import (
     _normalise_team_value,
     canonicalize_team_season_ids,
     normalise_fpl_position,
     repair_team_match_identity,
     validate_raw_season_dir,
 )
-from scripts.fbref_pipeline.scrape.match_stats_scraper import (
+from fpl_assistant.providers.fbref.scrape.match_stats_scraper import (
     validate_schedule_season,
 )
 

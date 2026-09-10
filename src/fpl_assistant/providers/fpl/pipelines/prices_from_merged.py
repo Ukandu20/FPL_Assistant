@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts.fpl_pipeline.prices.prices_from_merged
+fpl_assistant.providers.fpl.pipelines.prices_from_merged
 
 Build per-season player price registry from processed FPL merged_gws.csv files
 (after enrichment + team mapping + game_id assignment).

@@ -6,12 +6,12 @@ from importlib import import_module
 def __getattr__(name: str):
     if name == "whoscored_match_stats_scraper":
         return import_module(
-            "..fbref.scrape.whoscored_match_stats_scraper", __name__
+            ".scrape.whoscored_match_stats_scraper", __name__
         )
     if name == "whoscored_scraper":
-        return import_module("..fbref.scrape.whoscored_scraper", __name__)
+        return import_module(".scrape.whoscored_scraper", __name__)
 
-    native = import_module("..fbref.scrape.whoscored_native_backend", __name__)
+    native = import_module(".scrape.whoscored_native_backend", __name__)
     try:
         return getattr(native, name)
     except AttributeError as exc:

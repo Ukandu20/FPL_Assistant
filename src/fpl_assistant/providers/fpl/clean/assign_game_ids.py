@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts.fpl_pipeline.clean.assign_game_ids
+fpl_assistant.providers.fpl.clean.assign_game_ids
 
 Assign canonical match IDs to processed FPL GW rows.
 Build matches.csv from the FPL-joined rows so ROUND comes from FPL.

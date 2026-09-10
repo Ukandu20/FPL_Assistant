@@ -37,14 +37,14 @@ import lightgbm as lgb
 import joblib
 from typing import Optional, Dict, List, Tuple, Set
 
-from scripts.models.minutes_model_builder import (
+from fpl_assistant.models.minutes_model_builder import (
     _pick_gw_col, load_minutes, make_features,
     train_regressor, train_cameo_minutes_by_pos,
     parse_pos_thresholds, per_position_bench_cap_from_train,
     predict_with_model, taper_start_minutes
 )
 
-from scripts.utils.validate import validate_df
+from fpl_assistant.utils.validate import validate_df
 
 # ----------------------------- utils ------------------------------------------
 

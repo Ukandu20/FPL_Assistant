@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.clubelo_pipeline.clean.clubelo_understat_enricher import (
+from fpl_assistant.providers.clubelo.clean.clubelo_understat_enricher import (
     TeamResolver,
     build_elo_lookup,
     clean_clubelo_history,

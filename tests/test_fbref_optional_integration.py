@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from fpl_assistant.providers.fbref.integrate.calendar_builder import load_minutes
+from fpl_assistant.pipelines.integrate.calendar_builder import (
+    load_minutes,
+    write_empty_minutes_calendar,
+)
 from fpl_assistant.qa.assurance import (
     validate_fixture_calendar,
     validate_player_minutes_calendar,
@@ -64,6 +67,19 @@ def test_player_match_loader_uses_whoscored_without_fbref():
     assert result.loc[0, "minutes"] == 90
 
 
+def test_provider_calendar_builder_cannot_overwrite_modelling_registry():
+    tmp_path = _case_dir("observed_calendar_ownership")
+    season_dir = tmp_path / "2026-2027"
+    season_dir.mkdir()
+    modelling = season_dir / "player_fixture_calendar.csv"
+    modelling.write_text("sentinel\nkeep\n", encoding="utf-8")
+
+    write_empty_minutes_calendar(season_dir, include_price=False)
+
+    assert modelling.read_text(encoding="utf-8") == "sentinel\nkeep\n"
+    assert (season_dir / "player_fixture_calendar_observed.csv").is_file()
+
+
 def test_assurance_accepts_provider_neutral_calendars_without_price():
     tmp_path = _case_dir("assurance_without_fbref")
     season_dir = tmp_path / "2026-2027"
@@ -118,8 +134,8 @@ def test_assurance_accepts_provider_neutral_calendars_without_price():
             "bonus": 0,
             "bps": 5,
             "clean_sheets": 0,
-            "gf": 1,
-            "ga": 0,
+            "team_gf": 1,
+            "team_ga": 0,
             "fdr_home": 3,
             "fdr_away": 3,
         }]

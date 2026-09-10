@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.clubelo_pipeline.enrich.add_pl_season_bands import add_season_band_columns
+from fpl_assistant.providers.clubelo.enrich.add_pl_season_bands import add_season_band_columns
 
 
 def test_add_season_band_columns_bands_only_eng_level_1_rows():

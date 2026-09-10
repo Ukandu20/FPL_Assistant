@@ -39,7 +39,7 @@ REQ_FIXTURE_COLS = {
 REQ_PMC_COLS = {
     "player_id","player","pos","fpl_id","gw_orig",
     "date_played","team_id","team","minutes","days_since_last","is_active",
-    "venue","was_home","gf","ga","fdr_home","fdr_away",
+    "venue","was_home","team_gf","team_ga","fdr_home","fdr_away",
     "is_starter","starter_source","total_points","bonus","bps","clean_sheets",
 }
 
@@ -380,8 +380,9 @@ def random_sampling_probe(pmc_all: list[pd.DataFrame], seasons: list[str]):
         return
 
     sample_pids = random.sample(players, min(SAMPLE_PLAYERS, len(players)))
-    sample = df[df["player_id"].isin(sample_pids)].sample(
-        min(SAMPLE_ROWS, len(df)), replace=False, random_state=42
+    sample_pool = df[df["player_id"].isin(sample_pids)]
+    sample = sample_pool.sample(
+        min(SAMPLE_ROWS, len(sample_pool)), replace=False, random_state=42
     )
 
     must_have = ["player_id","match_id","team_id","date_played","was_home","minutes"]

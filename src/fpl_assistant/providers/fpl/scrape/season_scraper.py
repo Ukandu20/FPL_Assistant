@@ -40,21 +40,21 @@ import pandas as pd
 
 from fpl_assistant.providers.fpl.paths import DEFAULT_FPL_LEAGUE, league_scoped_root
 
-from scripts.fpl_pipeline.utils.parse_helpers import (
+from fpl_assistant.providers.fpl.utils.parse_helpers import (
     parse_fixtures,
     parse_player_gw_history,
     parse_player_history,
     parse_players,
     parse_team_data,
 )
-from scripts.fpl_pipeline.clean.cleaners import clean_players, id_players, get_player_ids
-from scripts.fpl_pipeline.scrape.api_client import (
+from fpl_assistant.providers.fpl.clean.cleaners import clean_players, id_players, get_player_ids
+from fpl_assistant.providers.fpl.scrape.api_client import (
     FPLApiError,
     get_data,
     get_individual_player_data,
     get_fixtures_data,
 )
-from scripts.fpl_pipeline.analysis.gw_data_collector import collect_gw, merge_gw
+from fpl_assistant.providers.fpl.analysis.gw_data_collector import collect_gw, merge_gw
 
 
 def _ensure_dir(path: str) -> None:

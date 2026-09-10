@@ -81,19 +81,28 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
+from importlib import import_module
 
 import numpy as np
 import pandas as pd
 
-# ---- MC engine import -------------------------------------------------------
-try:
-    import mc_sim_v01  # must expose run_sim(df, cfg, write_player_samples_path=None) and SimConfig
-except Exception as e:
-    raise SystemExit(
-        "ERROR: Could not import mc_sim_v01. Ensure mc_sim_v01.py is on PYTHONPATH.\n"
-        f"Underlying import error: {e}"
-    )
+def _load_mc_engine():
+    """Load the historical strategy engine only when evaluation is requested.
+
+    This external engine was never included in the repository. The packaged
+    mc.py simulator exposes a different API and must not be substituted silently.
+    """
+    try:
+        return import_module("mc_sim_v01")
+    except ModuleNotFoundError as exc:
+        if exc.name != "mc_sim_v01":
+            raise
+        raise RuntimeError(
+            "Strategy evaluation requires the external mc_sim_v01 engine "
+            "(SimConfig and run_sim), which is not included in this repository. "
+            "Other optimizers and the packaged MC simulator are independent."
+        ) from exc
 
 
 # ---- Data structures --------------------------------------------------------
@@ -194,7 +203,7 @@ def _team_points_from_samples(samples_df: pd.DataFrame) -> np.ndarray:
 
 def _choose_captain_for_gw(
     df: pd.DataFrame,
-    cfg: mc_sim_v01.SimConfig,
+    cfg: Any,
     base_seed: int,
     captain_ev_eps: float = 0.2,
     sd_tiebreak: bool = True,
@@ -203,6 +212,7 @@ def _choose_captain_for_gw(
     Evaluate each XI player as captain, using the same RNG seed for fairness.
     Return (chosen_captain_id, team_points_array_for_gw).
     """
+    mc_sim_v01 = _load_mc_engine()
     xi = df[df['is_start_xi'] == True].copy()
     if xi.empty:
         raise ValueError("No starters (is_start_xi=True) found in sim_input for this GW.")
@@ -310,6 +320,7 @@ def evaluate_candidate(
     For a single candidate, choose captains per GW, run MC per GW with common numbers for captain choice,
     sum team points across the horizon, subtract hit once (hit_cost on candidate), and compute metrics.
     """
+    mc_sim_v01 = _load_mc_engine()
     cfg = mc_sim_v01.SimConfig(
         n_sims=nsims,
         seed=base_seed,  # will be overridden per-GW for independence across GWs
@@ -447,6 +458,10 @@ def main():
     ap.add_argument("--out-json", required=True, help="Path to write JSON report")
     ap.add_argument("--out-csv", required=False, help="Optional CSV summary path")
     args = ap.parse_args()
+    try:
+        _load_mc_engine()
+    except RuntimeError as exc:
+        ap.error(str(exc))
 
     root = Path(args.candidates_root)
     if not root.exists():

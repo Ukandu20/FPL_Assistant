@@ -28,7 +28,7 @@ Assumptions on master
 CLI examples
 ------------
 # Add by NAME (AFCON)
-python scripts/registry/league_unavailable.py add data/registry/league_unavailable.json \
+python -m fpl_assistant.optimizers.availability add data/registry/league_unavailable.json \
   --name "Mohamed Salah" --club LIV \
   --status OUT --reason AFCON --gw-now 21 --matches 6 \
   --master data/processed/registry/master_fpl.json \
@@ -36,7 +36,7 @@ python scripts/registry/league_unavailable.py add data/registry/league_unavailab
   --season "2025-2026"
 
 # Add by ID (transfer)
-python scripts/registry/league_unavailable.py add data/registry/league_unavailable.json \
+python -m fpl_assistant.optimizers.availability add data/registry/league_unavailable.json \
   --player-id 9f9f9f9f \
   --status OUT --reason TRANSFERRED --gw-now 21 \
   --master data/processed/registry/master_fpl.json \
@@ -44,7 +44,7 @@ python scripts/registry/league_unavailable.py add data/registry/league_unavailab
   --season "2025-2026"
 
 # Batch add (comma-separated, aligned lists)
-python scripts/registry/league_unavailable.py add-batch data/registry/league_unavailable.json \
+python -m fpl_assistant.optimizers.availability add-batch data/registry/league_unavailable.json \
   --name "Tyrone Mings, Youri Tielemans, Emi Buendía, Andrés García" \
   --club "AVL, AVL, AVL, AVL" \
   --status "OUT, DOUBTFUL, DOUBTFUL, DOUBTFUL" \

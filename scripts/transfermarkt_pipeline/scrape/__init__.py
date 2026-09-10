@@ -1,1 +1,0 @@
-"""Scrapers for Transfermarkt data."""

@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.fbref_pipeline.integrate.calendar_builder import _derive_was_home
-from scripts.fbref_pipeline.integrate.team_form_builder import (
+from fpl_assistant.pipelines.integrate.calendar_builder import _derive_was_home
+from fpl_assistant.pipelines.integrate.team_form_builder import (
     _resolve_version as resolve_team_form_version,
 )
-from scripts.fbref_pipeline.integrate.player_form_builder import (
+from fpl_assistant.pipelines.integrate.player_form_builder import (
     _coerce_columns,
     _copy_to_latest_dir,
     _resolve_version as resolve_player_form_version,

@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pytest
 
-from scripts.fbref_pipeline.integrate import team_form_builder as tfb
+from fpl_assistant.pipelines.integrate import team_form_builder as tfb
 
 
 def _fixture_rows(

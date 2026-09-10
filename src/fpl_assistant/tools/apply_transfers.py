@@ -6,7 +6,7 @@ Apply transfers to a base team_state.json and write per-candidate team_state.jso
 We infer team_id/pos (and player name if available) for IN players from your minutes file.
 
 Usage (single candidate):
-py -m scripts.tools.apply_transfers ^
+py -m fpl_assistant.tools.apply_transfers ^
   --base-team-state data/state/team_state.json ^
   --minutes data/predictions/minutes/2025-2026/GW4_6.csv ^
   --season 2025-2026 --gws 4,5,6 ^
@@ -20,7 +20,7 @@ py -m scripts.tools.apply_transfers ^
   --out-root data/state/candidates
 
 Then build sim inputs for all candidates:
-py -m scripts.optimizers.simulator ^
+py -m fpl_assistant.optimizers.simulator ^
   --team-state-glob "data/state/candidates/*/team_state.json" ^
   --candidate-subdir hold ^
   --minutes ... --goals-assists ... --defense ... --saves ... --fixtures ... ^

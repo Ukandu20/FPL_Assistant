@@ -43,7 +43,7 @@ from typing import List, Dict, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-from scripts.utils.validate import validate_df
+from fpl_assistant.utils.validate import validate_df
 SCHEMA_VERSION = "future.v1.9"
 
 # ───────────────────────── IO & normalization ─────────────────────────

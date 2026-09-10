@@ -52,6 +52,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["fpl_assistant*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

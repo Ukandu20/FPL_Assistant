@@ -1,4 +1,4 @@
-# scripts/fbref_pipeline/scrape/fbref_robust.py
+# src/fpl_assistant/providers/fbref/scrape/fbref_robust.py
 from __future__ import annotations
 import re
 import time

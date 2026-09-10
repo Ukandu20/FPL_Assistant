@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.clubelo_pipeline.enrich.add_fbref_pl_matches import add_fbref_match_columns
+from fpl_assistant.providers.clubelo.enrich.add_fbref_pl_matches import add_fbref_match_columns
 
 
 def test_add_fbref_match_columns_matches_next_day_rows_and_skips_interleaved_non_league_rows():

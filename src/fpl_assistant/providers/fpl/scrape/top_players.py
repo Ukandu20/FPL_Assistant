@@ -1,5 +1,5 @@
-from scripts.fpl_pipeline.scrape.api_client import *
-from scripts.fpl_pipeline.utils.parse_helpers import *
+from fpl_assistant.providers.fpl.scrape.api_client import *
+from fpl_assistant.providers.fpl.utils.parse_helpers import *
 
 def main():
     data = get_data()

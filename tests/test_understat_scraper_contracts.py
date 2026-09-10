@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from scripts.understat_pipeline.scrape.understat_stats_scraper import (
+from fpl_assistant.providers.understat.scrape.understat_stats_scraper import (
     _empty_indexed_frame,
     normalize_understat_season,
 )

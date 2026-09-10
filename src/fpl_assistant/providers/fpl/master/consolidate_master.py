@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scripts.fpl_pipeline.master.consolidate_master
+fpl_assistant.providers.fpl.master.consolidate_master
 
 Build unified FPL master JSON by combining:
   • FBref master (source of truth for identity & seasons)
@@ -37,7 +37,7 @@ Rules:
 - Prices attached per season if available.
 
 CLI:
-py -m scripts.fpl_pipeline.master.consolidate_master ^
+py -m fpl_assistant.providers.fpl.master.consolidate_master ^
   --fbref-master data/processed/registry/master_players.json ^
   --proc-root    "data/processed/fpl/ENG-Premier League" ^
   --prices-dir   data/processed/registry/prices ^

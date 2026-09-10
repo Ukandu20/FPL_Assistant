@@ -5,7 +5,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.fpl_pipeline.scrape import api_client
+from fpl_assistant.providers.fpl.scrape import api_client
 
 
 class _DummyResponse:

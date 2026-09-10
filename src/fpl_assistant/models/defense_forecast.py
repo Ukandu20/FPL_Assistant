@@ -18,7 +18,7 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 
-from scripts.utils.validate import validate_df
+from fpl_assistant.utils.validate import validate_df
 # ----------------------------- helpers ----------------------------------------
 
 def _load_json(p: Path) -> list | dict:

@@ -1,4 +1,4 @@
-from scripts.fpl_pipeline.scrape.api_client import get_fixtures_data
+from fpl_assistant.providers.fpl.scrape.api_client import get_fixtures_data
 from dateutil.parser import parse
 from datetime import timedelta
 

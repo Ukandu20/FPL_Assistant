@@ -2,6 +2,20 @@
 
 > A machine learning-powered assistant to help optimize Fantasy Premier League (FPL) team decisions each gameweek — built for interpretability and open-source reproducibility.
 
+## Repository architecture
+
+Application implementations live in [`src/fpl_assistant/`](src/fpl_assistant/).
+Provider scraping and cleaning are grouped under `providers/<provider>/`;
+cross-provider integration is under `pipelines/integrate/`. Shared run tracking
+and paths live under `platform/`. Models, optimizers, archetypes, and minutes V2
+have their own packages. `tests/` contains the regression and artifact checks.
+
+Install the package with `python -m pip install -e .` and use
+`python -m fpl_assistant.<module>` commands. The mirrored pipeline implementations in
+`scripts/` have been removed; only the archetype sample generator remains there.
+See [the architecture migration report](docs/SCRIPT_MIGRATION_REPORT.md) for
+command mappings and the treatment of historical tools.
+
 ## 🏆 Objective
 
 This project aims to:
@@ -221,7 +235,7 @@ FPL schedule. This removes the circular dependency between the fixture calendar
 and cleaned WhoScored data:
 
 ```powershell
-python -m fpl_assistant.providers.fbref.integrate.fixtures_meta_builder `
+python -m fpl_assistant.pipelines.integrate.fixtures_meta_builder `
   --bootstrap `
   --league "ENG-Premier League" `
   --season "2026-2027" `

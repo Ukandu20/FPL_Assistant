@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/fbref_pipeline/scrape/season_stats_scraper.py
+# src/fpl_assistant/providers/fbref/scrape/season_stats_scraper.py
 """
 FBref season-level scraper (network-friendly, cache-first)
 
@@ -43,7 +43,7 @@ from ..utils.fbref_utils import (
 )
 
 # Keep meta import consistent with match scraper
-from ..automation.auto_scrape import ScrapeJobId, record_last_run
+from fpl_assistant.platform.scrape_runs import ScrapeJobId, record_last_run
 from fpl_assistant.providers.fbref.capabilities import (
     coverage_from_outputs,
     write_capability_document,

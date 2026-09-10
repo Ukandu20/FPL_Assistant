@@ -3,7 +3,7 @@ import pytest
 import uuid
 from pathlib import Path
 
-from scripts.understat_pipeline.clean.clean_understat_raw import (
+from fpl_assistant.providers.understat.clean.clean_understat_raw import (
     _season_sources,
     build_fpl_mode_maps,
     build_teams_config_maps,

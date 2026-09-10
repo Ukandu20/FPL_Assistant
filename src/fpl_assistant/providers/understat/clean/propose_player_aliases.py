@@ -21,13 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-try:
-    from scripts.understat_pipeline.clean.clean_understat_raw import build_player_lookup, normalize_player_key
-except ModuleNotFoundError:
-    REPO_ROOT = Path(__file__).resolve().parents[3]
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    from scripts.understat_pipeline.clean.clean_understat_raw import build_player_lookup, normalize_player_key
+from .clean_understat_raw import build_player_lookup, normalize_player_key
 
 LOG = logging.getLogger("understat_alias_proposal")
 
