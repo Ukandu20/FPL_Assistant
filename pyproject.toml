@@ -21,6 +21,7 @@ fpl-archetypes = "fpl_assistant.archetypes.cli:main"
 fpl-archetype-publish = "fpl_assistant.archetypes.publish_cli:main"
 fpl-archetype-validate = "fpl_assistant.archetypes.validation_cli:main"
 fpl-minutes-v2 = "fpl_assistant.minutes_v2.cli:main"
+fpl-clubelo-fallback = "fpl_assistant.providers.clubelo.fallback.elo_fallback:main"
 
 [project.optional-dependencies]
 app = [
