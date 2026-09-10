@@ -46,6 +46,9 @@ from fpl_assistant.apps.viewmodels.dashboard import (
     fixture_finished_mask,
 )
 from fpl_assistant.apps.viewmodels import player_card as player_card_viewmodels
+from fpl_assistant.apps.viewmodels import (
+    player_signal_profile as player_signal_profile_viewmodels,
+)
 
 
 # Keep shared UI helpers fresh in a long-running Streamlit development server.
@@ -61,6 +64,9 @@ style_availability_table = fpl_ui.style_availability_table
 # dependencies. Reload this small, pure presentation module so newly added
 # helpers cannot remain missing in a long-running development server.
 player_card_viewmodels = importlib.reload(player_card_viewmodels)
+player_signal_profile_viewmodels = importlib.reload(
+    player_signal_profile_viewmodels
+)
 comparable_players = player_card_viewmodels.comparable_players
 decision_factors = player_card_viewmodels.decision_factors
 forecast_summary = player_card_viewmodels.forecast_summary
@@ -74,6 +80,9 @@ profile_trend = player_card_viewmodels.profile_trend
 recent_form_summary = player_card_viewmodels.recent_form_summary
 select_profile_snapshot = player_card_viewmodels.select_profile_snapshot
 team_badge_url = player_card_viewmodels.team_badge_url
+build_player_signal_cards = (
+    player_signal_profile_viewmodels.build_player_signal_cards
+)
 
 
 st.set_page_config(page_title="FPL Players", page_icon="👤", layout="wide")
@@ -1348,6 +1357,104 @@ def render_player_bio(
         st.caption(str(selected_record.get("Price Category", "Uncategorized")).replace(" Â· ", " · "))
 
 
+def render_signal_component_cards(cards: list[dict[str, object]]) -> None:
+    """Render the stable signal-card view model in the player Overview."""
+    st.markdown("### Player signals")
+    for start in range(0, len(cards), 2):
+        columns = st.columns(2)
+        for column, card in zip(columns, cards[start : start + 2]):
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"#### {card['title']}")
+                    headline = pd.to_numeric(
+                        card.get("headline_value"), errors="coerce"
+                    )
+                    if pd.isna(headline):
+                        st.metric("Position percentile", "Unavailable")
+                    else:
+                        st.metric(
+                            "Position percentile",
+                            f"P{float(headline):.0f}",
+                            player_signal_profile_viewmodels.interpretation_band(
+                                headline
+                            ),
+                        )
+                    st.caption(str(card.get("scale_label", "")))
+
+                    context = []
+                    confidence = card.get("confidence_band")
+                    trend = card.get("trend")
+                    status = card.get("status")
+                    if pd.notna(confidence) and str(confidence).strip():
+                        context.append(f"{confidence} confidence")
+                    if pd.notna(trend) and str(trend).strip():
+                        context.append(str(trend))
+                    if pd.notna(status) and str(status).strip():
+                        context.append(str(status))
+                    evidence_window = str(
+                        card.get("evidence_window", "") or ""
+                    ).strip()
+                    if evidence_window:
+                        context.append(
+                            evidence_window.replace("_", " ").title()
+                            + " evidence"
+                        )
+                    if context:
+                        st.caption(" | ".join(context))
+
+                    minutes = pd.to_numeric(
+                        card.get("evidence_minutes"), errors="coerce"
+                    )
+                    appearances = pd.to_numeric(
+                        card.get("eligible_appearances"), errors="coerce"
+                    )
+                    sample = []
+                    if pd.notna(minutes):
+                        sample.append(f"{float(minutes):,.0f} minutes")
+                    if pd.notna(appearances):
+                        sample.append(
+                            f"{float(appearances):.0f} eligible appearances"
+                        )
+                    if sample:
+                        st.caption(" | ".join(sample))
+
+                    components = card.get("components", [])
+                    if not components:
+                        st.info("Component evidence is not currently published.")
+                        continue
+                    for component in components:
+                        component_columns = st.columns([3, 1])
+                        component_columns[0].markdown(
+                            f"**{component['label']}**",
+                            help=str(component.get("help", "")) or None,
+                        )
+                        component_columns[1].markdown(
+                            f"**{component.get('display_value') or '-'}**"
+                        )
+                        percentile = pd.to_numeric(
+                            component.get("percentile"), errors="coerce"
+                        )
+                        if pd.isna(percentile):
+                            st.caption(str(component.get("status", "Unavailable")))
+                        else:
+                            st.progress(
+                                min(max(float(percentile), 0), 100) / 100
+                            )
+                            details = [
+                                f"P{float(percentile):.0f}",
+                                str(component.get("interpretation", "")),
+                            ]
+                            weight = pd.to_numeric(
+                                component.get("weight"), errors="coerce"
+                            )
+                            if pd.notna(weight):
+                                details.append(f"{float(weight) * 100:.0f}% weight")
+                            provider = str(component.get("provider", "")).strip()
+                            if provider:
+                                details.append(provider)
+                            st.caption(" | ".join(details))
+
+
 def render_overview_tab(
     player_name: str,
     selected_season: str,
@@ -1364,11 +1471,14 @@ def render_overview_tab(
     team_badges: dict[int, str],
     alternatives: pd.DataFrame,
     data_freshness: dict[str, str],
+    signal_cards: list[dict[str, object]],
 ) -> None:
     """Render the decision-oriented overview content."""
 
     def number(value: object) -> float:
         return pd.to_numeric(value, errors="coerce")
+
+    render_signal_component_cards(signal_cards)
 
     st.markdown("### Next fixture")
     with st.container(border=True):
@@ -2653,6 +2763,8 @@ def main() -> None:
     archetype_snapshot_dir = latest_archetype_snapshot(selected_season)
     if archetype_snapshot_dir is None:
         archetype_path = None
+        v1_archetypes = pd.DataFrame()
+        component_evidence = pd.DataFrame()
         selected_v1_archetypes = pd.DataFrame()
         selected_component_evidence = pd.DataFrame()
         selected_family_evidence = pd.DataFrame()
@@ -2669,10 +2781,13 @@ def main() -> None:
         v1_archetypes = load_archetype_artifact(
             str(archetype_path), file_version(archetype_path)
         )
-        if selected_view == "Profile":
+        if selected_view in {"Overview", "Profile"}:
             component_evidence = load_archetype_artifact(
                 str(component_evidence_path), file_version(component_evidence_path)
             )
+        else:
+            component_evidence = pd.DataFrame()
+        if selected_view == "Profile":
             family_evidence = load_archetype_artifact(
                 str(family_evidence_path), file_version(family_evidence_path)
             )
@@ -2680,7 +2795,6 @@ def main() -> None:
                 str(match_evidence_path), file_version(match_evidence_path)
             )
         else:
-            component_evidence = pd.DataFrame()
             family_evidence = pd.DataFrame()
             match_evidence = pd.DataFrame()
         selected_v1_archetypes = (
@@ -2773,6 +2887,20 @@ def main() -> None:
         "forecast": updated_label(forecast_path),
     }
 
+    signal_cards = (
+        build_player_signal_cards(
+            v1_archetypes,
+            component_evidence,
+            selected_record,
+            gameweeks,
+            player_id=selected_player_id,
+            player_name=player_name,
+            fpl_position=str(raw_record.get("fpl_pos", selected_record["Position"])),
+        )
+        if selected_view == "Overview"
+        else []
+    )
+
     render_player_bio(
         player_name,
         selected_season,
@@ -2800,6 +2928,7 @@ def main() -> None:
             team_badges,
             alternatives,
             data_freshness,
+            signal_cards,
         )
     elif selected_view == "Form & Forecast":
         render_performance_tab(
