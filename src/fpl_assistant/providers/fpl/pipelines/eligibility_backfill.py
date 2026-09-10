@@ -59,6 +59,11 @@ PANEL_PROVENANCE_COLUMNS = [
 
 FINISHED_STATUSES = {"complete", "completed", "finished", "ft", "aet", "pen"}
 CONFIRMED_OUT_FPL_STATUSES = {"i", "s", "u"}
+ROW_PROVENANCE_COLUMNS = {
+    "information_timestamp": "_eligibility_information_timestamp",
+    "eligibility_source": "_eligibility_source",
+    "eligibility_timestamp_safe": "_eligibility_timestamp_safe",
+}
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -405,6 +410,59 @@ def load_preseason_fpl_universe(
     return universe, audit
 
 
+def combine_inseason_universes(
+    historical: pd.DataFrame,
+    historical_audit: dict[str, Any],
+    live: pd.DataFrame,
+    live_audit: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Prefer observed FPL rows and fill all other fixtures from a live roster.
+
+    Provenance is carried per row because retrospective match evidence is not
+    timestamp-safe while the official roster snapshot is safe for inference.
+    """
+    key = ["_fixture_key", "player_id", "team_id"]
+    for frame, audit in ((historical, historical_audit), (live, live_audit)):
+        frame[ROW_PROVENANCE_COLUMNS["information_timestamp"]] = audit["information_timestamp"]
+        frame[ROW_PROVENANCE_COLUMNS["eligibility_source"]] = audit["source"]
+        frame[ROW_PROVENANCE_COLUMNS["eligibility_timestamp_safe"]] = bool(audit["timestamp_safe"])
+
+    # Once a team-fixture is present in merged_gws it is fully authoritative,
+    # including its DNP population. Do not add differently-resolved live roster
+    # identities back into that completed fixture.
+    fixture_team_key = ["_fixture_key", "team_id"]
+    historical_fixture_teams = pd.MultiIndex.from_frame(
+        historical[fixture_team_key].drop_duplicates()
+    )
+    live_fixture_teams = pd.MultiIndex.from_frame(live[fixture_team_key])
+    live_only = live.loc[~live_fixture_teams.isin(historical_fixture_teams)].copy()
+    combined = pd.concat([historical, live_only], ignore_index=True, sort=False)
+    # Fixture metadata is joined authoritatively from fixture_calendar below.
+    # Dropping it here also prevents columns present only on the historical
+    # half from forcing suffixed/empty values on live-roster rows.
+    combined = combined.drop(
+        columns=[
+            "match_id", "fbref_id", "fpl_id", "gw_orig", "gw_played",
+            "date_sched", "date_played", "opponent_id", "team", "venue",
+            "is_home", "gf", "ga", "xg", "xga", "status",
+        ],
+        errors="ignore",
+    )
+    if combined.duplicated(key).any():
+        raise ValueError("Combined in-season FPL universe has duplicate player-fixture keys")
+    audit = {
+        **historical_audit,
+        "source": "fpl_merged_gws_plus_live_roster",
+        "information_timestamp": live_audit["information_timestamp"],
+        "timestamp_safe": True,
+        "historical_source_rows": len(historical),
+        "live_roster_source_rows": len(live),
+        "live_roster_rows_added": len(live_only),
+        "roster_players": live_audit.get("roster_players", 0),
+    }
+    return combined, audit
+
+
 def build_availability_snapshot(
     season: str,
     *,
@@ -450,6 +508,70 @@ def build_availability_snapshot(
         "information_timestamp", "source", "source_path",
     ]
     return snapshot[columns].sort_values(["team_id", "player_id"]).reset_index(drop=True)
+
+
+def enrich_player_attacking_stats(
+    panel: pd.DataFrame,
+    player_match_path: Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Attach canonical player-level goals and expected attacking metrics."""
+    result = panel.copy()
+    if not player_match_path.is_file():
+        return result, {
+            "player_attacking_source": "unavailable",
+            "player_attacking_source_path": str(player_match_path),
+            "player_attacking_provider_rows_matched": 0,
+            "player_attacking_rows_populated": 0,
+        }
+
+    stats = _read_csv(player_match_path)
+    required = {"match_id", "player_id", "goals", "assists", "xg", "xa"}
+    missing = sorted(required - set(stats.columns))
+    if missing:
+        raise ValueError(
+            f"Understat player-match data lacks required attacking fields: {missing}"
+        )
+    key = ["match_id", "player_id"]
+    stats["match_id"] = stats["match_id"].astype(str)
+    stats["player_id"] = stats["player_id"].astype(str)
+    if stats.duplicated(key).any():
+        raise ValueError("Understat player-match data has duplicate match/player keys")
+    metrics = ["goals", "assists", "xg", "xa"]
+    stats = stats[key + metrics].rename(
+        columns={metric: f"_player_{metric}" for metric in metrics}
+    )
+    result = result.merge(stats, on=key, how="left", validate="many_to_one")
+    provider_rows_matched = int(result["_player_xg"].notna().sum())
+
+    completed_dnp = (
+        result["observation_status"].ne("fixture_pending")
+        & pd.to_numeric(result["minutes"], errors="coerce").fillna(0).eq(0)
+    )
+    for metric in metrics:
+        provider = pd.to_numeric(result.pop(f"_player_{metric}"), errors="coerce")
+        if metric in {"goals", "assists"}:
+            legacy_name = "gls" if metric == "goals" else "ast"
+            legacy = pd.to_numeric(
+                result.get(legacy_name, pd.Series(pd.NA, index=result.index)),
+                errors="coerce",
+            )
+            result[metric] = provider.combine_first(legacy)
+        else:
+            # Legacy `xg` was ambiguous with fixture-level xG. Do not carry it
+            # forward when canonical player-match evidence is unavailable.
+            result[metric] = provider
+        result.loc[completed_dnp & result[metric].isna(), metric] = 0.0
+
+    # Retain established model aliases while making the public meaning clear.
+    result["gls"] = result["goals"]
+    result["ast"] = result["assists"]
+    populated = int(result["xg"].notna().sum())
+    return result, {
+        "player_attacking_source": "understat_player_match",
+        "player_attacking_source_path": str(player_match_path),
+        "player_attacking_provider_rows_matched": provider_rows_matched,
+        "player_attacking_rows_populated": populated,
+    }
 
 
 def _observed_calendar_source(calendar_path: Path) -> tuple[pd.DataFrame, Path]:
@@ -609,18 +731,22 @@ def expand_player_fixture_calendar(
     output["_had_fpl_roster_row"] = pd.MultiIndex.from_frame(output[key]).isin(fpl_index)
 
     fpl_keyed = fpl.set_index(key).reindex(pd.MultiIndex.from_frame(output[key]))
-    fixture_fill_columns = [
-        "fbref_id", "fpl_id", "gw_orig", "gw_played", "date_sched", "date_played",
-        "opponent_id", "team", "venue", "is_home", "gf", "ga", "xg", "xga", "status",
-    ]
-    for column in fixture_fill_columns:
-        if column not in fpl_keyed:
+    fixture_fill_columns = {
+        "fbref_id": "fbref_id", "fpl_id": "fpl_id", "gw_orig": "gw_orig",
+        "gw_played": "gw_played", "date_sched": "date_sched",
+        "date_played": "date_played", "opponent_id": "opponent_id",
+        "team": "team", "venue": "venue", "is_home": "is_home",
+        "gf": "team_gf", "ga": "team_ga", "xg": "team_xg",
+        "xga": "team_xga", "status": "status",
+    }
+    for source, target in fixture_fill_columns.items():
+        if source not in fpl_keyed:
             continue
-        values = pd.Series(fpl_keyed[column].to_numpy(), index=output.index)
-        if column not in output:
-            output[column] = values
+        values = pd.Series(fpl_keyed[source].to_numpy(), index=output.index)
+        if target not in output:
+            output[target] = values
         else:
-            output[column] = output[column].replace("", pd.NA).fillna(values)
+            output[target] = output[target].replace("", pd.NA).fillna(values)
     output["fbref_id"] = output.get("fbref_id", output["match_id"]).replace("", pd.NA).fillna(output["match_id"])
     derived_home = pd.to_numeric(output.get("is_home"), errors="coerce")
     existing_home = pd.to_numeric(output.get("was_home"), errors="coerce")
@@ -648,6 +774,8 @@ def expand_player_fixture_calendar(
         "red_cards": "red_crd",
         "own_goals": "own_goals",
         "saves": "saves",
+        "goals_scored": "goals",
+        "assists": "assists",
         "value": "price",
     }
     for source, target in authoritative_stats.items():
@@ -660,9 +788,12 @@ def expand_player_fixture_calendar(
         output.loc[fpl_mask, target] = values.loc[fpl_mask]
 
     status = output.get("status", pd.Series("", index=output.index)).astype(str).str.lower()
-    completed = status.isin(FINISHED_STATUSES) | output.get(
+    # Some canonical schedules retain the planned date in date_played before
+    # kickoff. An explicit scheduled status therefore wins over that fallback.
+    has_played_date = output.get(
         "date_played", pd.Series("", index=output.index)
     ).astype(str).ne("")
+    completed = status.isin(FINISHED_STATUSES) | (status.eq("") & has_played_date)
     if {"team_h_score", "team_a_score"}.issubset(fpl_keyed.columns):
         home_score = pd.to_numeric(fpl_keyed["team_h_score"], errors="coerce")
         away_score = pd.to_numeric(fpl_keyed["team_a_score"], errors="coerce")
@@ -712,21 +843,38 @@ def expand_player_fixture_calendar(
     output.loc[goalkeeper_started, "is_starter"] = 1
     output.loc[goalkeeper_needs_imputation, "starter_source"] = "imputed"
 
+    # A live in-season panel mixes retrospective observations with a current
+    # roster snapshot. Preserve that leakage boundary on each individual row.
+    for target, internal_source in ROW_PROVENANCE_COLUMNS.items():
+        default = {
+            "information_timestamp": information_timestamp,
+            "eligibility_source": eligibility_source,
+            "eligibility_timestamp_safe": bool(timestamp_safe),
+        }[target]
+        if internal_source in fpl_keyed:
+            values = pd.Series(fpl_keyed[internal_source].to_numpy(), index=output.index)
+            output[target] = values.replace("", pd.NA).fillna(default)
+        else:
+            output[target] = default
+    output["eligibility_timestamp_safe"] = (
+        output["eligibility_timestamp_safe"].astype("string").str.lower().isin({"1", "true", "yes", "y"})
+    )
+
     output["registered"] = True
     output["confirmed_unavailable"] = False
     output["unavailable_reason"] = ""
     if availability is not None and not availability.empty:
         availability_keyed = availability.drop_duplicates("player_id", keep="last").set_index("player_id")
-        output["confirmed_unavailable"] = output["player_id"].map(
+        current_snapshot_row = output["eligibility_timestamp_safe"]
+        mapped_unavailable = output["player_id"].map(
             availability_keyed["confirmed_unavailable"]
         ).fillna(False).astype(bool)
-        output["unavailable_reason"] = output["player_id"].map(
+        mapped_reason = output["player_id"].map(
             availability_keyed["unavailable_reason"]
         ).fillna("")
+        output.loc[current_snapshot_row, "confirmed_unavailable"] = mapped_unavailable.loc[current_snapshot_row]
+        output.loc[current_snapshot_row, "unavailable_reason"] = mapped_reason.loc[current_snapshot_row]
     output["eligible_for_fixture"] = output["registered"] & ~output["confirmed_unavailable"]
-    output["information_timestamp"] = information_timestamp
-    output["eligibility_source"] = eligibility_source
-    output["eligibility_timestamp_safe"] = bool(timestamp_safe)
     output["row_source"] = np.select(
         [
             output["_had_fpl_roster_row"] & output["_had_provider_observation"],
@@ -751,12 +899,15 @@ def expand_player_fixture_calendar(
         "match_id", "fbref_id", "fpl_id", "gw_orig", "gw_played", "date_sched", "date_played",
         "team_id", "opponent_id", "team", "venue", "was_home", "player_id", "player", "pos",
         "minutes", "days_since_last", "is_active", "is_starter", "starter_source",
+        "team_gf", "team_ga", "team_xg", "team_xga", "goals", "assists", "xg", "xa",
     ]
     trailing = [c for c in PANEL_PROVENANCE_COLUMNS if c in output]
     internal = {"_had_provider_observation", "_had_fpl_roster_row", "_fixture_time", "is_home", "status"}
+    legacy_team_columns = {"gf", "ga", "xga"}
     remainder = [
         c for c in output.columns
         if c not in leading and c not in trailing and c not in internal
+        and c not in legacy_team_columns
     ]
     output = output[[c for c in leading if c in output] + remainder + trailing]
     audit = {
@@ -793,7 +944,20 @@ def build_effective_dated_eligibility(
         raise ValueError(f"{season}: eligibility rows lack team fixture ordering")
     work = work.sort_values(["player_id", "team_id", "_team_fixture_index"])
     previous = work.groupby(["player_id", "team_id"])["_team_fixture_index"].shift(1)
-    new_segment = previous.isna() | work["_team_fixture_index"].sub(previous).ne(1)
+    grouping = work.groupby(["player_id", "team_id"])
+    provenance_changed = pd.Series(False, index=work.index)
+    for column in (
+        "eligibility_source", "information_timestamp",
+        "eligibility_timestamp_safe", "confirmed_unavailable",
+    ):
+        provenance_changed |= work[column].astype("string").ne(
+            grouping[column].shift(1).astype("string")
+        )
+    new_segment = (
+        previous.isna()
+        | work["_team_fixture_index"].sub(previous).ne(1)
+        | provenance_changed
+    )
     work["_segment"] = new_segment.groupby([work["player_id"], work["team_id"]]).cumsum()
 
     rows: list[dict[str, Any]] = []
@@ -847,6 +1011,7 @@ def process_season(
     registry_root: Path,
     eligibility_root: Path,
     availability_root: Path,
+    understat_root: Path,
     as_of: pd.Timestamp,
     force: bool,
 ) -> dict[str, Any]:
@@ -862,13 +1027,33 @@ def process_season(
     roster_path = processed_fpl_root / season / "season" / "cleaned_players.csv"
     availability: pd.DataFrame | None = None
     if merged_path.is_file():
+        if not roster_path.is_file() or not raw_players_path.is_file():
+            raise FileNotFoundError(
+                f"{season}: in-season publication requires merged_gws.csv plus a cleaned/raw live roster"
+            )
         code_registry = _global_fpl_code_registry(registry_root, processed_fpl_root)
-        universe, source_audit = load_historical_fpl_universe(
+        historical, historical_audit = load_historical_fpl_universe(
             season,
             merged_path=merged_path,
             players_raw_path=raw_players_path,
             code_registry=code_registry,
             registry_root=registry_root,
+        )
+        source_timestamp = _file_timestamp(raw_players_path)
+        live, live_audit = load_preseason_fpl_universe(
+            season,
+            roster_path=roster_path,
+            fixtures=fixtures,
+            information_timestamp=source_timestamp,
+        )
+        universe, source_audit = combine_inseason_universes(
+            historical, historical_audit, live, live_audit
+        )
+        availability = build_availability_snapshot(
+            season,
+            raw_players_path=raw_players_path,
+            roster_path=roster_path,
+            information_timestamp=source_timestamp,
         )
     else:
         if not roster_path.is_file() or not raw_players_path.is_file():
@@ -888,6 +1073,7 @@ def process_season(
             roster_path=roster_path,
             information_timestamp=source_timestamp,
         )
+    if availability is not None:
         timestamp_label = source_timestamp.strftime("%Y%m%dT%H%M%SZ")
         snapshot_path = availability_root / season / "snapshots" / f"availability__{timestamp_label}.csv"
         if force or not snapshot_path.exists():
@@ -916,11 +1102,15 @@ def process_season(
         eligibility_source=source_audit["source"],
         timestamp_safe=bool(source_audit["timestamp_safe"]),
     )
+    panel, attacking_audit = enrich_player_attacking_stats(
+        panel, understat_root / season / "player_match.csv"
+    )
     eligibility = build_effective_dated_eligibility(season, panel, fixtures)
     eligibility_path = eligibility_root / season / "player_eligibility.csv"
     audit = {
         **source_audit,
         **panel_audit,
+        **attacking_audit,
         "eligibility_intervals": len(eligibility),
         "observed_calendar_source": str(observed_source),
         "calendar_output": str(calendar_path),
@@ -978,6 +1168,11 @@ def main() -> None:
         type=Path,
         default=Path("data/processed/registry/availability"),
     )
+    parser.add_argument(
+        "--understat-root",
+        type=Path,
+        default=Path("data/processed/understat/ENG-Premier League"),
+    )
     parser.add_argument("--as-of", help="UTC information timestamp; defaults to now")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--log-level", default="INFO")
@@ -996,6 +1191,7 @@ def main() -> None:
                 registry_root=args.registry_root,
                 eligibility_root=args.eligibility_root,
                 availability_root=args.availability_root,
+                understat_root=args.understat_root,
                 as_of=as_of,
                 force=args.force,
             )

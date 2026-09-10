@@ -13,7 +13,12 @@ from .artifacts import (
 )
 from .backtest import run_walk_forward
 from .config import load_config
-from .data import canonical_training_rows, inference_rows, load_registry
+from .data import (
+    canonical_training_rows,
+    current_season_history_rows,
+    inference_rows,
+    load_registry,
+)
 from .features import build_features
 from .inference import add_legacy_compatibility, predict
 from .legacy import prepare_v1_inputs, prepare_v1_shadow_artifact
@@ -98,6 +103,9 @@ def command_forecast(args: argparse.Namespace) -> int:
     cutoff = pd.to_datetime(args.prediction_cutoff, utc=True)
     rows, audit = load_registry(config, (*config.canonical_label_seasons, args.season))
     historical = canonical_training_rows(rows, config, cutoff, audit)
+    current_history = current_season_history_rows(
+        rows, args.season, cutoff, config
+    )
     future = inference_rows(rows, args.season, cutoff)
     if args.gws:
         target_gws = {int(value.strip()) for value in args.gws.split(",") if value.strip()}
@@ -111,13 +119,20 @@ def command_forecast(args: argparse.Namespace) -> int:
     future = future[pd.to_numeric(future["gw_orig"], errors="coerce").isin(target_gws)].copy()
     if future.empty:
         raise ValueError(f"No timestamp-safe inference rows for target GWs {sorted(target_gws)}")
-    combined = pd.concat([historical, future], ignore_index=True, sort=False)
+    combined = pd.concat(
+        [historical, current_history, future], ignore_index=True, sort=False
+    )
     featured = build_features(combined, cutoff)
     future_keys = future[["match_id", "player_id"]].drop_duplicates()
     forward_featured = featured[featured["season"].eq(args.season)].copy()
     forecast_rows = forward_featured.merge(
         future_keys, on=["match_id", "player_id"], how="inner", validate="one_to_one"
     )
+    # Historical calendars may still contribute legacy team-context names to
+    # the concat schema. Never republish those ambiguous aliases when the
+    # explicit current-registry columns are present.
+    if {"team_gf", "team_ga", "team_xg", "team_xga"}.issubset(forecast_rows.columns):
+        forecast_rows = forecast_rows.drop(columns=["gf", "ga", "xga"], errors="ignore")
     models, calibrators, card = load_training_artifacts(Path(args.artifact_dir))
     run_id = deterministic_run_id(config, cutoff.isoformat(), audit.source_files)
     predictions = predict(forecast_rows, models, calibrators, cutoff, run_id)

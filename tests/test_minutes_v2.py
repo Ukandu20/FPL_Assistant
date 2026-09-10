@@ -12,7 +12,12 @@ from fpl_assistant.minutes_v2.calibration import (
     select_calibration,
 )
 from fpl_assistant.minutes_v2.config import MinutesV2Config, load_config
-from fpl_assistant.minutes_v2.data import DatasetAudit, _normalize, canonical_training_rows
+from fpl_assistant.minutes_v2.data import (
+    DatasetAudit,
+    _normalize,
+    canonical_training_rows,
+    current_season_history_rows,
+)
 from fpl_assistant.minutes_v2.evaluation import (
     acceptance_gate, paired_block_bootstrap, probability_metrics, state_log_loss,
 )
@@ -91,6 +96,27 @@ def test_training_filter_excludes_untrusted_seasons_labels_and_post_cutoff() -> 
     selected = canonical_training_rows(rows, _config(), "2026-01-01", audit)
     assert len(selected) == 1
     assert selected.iloc[0]["starter_source"] == "fpl"
+
+
+def test_current_season_history_uses_only_trusted_outcomes_known_by_cutoff() -> None:
+    rows = pd.DataFrame({
+        "season": ["2026-2027"] * 4,
+        "date_sched": pd.to_datetime(
+            ["2026-08-21", "2026-08-21", "2026-08-21", "2026-08-31"], utc=True
+        ),
+        "minutes": [90, 30, 0, np.nan],
+        "is_starter": [1, 0, 0, np.nan],
+        "information_timestamp": pd.to_datetime(
+            ["2026-08-25", "2026-08-27", "2026-08-25", "2026-08-25"], utc=True
+        ),
+        "starter_source": ["fpl", "fpl", "fallback", "pending"],
+    })
+
+    selected = current_season_history_rows(
+        rows, "2026-2027", "2026-08-26T23:59:59Z", _config()
+    )
+
+    assert selected.index.tolist() == [0]
 
 
 def test_registry_normalization_accepts_mixed_date_and_kickoff_precision() -> None:

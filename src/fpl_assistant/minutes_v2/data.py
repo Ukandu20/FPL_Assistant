@@ -153,3 +153,24 @@ def inference_rows(
     if result.empty:
         raise ValueError("No timestamp-safe eligible inference roster rows known by prediction cutoff")
     return result
+
+
+def current_season_history_rows(
+    rows: pd.DataFrame,
+    season: str,
+    prediction_cutoff: str | pd.Timestamp,
+    config: MinutesV2Config,
+) -> pd.DataFrame:
+    """Return current-season outcomes that were published before the cutoff."""
+    cutoff = pd.to_datetime(prediction_cutoff, utc=True)
+    df = rows[rows["season"].eq(season)].copy()
+    observed_before_cutoff = (
+        df["date_sched"].notna()
+        & df["date_sched"].lt(cutoff)
+        & df["minutes"].notna()
+        & df["is_starter"].notna()
+        & df["information_timestamp"].notna()
+        & df["information_timestamp"].le(cutoff)
+        & df["starter_source"].isin(config.trusted_starter_sources)
+    )
+    return df.loc[observed_before_cutoff].copy()
