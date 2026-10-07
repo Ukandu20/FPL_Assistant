@@ -557,10 +557,44 @@ def build_fixture_calendar(
     all_date_conflicts = ws_dates.notna() & und_dates.notna() & ws_dates.ne(und_dates)
     observed_rows = _observed_match_mask(fb)
     date_conflicts = all_date_conflicts & observed_rows
+    reconciliation_columns = [
+        "match_id", "team_id", "home", "away", "fpl_id",
+        "whoscored_date", "understat_date", "fpl_date", "date_played", "reason",
+    ]
+    date_reconciliation = pd.DataFrame(columns=reconciliation_columns)
+    reconciled = pd.Series(False, index=fb.index)
     if date_conflicts.any():
+        # Pairings must be unique within this season, including unfinished
+        # fixtures. Never choose one of several FPL candidates by date.
+        unique_fpl = fpl.loc[
+            ~fpl.duplicated(["home", "away"], keep=False)
+            & fpl["home"].notna() & fpl["away"].notna(),
+            ["home", "away", "fpl_id", "date_sched", "status"],
+        ]
+        candidates = fb.loc[
+            date_conflicts, ["match_id", "team_id", "home", "away"]
+        ].copy()
+        candidates["_provider_row"] = candidates.index
+        candidates = candidates.merge(
+            unique_fpl, on=["home", "away"], how="left", validate="many_to_one"
+        ).set_index("_provider_row")
+        candidates["whoscored_date"] = ws_dates.reindex(candidates.index)
+        candidates["understat_date"] = und_dates.reindex(candidates.index)
+        agreed = candidates["status"].eq("finished") & candidates["date_sched"].eq(
+            candidates["understat_date"]
+        )
+        accepted = candidates.loc[agreed].copy()
+        reconciled.loc[accepted.index] = True
+        accepted["fpl_date"] = accepted["date_sched"]
+        accepted["date_played"] = accepted["understat_date"]
+        accepted["reason"] = "finished_fpl_understat_date_agreement"
+        date_reconciliation = accepted[reconciliation_columns]
+    unresolved_conflicts = date_conflicts & ~reconciled
+    if unresolved_conflicts.any():
         raise ValueError(
             "WhoScored/Understat game dates conflict on "
-            f"{int(date_conflicts.sum())} rows"
+            f"{int(unresolved_conflicts.sum())} rows without unique finished "
+            "FPL fixtures corroborating Understat dates"
         )
     provisional_conflicts = all_date_conflicts & ~observed_rows
     if provisional_conflicts.any():
@@ -570,6 +604,13 @@ def build_fixture_calendar(
             int(provisional_conflicts.sum()),
         )
     fb["date_played"] = ws_dates.fillna(und_dates)
+    fb.loc[reconciled, "date_played"] = und_dates.loc[reconciled]
+    if reconciled.any():
+        logging.warning(
+            "%s • reconciled %d stale WhoScored date rows using finished "
+            "FPL/Understat agreement (see _date_reconciliation_audit.csv)",
+            season, int(reconciled.sum()),
+        )
     fb["is_away"] = (~_to_bool_mask(fb["is_home"])).astype("Int8")
 
     # Publish the schema consumed by team_form_builder. The current WhoScored
@@ -738,6 +779,10 @@ def build_fixture_calendar(
     csv_out["date_played"] = csv_out["date_played"].dt.strftime("%Y-%m-%d")
     csv_out.to_csv(out_csv, index=False)
     logging.info("%s • fixture_calendar.csv (%d rows)", season, len(out))
+
+    # Always replace the audit on a successful build, even when empty, so it
+    # describes the current calendar rather than an earlier reconciliation.
+    date_reconciliation.to_csv(dst_dir / "_date_reconciliation_audit.csv", index=False)
 
     # Diagnostics
     missing = out[out["match_id"].isna()]

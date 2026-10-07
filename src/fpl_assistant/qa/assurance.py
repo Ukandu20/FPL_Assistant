@@ -95,7 +95,7 @@ def validate_fixture_calendar(season_dir: Path) -> pd.DataFrame:
     if not fp.exists():
         fail(f"{season_dir.name}: fixture_calendar.csv missing")
 
-    df = pd.read_csv(fp)
+    df = pd.read_csv(fp, low_memory=False)
 
     missing_header = REQ_FIXTURE_COLS - set(df.columns)
     assert not missing_header, (
@@ -156,7 +156,7 @@ def validate_player_minutes_calendar(season_dir: Path,
     if fp is None:
         fail(f"{season_dir.name}: player_fixture_calendar.csv missing")
 
-    df = pd.read_csv(fp)
+    df = pd.read_csv(fp, low_memory=False)
 
     # Header must include all required columns (even if empty)
     missing_header = REQ_PMC_COLS - set(df.columns)
