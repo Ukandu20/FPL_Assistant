@@ -1,0 +1,119 @@
+Team Form Builder — CLI Arguments & Usage
+
+This section documents every CLI flag in team_form_builder.py and shows how to use them—individually and together.
+
+Outputs (what this command produces)
+
+For each processed season:
+
+data/processed/features/<version>/<SEASON>/team_form.csv
+
+data/processed/features/<version>/<SEASON>/team_form.meta.json
+
+data/processed/features/<version>/<SEASON>/logs/identity_mismatches.csv (only if mismatches were found)
+
+Arguments (flag-by-flag)
+Flag	Type / Default	What it does	When to use
+--season	str, optional	Process only this season (e.g., 2025-2026). If omitted, processes all season folders under --fixtures-root.	Target a single season (debugging or incremental builds). Omit for a full backfill.
+--fixtures-root	Path, default data/processed/fixtures	Root directory containing per-season fixture_calendar.csv.	Point to your registry/alt data location if different from default.
+--out-dir	Path, default data/processed/features	Root directory for outputs (versioned).	Keep default for normal runs; change if you maintain multiple registries.
+
+
+Versioning controls
+Flag	Type / Default	What it does	When to use
+--version	str, default None	Write into this explicit version directory (e.g., v2). If omitted and --auto-version is set, a new vN is chosen automatically.	Pin builds to a known version (v2) for reproducibility.
+--auto-version	boolean (store_true)	Picks the next available vN under --out-dir.	Making a brand new build without choosing a number manually.
+--reuse-version	boolean	Overwrite in-place inside the chosen version (safe for small, non-logic edits). Increments build_no in meta.	Small changes where consumers already read from that version.
+--write-latest	boolean	Updates a latest pointer (symlink or LATEST_VERSION.txt) and copies per-season outputs to features/latest/<SEASON>/.	Workflows that reference a stable “latest” path downstream.
+
+
+Rolling parameters
+Flag	Type / Default	What it does	When to use
+--window	int, default 5	Rolling window size (matches) for classic past-only rolling. Ignored if --ewma is used.	Prefer simple, fixed-length history.
+--tau	float, default 2.0	Venue shrinkage strength in the venue-aware means. Larger → more shrink toward overall mean when few venue samples exist.	Early season or sparse venue data; tune for stability.
+--prior-matches	int, default 6	First K matches blend team priors → 0 (fading). Helps cold start.	Leagues with promoted teams or first weeks of season.
+--ewma	boolean	Use EWMA past-only rolling instead of hard window.	Prefer recency weighting without a hard cutoff.
+--halflife	float, default 3.0	EWMA halflife (in matches). Only used when --ewma is set.	Tune how fast history decays (smaller = more reactive).
+FDR parameters
+Flag	Type / Default	What it does	When to use
+--bucket-mode	{"hybrid","season","global"}, default hybrid	Determines how difficulty buckets (2–5, where 5 = hardest) are formed: hybrid (early GWs use fixed-z; later use season percentiles), season (percentiles all season), global (fixed-z all season).	Hybrid is robust early; use season for intra-season relative scaling; global for stable thresholds.
+--hybrid-cutoff	int, default 6	In hybrid mode, GWs < cutoff use fixed-z; ≥ cutoff use season percentiles.	Adjust if your league starts later/earlier or if early noise persists.
+--w-att	float, default 0.5	Weight for attacking difficulty component in composite FDR.	Increase if you want attacking form to matter more.
+--w-def	float, default 0.5	Weight for defensive difficulty component in composite FDR.	Increase if you want defensive strength to matter more.
+Behavior & logging
+Flag	Type / Default	What it does	When to use
+--strict-ids	boolean, default False	Error if is_home conflicts with home_id/away_id; otherwise we warn and continue.	Enforce upstream identity hygiene in CI/backfills.
+--force	boolean	Rebuild even if outputs already exist (ignores “exists” guard).	When you need to overwrite a version regardless.
+--log-level	{"DEBUG","INFO","WARNING","ERROR"}, default INFO	Controls verbosity. DEBUG prints side-split and pairing strategy, coverage, etc.	Use DEBUG while debugging joins/data quality.
+Usage Patterns (copy-paste recipes)
+1) Full backfill (all seasons), classic rolling
+py -m scripts.fbref_pipeline.integrate.team_form_builder \
+  --fixtures-root "data/processed/fixtures" \
+  --out-dir "data/processed/features" \
+  --auto-version \
+  --window 5 --tau 2.0 --prior-matches 6 \
+  --bucket-mode hybrid --hybrid-cutoff 6 \
+  --w-att 0.5 --w-def 0.5 \
+  --log-level INFO --write-latest
+
+2) Single-season rebuild with EWMA
+py -m scripts.fbref_pipeline.integrate.team_form_builder \
+  --season 2025-2026 \
+  --fixtures-root "data/processed/registry/fixtures" \
+  --out-dir "data/processed/registry/features" \
+  --version v2 --reuse-version \
+  --ewma --halflife 3 \
+  --bucket-mode hybrid --hybrid-cutoff 6 \
+  --w-att 0.5 --w-def 0.5 \
+  --log-level DEBUG --write-latest
+
+3) Strict identity checks (CI gate)
+py -m scripts.fbref_pipeline.integrate.team_form_builder \
+  --season 2024-2025 \
+  --version v3 \
+  --strict-ids \
+  --log-level INFO
+
+4) Force overwrite a version
+py -m scripts.fbref_pipeline.integrate.team_form_builder \
+  --version v2 \
+  --force \
+  --log-level INFO
+
+Notes & Gotchas
+
+Season selection: If you omit --season, the tool inspects --fixtures-root for subfolders (one per season) and builds them all.
+
+Versioning:
+
+Use --auto-version for new builds (v1, v2, …).
+
+Use --version vX --reuse-version to overwrite within an existing version (and bump build_no in meta).
+
+--write-latest updates a latest pointer and copies per-season outputs to features/latest/<SEASON>/.
+
+Rolling mode:
+
+Classic (--window): fixed horizon; simple and predictable.
+
+EWMA (--ewma --halflife): smooth decay; more responsive to form shifts.
+
+FDR buckets: Always 2–5 (5 = hardest). Hybrid bucketing stabilizes the first few GWs where sample sizes are thin.
+
+Identity hygiene:
+
+The builder prefers is_home to split sides; falls back to id-equality if flags are unusable.
+
+Conflicts between flags and IDs are logged to logs/identity_mismatches.csv. Use --strict-ids to fail on them.
+
+Coverage & logs: The tool logs FDR coverage per season and (with DEBUG) the pairing mode used (strict by side IDs vs. relaxed by (season,fpl_id)).
+
+Quick Checklist (best practices)
+
+✅ For early season: use hybrid bucketing with --hybrid-cutoff around 6.
+
+✅ If your league’s data is noisy, increase prior-matches and tau slightly.
+
+✅ Run with --log-level DEBUG when debugging join keys or current-season quirks.
+
+✅ Keep downstream consumers reading from …/features/latest/<SEASON>/ and update with --write-latest.

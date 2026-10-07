@@ -1,4 +1,8 @@
-# FPL pipeline runbook
+# FPL pipeline reference
+
+For the combined scraping-to-publication execution order, use
+[Complete FPL and provider data pipeline](COMPLETE_DATA_PIPELINE.md).
+This document retains the detailed FPL data contracts.
 
 This runbook is the production contract for scraping, cleaning, enriching, and
 publishing Fantasy Premier League data.
@@ -23,14 +27,16 @@ paths shown below.
 Raw files are source snapshots. Applications and models must read processed
 files only.
 
-## Complete cleaning suite
+## FPL stage responsibilities
 
 The maintained FPL entry points live under `fpl_assistant.providers.fpl`.
 Canonical fixture bootstrapping and combined player/team features live under
 `fpl_assistant.pipelines.integrate`. Run package commands from the repository
 root after installing with `python -m pip install -e .`.
 
-The complete sequence is:
+The FPL-owned stages are listed below. They interleave with provider cleaning
+and integration as shown in the combined runbook; this list alone is not the
+full multi-provider execution sequence:
 
 1. `scrape.season_scraper`: download the bootstrap roster, teams, fixtures,
    player history, and available gameweek data into the league-scoped raw tree.
@@ -42,7 +48,7 @@ The complete sequence is:
 4. `clean.gw_stats_cleaner`: clean individual and merged gameweek rows and
    attach canonical player/team IDs.
 5. `clean.assign_game_ids`: attach canonical match IDs to played gameweek rows
-   after the fixture calendar and FBref match surface are available.
+   after the fixture calendar is available; FBref is an optional fallback.
 6. `pipelines.prices_from_merged`: publish per-season price registries. Before
    GW1 it uses the processed roster price as the opening GW1 price.
 7. `master.consolidate_master`: rebuild the FPL player master from enriched
@@ -223,9 +229,9 @@ data/processed/fpl/ENG-Premier League/<season>/_manual_review/
   preseason_carryover_reset_<season>.json
 ```
 
-This is the required treatment for the current 2026-2027 snapshot: its roster
-and fixtures belong to 2026-2027, but its cumulative player values belong to
-the preceding season and must not be displayed as 2026-2027 results.
+This treatment applies only while the target season is entirely unstarted
+and the cleaner detects prior-season cumulative values. Once fixtures have
+started, current-season performance must not be reset as preseason carry-over.
 
 ## 3. Bootstrap the canonical fixture calendar
 
@@ -398,9 +404,9 @@ timestamp-safety contract.
 ## 5. Assign canonical game IDs
 
 The bootstrap calendar already contains canonical match identities, but this
-stage attaches them to played FPL gameweek rows. The current command also uses
-the processed FBref match surface as a fallback and validation source, so run
-it only after both the merged FPL gameweeks and FBref summary are available:
+stage attaches them to played FPL gameweek rows. Run it after merged FPL
+gameweeks and the canonical fixture calendar are available. A processed FBref
+summary is an optional fallback, not a prerequisite:
 
 ```powershell
 python -m fpl_assistant.providers.fpl.clean.assign_game_ids `

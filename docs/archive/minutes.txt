@@ -1,0 +1,405 @@
+Minutes Model (v1) — Technical Guide & Operator Manual
+
+This is a practical, “how it works + how to use it” guide for your minutes predictor with starter-awareness, cameo decomposition, GK routing, and versioned artifacts. I’ll also call out known limitations (notably: no-DNP rows) and the highest-leverage follow-ups.
+
+1) Problem framing
+
+We want expected minutes for each player in a fixture pre-deadline, plus probability surfaces that matter for FPL:
+
+Why is this important?
+
+It is the core backbone for which the rest of the models lie. If the accurac
+
+P(start): probability of starting.
+
+P(60+): probability of playing 60+ minutes (minutes points cliff).
+
+P(play>0) a.k.a. P(cameo) when benched, and the expected cameo minutes if they do come on.
+
+Core output is:
+
+pred_minutes (hybrid of start vs bench paths)
+
+p_start, p60, p_cameo, p_play (= p_start + (1−p_start)*p_cameo)
+
+exp_minutes_points = clamp(p_play + p60, 0, 2)
+
+Diagnostics CSVs and metrics.json for quality control.
+
+2) Data expectations
+
+Input CSV per season: player_minutes_calendar.csv
+
+Minimum columns used:
+
+player_id, player, pos, team_id,
+gw_orig, date_played,
+minutes, is_starter, is_active,
+days_since_last, venue, fdr_home, fdr_away
+
+
+Notes:
+
+No DNP rows currently (dataset only contains rows where a player appeared). This is the major limitation: it restricts what we can learn about true bench no-shows.
+
+is_starter is target for start classifier; minutes yields labels:
+
+y60 = 1{minutes >= 60}
+
+y_played = 1{minutes > 0} (used for cameo head training when is_starter==0)
+
+3) Features (causal / pre-deadline safe)
+
+For each row (sorted by player, season, date, gw):
+
+Minutes history:
+
+min_lag1 (last appearance minutes)
+
+min_ewm_hl2 (EWMA of minutes with halflife≈2; causal via lag)
+
+Recency:
+
+days_feat (capped or log1p days since last appearance)
+
+long_gap14 (1 if gap >14d)
+
+Starter history:
+
+start_lag1 (1 if started last)
+
+start_rate_hl3 (EWMA of starts with halflife≈3; causal)
+
+start_streak, bench_streak (consecutive prior starts/benches)
+
+Context:
+
+pos_enc (GK/DEF/MID/FWD → 0/1/2/3)
+
+team_rot3 (XI changes rolling window proxy; optional)
+
+fdr (venue-aware difficulty if supplied)
+
+All these are shifted / lagged so they don’t leak post-deadline info.
+
+4) Model heads & what each does
+4.1 Start gate: P(start | X, pos)
+
+Per-position LightGBM classifiers (GK/DEF/MID/FWD) with a global fallback.
+
+Optional monotonic constraints on safe features (e.g., more recent starts → higher P(start)).
+
+Optional isotonic calibration (per-position + global fallback).
+
+Blending: p = blend * p_pos + (1−blend) * p_global where both exist (flag --gate-blend, e.g. 0.3).
+
+Why per-pos? Starting dynamics differ a lot across positions (esp. GK).
+
+4.2 Benched cameo decomposition
+
+If benched, minutes are modeled via two components:
+
+Cameo probability: P(cameo | bench, X, pos) trained on bench rows:
+
+Per-position classifiers (+global fallback), optional isotonic.
+
+In your current data, no DNP → bench rows almost always have minutes > 0, so this head collapses to ~1.0. That’s an honest reflection of the label space.
+
+Cameo minutes: a regression head predicting the minutes if they do come on. We also put per-position caps learned from training cameo distributions (e.g., 95th/98th percentile by position).
+
+Combined bench path minutes:
+
+μ_bench = P(cameo | bench, X, pos)  *  E[minutes | cameo, bench, X, pos]
+
+
+(With no DNPs, P(cameo) ≈ 1.0, so μ_bench ≈ the cameo minutes head.)
+
+4.3 Starter minutes: E[minutes | start, X]
+
+Regressor trained on starter rows. Objective is L2 (least squares).
+
+Optional taper: shrink predicted starter minutes when p_start is low, to avoid over-confident 80–90’ when the start is doubtful.
+
+4.4 60-minute cliff head: P(60+ | X)
+
+Two modes:
+
+Direct (--p60-mode direct): binary classifier using all rows (empirically your best so far: AUC ≈ 0.83–0.85).
+
+Structured (P(60+) = P(start) * P(60+ | start) with per-pos models). Useful when the start gate is very strong.
+
+Optional isotonic calibration improves Brier and interpretability.
+
+5) Hybrid routing (core minutes prediction)
+
+We compute three quantities:
+
+Starter prediction: μ_start = E[minutes | start, X] (after taper if enabled)
+
+Bench prediction: μ_bench (cameo probability × cameo minutes, capped per pos)
+
+Soft mix: μ_mix = p_start * μ_start + (1 - p_start) * μ_bench
+
+Then apply per-position thresholds (t_lo, t_hi):
+
+If p_start ≤ t_lo(pos): use bench minutes (hard route).
+
+If p_start ≥ t_hi(pos): use start minutes (hard route).
+
+Otherwise: use the soft mix.
+
+GK no-mix mode (--no-mix-gk): if GK and p_start > t_lo, route hard to starter minutes (reflects “GK either starts 90’ or doesn’t play” reality).
+
+Finally, guardrails:
+
+Clip very low p_start cases to max 10 or 30 minutes (configurable caps).
+
+Clip final to [0, 120].
+
+6) Outputs
+6.1 expected_minutes.csv
+
+Columns (typical):
+
+season, gw_orig, date_played
+player_id, player, pos, team_id
+is_starter, minutes_true, true_pts
+p_start, p_cameo, p_play, p60
+pred_minutes, exp_minutes_points
+pred_bench_head (if exported), ...
+
+
+Interpretation:
+
+pred_minutes: the hybrid-routed minutes predictor (what you’ll use downstream).
+
+exp_minutes_points = clamp(p_play + p60, 0, 2).
+This is the EV of minutes points only, independent of attacking/defensive returns.
+
+6.2 metrics.json
+
+minutes_test_MAE, minutes_MAE_Started, minutes_MAE_Benched
+
+start_AUC_test, start_Brier_test
+
+p60_AUC_test, p60_Brier_test
+
+ev_minutes_points_MAE
+
+bench_share
+
+thresholds actually used: either global (t_lo, t_hi) or by-pos thresholds if supplied.
+
+6.3 Risk lists (optional)
+
+risky_starters.csv: high p_start but low p60 (potential “sub-60” traps).
+
+6.4 Artifacts (models & calibrators)
+
+Gate, cameo, p60 models (per-pos + global fallbacks)
+
+Isotonic calibrators where trained
+
+Feature importances for explainability
+
+7) Training & CLI
+Typical run (what you just used)
+py -m scripts.models.minutes_model_builder \
+  --seasons 2020-2021,2021-2022,2022-2023,2023-2024,2024-2025 \
+  --first-test-gw 26 \
+  --fix-root data/processed/registry/fixtures \
+  --model-out data/models/minutes \
+  --use-calibration --use-p60-calibration --use-pos-bench-caps --use-taper \
+  --p60-mode direct --gate-blend 0.3 \
+  --pos-thresholds "GK:0.15,0.55;DEF:0.25,0.70;MID:0.25,0.70;FWD:0.25,0.70" \
+  --no-mix-gk
+
+Key flags (what to tweak)
+
+Calibration: --use-calibration, --use-p60-calibration
+
+Routing: --pos-thresholds "GK:lo,hi;DEF:lo,hi;...", --no-mix-gk
+
+Taper: --use-taper (shrinks μ_start when p_start is low)
+
+Caps: --use-pos-bench-caps (data-driven 95–98th pct per pos cameo caps)
+
+Blending: --gate-blend α (0..1) between per-pos start gate and global
+
+P60: --p60-mode direct|structured
+
+8) Versioning model artifacts
+
+Latest: Every run updates <model-out>/latest (the working copy).
+
+Versioned: If the versions directory has no version, first run creates versions/v1.
+Subsequent runs keep writing to latest.
+When you want to lock a new version, pass a version tag (e.g., --version-tag v2) or run your “bump” task—this will snapshot the current latest into versions/vX.
+
+metrics.json includes code_version (e.g., 1.1.0) for traceability.
+
+Recommendation: Treat versions/vX as immutable snapshots; iterate on latest. When satisfied, snapshot to vX+1.
+
+9) Interpreting your current numbers (sanity)
+
+Recent runs (examples you posted):
+
+Minutes MAE ≈ 18.3–19.7 overall
+
+Starters MAE ≈ 13.7–15.8 (good)
+
+Bench MAE ≈ 28–29 (main pain point)
+
+P(60+) AUC ≈ 0.83–0.85 (solid)
+
+EV minutes-points MAE ≈ 0.31–0.45 (already helpful for pick decisions)
+
+GK (no-mix) starter MAE very low (≈ 2–4 mins), matching reality.
+
+Cause of bench pain: dataset has no DNP rows → cameo head learns that benches usually play, and you can’t calibrate “no-show”. Minutes head still works (≈20 mins average cameo) but misses the long cameo tail for DEF/MID in some weeks. If/when you add DNPs, that instantly improves both calibration and routing.
+
+10) Limitations & roadmap (blunt honesty)
+
+No DNPs: Can’t model/validate bench no-shows right now.
+Fix later: outer-join squad availability → create zero-minute rows.
+
+Single-mode cameo minutes: Captures central tendency (10–25’) but not the long cameo tail.
+Upgrade: two-mode cameo (short vs long) or quantile regression.
+
+Threshold autotune: Currently tuned with the bench head in place, but you can weight bench error more heavily when you care about it (already supported internally).
+
+P60 per-pos calibration: You can squeeze more Brier and reduce false “risky starters” with per-pos isotonic on the direct P60 head.
+
+11) Minimal reproducible workflow
+
+Build features & train
+
+Run the CLI (above).
+
+Inspect metrics.json in <model-out>/latest.
+
+Open expected_minutes.csv, check:
+
+Distribution of pred_minutes vs minutes_true.
+
+p_start reliability by deciles.
+
+Bench cameo distribution vs predicted cameo minutes.
+
+Lock version: snapshot to versions/vX when satisfied.
+
+12) Failure modes & fixes
+
+“UndefinedMetricWarning: AUC”
+Means validation tail has a single class. The code already widens the tail window; otherwise AUC is omitted for that head. Safe to ignore; check Brier or rows count.
+
+Bench minutes under-/over-clipped
+Tweak per-pos cap percentiles (95 → 98 for DEF/MID); keep GK tight.
+
+Overconfident starts around 0.6–0.8
+Increase t_hi in --pos-thresholds or use stronger per-pos isotonic (keep --use-calibration on).
+
+13) How to extend (when you’re ready)
+
+Add DNPs into the training/test frames (outer join vs. fixture roster).
+
+Two-mode cameo minutes: add P(long ≥30 | bench, X, pos) + two regressors μ_short, μ_long.
+
+Per-pos isotonic for P60 (direct mode).
+
+Autotune thresholds with a custom objective that weights bench MAE more when you’re focused on bench pain weeks.
+
+14) Pushback (so you keep improving)
+
+You’re relying on central cameo minutes. That’s safe but hides long-tail variance that bites DEF/MID benches. Make a note to implement the two-mode cameo once you can validate it.
+
+Without DNPs, p_cameo is necessarily near 1. Don’t over-interpret its calibration; it’s a placeholder until you expand the dataset.
+
+Don’t chase overall MAE too hard—optimize the EV minutes-points metric when making FPL decisions. You’re already in a good band there.
+
+15) Example: reading the outputs downstream
+
+Use pred_minutes to weight downstream xGI/xCS contributions (minute-scaled), not just binary ≥60.
+
+For start-risk comms, prefer p60 and risk_start_sub60 = max(0, p_start − p60) to flag “likely starter but sub-60 danger”.
+
+
+py -m scripts.models.minutes_model_builder `
+  --seasons 2020-2021,2021-2022,2022-2023,2023-2024,2024-2025 `
+  --first-test-gw 26 `
+  --fix-root data/processed/registry/fixtures `
+  --model-out data/models/minutes `
+  --use-calibration --use-p60-calibration --use-pos-bench-caps --use-taper `
+  --p60-mode direct --gate-blend 0.3 `
+  --pos-thresholds "GK:0.15,0.55;DEF:0.25,0.70;MID:0.25,0.70;FWD:0.25,0.70" --no-mix-gk
+
+INFO: {
+  "code_version": "1.1.0",
+  "n_train": 48501,
+  "n_test": 3955,
+  "minutes_test_MAE": 18.352,
+  "start_AUC_test": 0.8309,
+  "start_Brier_test": 0.1436,
+  "minutes_MAE_Started": 13.7307,
+  "minutes_MAE_Benched": 29.4059,
+  "bench_share": 0.2948166877370417,
+  "p60_AUC_test": 0.8319,
+  "p60_Brier_test": 0.1544,
+  "ev_minutes_points_MAE": 0.3134
+}
+INFO: Artifacts written to data\models\minutes (latest) and data\models\minutes\versions\v1 (versioned: v1).
+
+
+Commit message (suggested)
+
+feat(minutes): starter-aware hybrid with bench cameo decomposition, GK hard routing, per-pos thresholds; v1.1.0
+
+Add per-position start gate models (GK/DEF/MID/FWD) with global fallback and optional isotonic calibration; support blending via --gate-blend.
+
+Implement bench cameo decomposition:
+μ_bench = P(cameo | bench, X, pos) * E[minutes | cameo, bench, X, pos]
+with per-position cameo classifiers/regressors and train-derived per-pos caps.
+
+Add GK “no-mix” routing: if GK and above low threshold, hard-route to starter minutes (reflects GK start=90 reality).
+
+Support per-position routing thresholds via --pos-thresholds "GK:lo,hi;...".
+
+Keep direct P60 head with optional isotonic; export p60, p_play, exp_minutes_points.
+
+Add taper of starter minutes when p_start low (--use-taper).
+
+Export full diagnostics: expected_minutes.csv, metrics.json, feature importances, risky starters list.
+
+Versioned artifacts: always update latest; if no prior version, create versions/v1. metrics.json includes code_version (now 1.1.0).
+
+Results (example on 24/25 GW26+ test):
+
+Minutes MAE ≈ 18.35 (starters ≈ 13.7, bench ≈ 29.4)
+
+Start AUC ≈ 0.83, P60 AUC ≈ 0.83
+
+EV minutes-points MAE ≈ 0.31
+
+GK starters MAE ~ 2–4 mins with --no-mix-gk
+
+Notes: Dataset currently lacks DNP rows; cameo probability calibrations will improve once DNPs are integrated. Future: two-mode cameo minutes and per-pos isotonic for P60.
+
+
+
+1) Retrain to include full 2024–2025 (and 2025–2026 to date)
+
+Replace <NEXT_GW> with the next upcoming GW in 2025–2026 (e.g., 3 if GW1–2 are played).
+
+py -m scripts.models.minutes_model_builder ^
+  --seasons 2020-2021,2021-2022,2022-2023,2023-2024,2024-2025,2025-2026 ^
+  --first-test-gw <NEXT_GW> ^
+  --fix-root data/processed/registry/fixtures ^
+  --model-out data/models/minutes ^
+  --use-calibration --use-p60-calibration --use-pos-bench-caps --use-taper ^
+  --p60-mode direct --gate-blend 0.3 ^
+  --pos-thresholds "GK:0.15,0.55;DEF:0.25,0.70;MID:0.25,0.70;FWD:0.25,0.70" --no-mix-gk
+
+
+Training = all seasons listed plus 2025–2026 GWs < <NEXT_GW>.
+
+Test/predictions = 2025–2026 GWs ≥ <NEXT_GW>.

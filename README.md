@@ -4,6 +4,9 @@
 
 ## Repository architecture
 
+See the [documentation index](docs/README.md) for current runbooks, governing
+specifications, historical reports, and the documentation review.
+
 Application implementations live in [`src/fpl_assistant/`](src/fpl_assistant/).
 Provider scraping and cleaning are grouped under `providers/<provider>/`;
 cross-provider integration is under `pipelines/integrate/`. Shared run tracking
@@ -124,10 +127,10 @@ structure and UI conventions.
 
 ### Clean and integrate FBref data
 
-Use the [FBref pipeline runbook](docs/FBREF_PIPELINE.md) for the complete
-PowerShell sequence: raw coverage checks, the league/season-scoped cleaner,
-quarantine of source-deprecated 2025-2026 advanced outputs, canonical fixture
-and match-ID integration, feature publication, and final assurance.
+Use the [complete data pipeline runbook](docs/COMPLETE_DATA_PIPELINE.md) for
+the ordered PowerShell sequence covering FPL, WhoScored, Understat, optional
+FBref, and ClubElo scraping, cleaning, identity publication, calendars,
+eligibility, feature publication, and final assurance.
 
 ### Clean native WhoScored data
 

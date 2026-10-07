@@ -137,15 +137,7 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# documentation
-docs/*
-!docs/FBREF_PIPELINE.md
-!docs/FPL_PIPELINE.md
-!docs/SCRIPT_MIGRATION_REPORT.md
-!docs/archive/
-!docs/archive/optimizer_single_gw_prototype.txt
-!docs/FPL_ARCHETYPE_V1.md
-!docs/FPL_ARCHETYPE_V1_SAMPLE_OUTPUT.json
-!docs/FPL_APP_DESIGN.md
-!docs/CLUBELO_FALLBACK_DESIGN.md
+# Documentation and specifications are source files, not generated artifacts.
+# Keep local historical data exports out of version control.
+docs/archive/*.csv
 archived_files/

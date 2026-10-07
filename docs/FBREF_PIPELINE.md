@@ -1,7 +1,11 @@
-# Provider integration pipeline runbook
+# Provider integration reference
 
-This is the production runbook for building canonical fixture, team-form, and
-player-form artifacts. FBref is optional: current-season publication can use
+For the combined FPL and provider execution order, use
+[Complete FPL and provider data pipeline](COMPLETE_DATA_PIPELINE.md).
+This document retains provider-specific details and troubleshooting.
+
+This reference explains provider-specific acquisition, cleaning, and integration.
+Its sections are not a separate combined execution order. FBref is optional: current-season publication can use
 official FPL schedules, WhoScored match data, and Understat expected metrics.
 Commands are PowerShell commands and assume they run from the repository root.
 
@@ -264,7 +268,7 @@ python -m fpl_assistant.providers.whoscored.scrape.whoscored_match_stats_scraper
   --league "ENG-Premier League" `
   --seasons "2026-2027" `
   --out-dir "data/raw/whoscored" `
-  --tables schedule missing_players `
+  --tables schedule `
   --browser-fallback `
   --delay 0.75 `
   --headless `
@@ -286,7 +290,7 @@ python -m fpl_assistant.providers.whoscored.scrape.whoscored_match_stats_scraper
   --league "ENG-Premier League" `
   --seasons "2026-2027" `
   --out-dir "data/raw/whoscored" `
-  --tables schedule missing_players events `
+  --tables schedule events `
   --events-format events `
   --derived-tables match_info incidents player_dictionary lineups formations `
   --archive-raw-events `
@@ -313,6 +317,49 @@ stored under `data/raw/whoscored/WhoScored/ENG-Premier League/2627`; the cleaner
 still receives the canonical split-year season `2026-2027`. On later
 incremental runs, add `--skip-existing` to retain match artifacts already
 downloaded successfully.
+
+Keep `missing_players` as a separate scrape: it requests match preview pages,
+and a blocked preview currently aborts the native run before events are fetched.
+The schedule is written before preview scraping, so a preview failure does not
+undo a saved schedule. To collect previews separately, rerun the first command
+with `--tables missing_players` after saving the schedule.
+
+If the native backend reports `WhoScored blocked the request`, the returned
+HTML matched its block-page check even after the enabled browser fallback.
+The fallback currently reads Chrome's page source immediately after navigation
+and closes the browser; `--headed` alone does not provide a manual challenge
+wait. `--retry-missing` and `--on-error` control soccerdata event handling, not
+native preview failures. Native `--delay` pauses between table operations, not
+between individual preview requests. Separating previews lets you attempt the
+event scrape independently, but event pages can also be blocked.
+
+To attempt the completed-match event scrape with soccerdata instead:
+
+```powershell
+python -m fpl_assistant.providers.whoscored.scrape.whoscored_match_stats_scraper `
+  --backend soccerdata `
+  --league "ENG-Premier League" `
+  --seasons "2026-2027" `
+  --out-dir "data/raw/whoscored" `
+  --tables events `
+  --completed-only `
+  --events-format events `
+  --derived-tables match_info incidents player_dictionary lineups formations `
+  --archive-raw-events `
+  --raw-match-dir-layout per-match `
+  --stats-mode all-visible `
+  --headed `
+  --retry-missing `
+  --on-error raise `
+  --meta-path "data/meta/scraper_runs.json" `
+  --run-mode manual `
+  --verbose
+```
+
+Copy only the command text. PowerShell's `>>` continuation prompts are not part
+of the command: pasting them makes PowerShell parse output redirection and can
+raise `StreamAlreadyRedirected` before Python starts. Each continuation
+backtick must be the final character on its line, with no trailing spaces.
 
 Before cleaning WhoScored, rerun the FPL season roster publication whenever
 the live FPL roster has changed. The WhoScored cleaner uses that processed
@@ -441,6 +488,12 @@ Do not use `--create-empty` for a production run; that switch is only a
 diagnostic escape hatch.
 
 ## 11. Build player form
+
+First run the eligibility backfill in
+[stage 17 of the complete runbook](COMPLETE_DATA_PIPELINE.md#17-publish-eligibility-availability-and-complete-dnp-calendars).
+The calendar builder above writes `player_fixture_calendar_observed.csv`;
+eligibility backfill publishes the expanded `player_fixture_calendar.csv`
+that player form consumes.
 
 ```powershell
 python -m fpl_assistant.pipelines.integrate.player_form_builder `

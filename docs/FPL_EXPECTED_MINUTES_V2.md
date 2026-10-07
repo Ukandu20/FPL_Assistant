@@ -1,5 +1,10 @@
 # FPL Expected-Minutes V2.0 Operations
 
+> Governing specification: [hardened V2 contract](FPL_expected_minutes_V2_implementation_contract_HARDENED.md).
+> Prerequisite: [eligibility and DNP publication](FPL_ELIGIBILITY_BACKFILL.md).
+> Dates, GW01, RUN_ID, and example paths below are illustrative. Supply the
+> intended forecast cutoff and artifacts; do not reuse an old cutoff for a live run.
+
 The implementation lives in `fpl_assistant.minutes_v2`, separate from V1 so
 the benchmark and rollback path remain reproducible. Canonical configuration is
 `config/minutes_v2.json`; rolling seasons requires data/config updates, not model

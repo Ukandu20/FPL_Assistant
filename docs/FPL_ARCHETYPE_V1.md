@@ -76,10 +76,11 @@ python -m fpl_assistant.archetypes.publish_cli `
   --strict-input-contract
 ```
 
-The installed console command is equivalent:
+The installed console command is equivalent. These timestamps are examples;
+choose the intended snapshot cutoff rather than reusing an old date:
 
 ```powershell
-fpl-archetype-publish --current-season 2026-2027 --as-of <UTC-timestamp>
+fpl-archetype-publish --current-season 2026-2027 --as-of "2026-08-17T08:15:00Z"
 ```
 
 The input builder uses FPL's full player/team-match grid for minutes, starts,

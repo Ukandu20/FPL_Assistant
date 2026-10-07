@@ -1,0 +1,373 @@
+# FBref Pipeline — End-to-End Manual (Scrape ➜ team\_form / players\_form)
+
+**Updated for split runs & 429-safe scrapers**
+
+Canonical, idempotent path from raw FBref scrapes to consolidated `team_form` (FDR source of truth) and `players_form` suitable for modeling. This version reflects the new scraper flags:
+
+* Split runs: `--levels {player,team,both}`
+* Team build strategy: `--team-mode {aggregate,auto,direct}` (default **aggregate**)
+* Cache-first + `--force-cache`, 429 backoff, jittered sleeps, periodic cool-downs
+* Season scraper extras: `--layout {flat,folders}`, `--echo-config`
+* Optional `--proxy` (e.g., `tor` or HTTP proxy)
+
+Single source of truth: `team_form.csv` defines FDR. The fixture calendar mirrors it for convenience.
+
+---
+
+## 0) Quick overview (what runs when)
+
+**Data flow**
+
+```
+FBref scrape (match + season) ──► data/raw/fbref/<LEAGUE>/<SEASON>/
+   ├─ schedule.csv / player_match/* / team_match_*            (match-level)
+   └─ player_season_*.csv / team_season_*.csv                 (season-level)
+        │
+        ▼
+All-in-one cleaner (IDs, venue, opp_id, promoted/relegated, position sync)
+scripts.fbref_pipeline.clean.clean_fbref_csvs
+        │
+        ▼
+Fixture calendar (FPL + FBref schedule) + (neutral FDR or latest team_form)
+scripts.fbref_pipeline.integrate.fixtures_meta_builder
+        │
+        ▼
+Team form (past-only rollups, symmetric FDR)  ←─── FDR source of truth
+scripts.fbref_pipeline.integrate.team_form_builder
+        │
+        ├─ (Optional) Re-inject FDR back into fixtures_meta
+        │
+        ▼
+Player minutes calendar (per-match player rows + optional FPL enrich)
+scripts.fbref_pipeline.integrate.calendar_builder
+        │
+        ▼
+Players form (per-90, venue-aware, GK binomial save%)
+scripts.fbref_pipeline.integrate.player_form_builder
+```
+
+**New scraper defaults & intent**
+
+* Run **player layers first**, then build **team** from player (**aggregate**) to avoid hitting FBref’s team endpoints (primary 429 source).
+* Use `--force-cache` for iterative local work (no network).
+* If you *must* replicate FBref’s team tables (including per-90s), use `--team-mode direct` with generous throttling.
+
+Seasons normalized as `YYYY-YYYY+1` (e.g., `2025-2026`).
+
+---
+
+## 1) Prerequisites
+
+* Python ≥ 3.10 (3.12 OK)
+* `pip install pandas numpy soccerdata tqdm`
+* Recommended cache env (prevents re-hits):
+
+  * Windows: set persistent env or PowerShell profile
+
+  ```
+  setx SOCCERDATA_DIR "C:\Users\oukan\soccerdata"
+  setx SOCCERDATA_NOCACHE "False"
+  setx SOCCERDATA_NOSTORE "False"
+  ```
+* Registry/config files (unchanged):
+
+  * `data/config/teams.json` (aliases → 3-letter code)
+  * `data/processed/registry/_id_lookup_teams.json` (3-letter → 8-char id)
+
+Cleaner writes:
+
+* `data/processed/fbref/<LEAGUE>/<SEASON>/...` (clean CSVs)
+* `data/processed/registry/` lookups + masters
+
+FPL joins (optional but typical): see original list (unchanged).
+
+---
+
+## 2) Directory structure (after scrape)
+
+```
+data/
+  raw/
+    fbref/ENG-Premier League/2025-2026/
+      schedule.csv
+      player_match/<stat>.csv
+      team_match_<stat>.csv
+      player_season_<stat>.csv              # season scraper default layout = flat
+      team_season_<stat>.csv
+      # If you pass --layout folders on season scraper:
+      #   player_season/<stat>.csv, team_season/<stat>.csv
+  processed/
+    fbref/ENG-Premier League/2025-2026/
+      player_match/*.csv
+      team_match/*.csv                      # includes schedule.csv after cleaning
+      player_season/*.csv + season_players.json
+      registry/{master_players.json, master_teams.json}
+    registry/
+      _id_lookup_players.json
+      _id_lookup_teams.json
+      fixtures/<SEASON>/fixture_calendar.csv
+      features/<VERSION>/<SEASON>/{team_form.csv, players_form.csv}
+```
+
+---
+
+## 3) Step-by-step commands (PowerShell-friendly)
+
+### A) **Scrape match-level** (schedule, player\_match, team\_match)
+
+**A1. Player-only (prime cache; safest)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels player `
+  --delay 3.6 --max-retries 7 --periodic-every 6 --periodic-secs 20 `
+  --out-dir data/raw/fbref `
+  --verbose
+```
+
+**A2. Team-only (aggregate from player; zero extra hits)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels team --team-mode aggregate `
+  --force-cache `
+  --delay 3.2 `
+  --out-dir data/raw/fbref
+```
+
+**A3. If you truly need direct team endpoints (be gentle)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels team --team-mode auto `
+  --delay 4.5 --max-retries 8 --periodic-every 6 --periodic-secs 25 `
+  --out-dir data/raw/fbref
+```
+
+> Player-match runs first so aggregate team tables can be built locally. If FBref omits/blocks, schema-only CSVs are written to keep downstream steps robust.
+
+---
+
+### B) **Scrape season-level** (player\_season, team\_season)
+
+**B1. Player-only (prime cache; prints what will be scraped)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels player `
+  --delay 3.6 --max-retries 7 --periodic-every 6 --periodic-secs 20 `
+  --layout flat --echo-config `
+  --out-dir data/raw/fbref `
+  --verbose
+```
+
+**B2. Team-only (aggregate from player; zero extra hits if cache/files exist)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels team --team-mode aggregate `
+  --force-cache `
+  --delay 3.2 `
+  --layout flat `
+  --out-dir data/raw/fbref
+```
+
+**B3. Direct team season tables (only if you need FBref’s rate columns)**
+
+```powershell
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" `
+  --seasons 2025-2026 `
+  --levels team --team-mode direct `
+  --delay 5.0 --max-retries 8 --periodic-every 5 --periodic-secs 30 `
+  --layout flat `
+  --out-dir data/raw/fbref
+```
+
+> After first successful run, prefer `--force-cache` while iterating to avoid 429s.
+
+---
+
+### C) Clean & normalize (IDs, venue, opp\_id, promoted/relegated, positions)
+
+```powershell
+py -m scripts.fbref_pipeline.clean.csv_cleaner `
+  --raw-dir data/raw/fbref `
+  --league "ENG-Premier League" `
+  --clean-dir data/processed `
+  --workers 4 `
+  --log-level INFO `
+  --force
+```
+
+**Guarantees**: flattened headers; numeric coercion; stable `game_id` (slug else hashed date/home/away); `team_id`/`player_id` persisted; `is_home`/`opponent_id`; promoted/relegated flags; position sync.
+
+⚠ Ensure `schedule.csv` ends up at:
+`data/processed/fbref/ENG-Premier League/<SEASON>/team_match/schedule.csv`
+
+---
+
+### D) Build fixture calendar (FPL × FBref schedule)
+
+(First pass can use neutral FDR until `team_form` exists.)
+
+```powershell
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --fpl-root data/processed/fpl `
+  --fbref-league-dir "data/processed/fbref/ENG-Premier League" `
+  --team-map "data/processed/registry/_id_lookup_teams.json" `
+  --short-map "data/config/teams.json" `
+  --out-dir "data/processed/registry/fixtures" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --force --log-level INFO
+```
+
+**Produces** `registry/fixtures/<SEASON>/fixture_calendar.csv`. If `team_form.csv` exists in `features/<version>/<SEASON>`, it’s merged; otherwise neutral FDR is used.
+
+---
+
+### E) Build team\_form (FDR source of truth)
+
+```powershell
+py -m scripts.fbref_pipeline.integrate.team_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest --auto-version
+```
+
+Writes `features/v1/<SEASON>/team_form.csv`. Past-only, venue-aware rollups; symmetric FDR per fixture.
+
+---
+
+### F) Re-inject latest FDR into fixtures (recommended)
+
+```powershell
+py -m scripts.fbref_pipeline.integrate.fixtures_meta_builder `
+  --season "2025-2026" `
+  --features-root "data/processed/registry/features" `
+  --features-version latest `
+  --out-dir "data/processed/registry/fixtures" `
+  --force
+```
+
+---
+
+### G) Build player\_minutes calendar
+
+```powershell
+py -m scripts.fbref_pipeline.integrate.calendar_builder `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --fbref-root "data/processed/fbref/ENG-Premier League" `
+  --fpl-root "data/processed/fpl" `
+  --features-root "data/processed/registry/features" `
+  --team-version latest `
+  --include-price `
+  --price-master "data/processed/registry/fpl/master_fpl.json" `
+  --force
+```
+
+---
+
+### H) Build players\_form
+
+```powershell
+py -m scripts.fbref_pipeline.integrate.player_form_builder `
+  --season "2025-2026" `
+  --fixtures-root "data/processed/registry/fixtures" `
+  --out-dir "data/processed/registry/features" `
+  --version v1 --force --write-latest
+```
+
+---
+
+## 4) Validation checklist (smoke tests)
+
+* **After cleaner**: `team_match/schedule.csv` present in processed tree; `player_match/*.csv` have `player_id`, `team_id`, `game_id`, `is_home`, `opponent_id`.
+* **After fixtures\_meta**: `fixture_calendar.csv` row count ≈ FPL fixtures × 2; `home_id/away_id` filled.
+* **After team\_form**: `team_form.csv` with `fdr_home/_cont` and `fdr_away/_cont`; symmetry check quiet.
+* **After player\_minutes**: minutes > 0 coverage reasonable; venue flags correct; price coverage ok if included.
+* **After players\_form**: `_roll` and `_roll_z` present; GK metrics populated only for GK.
+
+---
+
+## 5) Troubleshooting (assume gremlins until proven otherwise)
+
+* **429s on team endpoints**: prefer `--team-mode aggregate` (no direct hits). If you must go direct, increase `--delay` (≥4.5), `--max-retries` (≥8), and periodic cool-downs; consider `--proxy`.
+* **“No data written” feeling**: run season scraper with `--echo-config` and watch `WROTE:` lines (absolute paths + row counts). Check `STAT_MAP` contents at runtime if needed.
+* **Neutral FDR leak**: if you build player artifacts before `team_form`, calendar carries neutral FDR—re-run fixtures after `team_form` to re-inject.
+
+---
+
+## 6) Frequently used variants
+
+* **All seasons**: omit `--season` (each tool walks subfolders).
+* **Weekly refresh (current season)**:
+
+  1. A1 Player-only match + B1 Player-only season
+  2. A2 Team-aggregate match + B2 Team-aggregate season (with `--force-cache`)
+  3. Clean current season
+  4. Fixtures (neutral OK) → Team\_form → Fixtures (re-inject)
+  5. Calendar → Players\_form
+* **Add a new season to existing version**: keep `--version v1`, omit `--force` (only new season writes).
+
+---
+
+## 7) “Pushback” — decide upfront
+
+* **Authoritative FDR**: always from `team_form.csv`. Calendar mirrors it; downstream must read FDR from team\_form.
+* **Aggregation math**: team tables aggregated **only** on numeric, **non-rate** columns (per-90, `%`, `rate`, `90s`, etc. excluded). If you require FBref’s per-90s, use `--team-mode direct`.
+* **Failure policy**: downstream continues with schema-only CSVs; watch warnings.
+* **ID stability**: slugs win; else hashed (date, home, away). Documented.
+* **DGWs**: z-scores by `(season, gw_orig)`; DGW games share the pool—intentional.
+
+---
+
+## 8) Minimal “golden run” (polite & split)
+
+**Scrape raw (match + season) — cache-friendly**
+
+```powershell
+# Match: player then team (aggregate)
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" --seasons 2025-2026 `
+  --levels player --delay 3.6 --max-retries 7 --periodic-every 6 --periodic-secs 20 -v
+
+py -m scripts.fbref_pipeline.scrape.match_stats_scraper `
+  --league "ENG-Premier League" --seasons 2025-2026 `
+  --levels team --team-mode aggregate --force-cache --delay 3.2
+
+# Season: player then team (aggregate)
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" --seasons 2025-2026 `
+  --levels player --delay 3.6 --periodic-every 6 --periodic-secs 20 --layout flat -v
+
+py -m scripts.fbref_pipeline.scrape.season_stats_scraper `
+  --league "ENG-Premier League" --seasons 2025-2026 `
+  --levels team --team-mode aggregate --force-cache --delay 3.2 --layout flat
+```
+
+**Then the usual:**
+
+Clean → Fixtures (pass 1) → Team\_form → Fixtures (re-inject) → Calendar → Players\_form
+(Commands unchanged from sections C–H.)
+
+---
+
+### Final skepticism checklist
+
+* Are you accidentally passing `--no-cache`? (Expect 429s.)
+* Did you *really* need `--team-mode direct`? If not, **aggregate**.
+* Do your logs show `WROTE:` with non-zero rows where you expect? If not, trace `STAT_MAP` and input availability before blaming downstream.

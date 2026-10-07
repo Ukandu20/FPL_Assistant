@@ -1,5 +1,10 @@
 # Architecture consolidation report
 
+> Status: completed migration record dated 2026-09-10. Legacy paths in the
+> mapping tables are intentional historical references; verification counts
+> describe that migration run. Use the [combined runbook](COMPLETE_DATA_PIPELINE.md)
+> for current pipeline execution.
+
 Date: 2026-09-10
 
 ## Final directory ownership
