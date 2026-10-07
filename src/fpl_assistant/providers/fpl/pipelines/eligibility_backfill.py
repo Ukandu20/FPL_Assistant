@@ -561,6 +561,7 @@ def enrich_player_attacking_stats(
             # forward when canonical player-match evidence is unavailable.
             result[metric] = provider
         result.loc[completed_dnp & result[metric].isna(), metric] = 0.0
+        result.loc[result["observation_status"].eq("fixture_pending"), metric] = pd.NA
 
     # Retain established model aliases while making the public meaning clear.
     result["gls"] = result["goals"]
@@ -804,6 +805,13 @@ def expand_player_fixture_calendar(
     output["minutes"] = pd.to_numeric(output.get("minutes"), errors="coerce")
     minutes = output["minutes"]
     output.loc[~completed, "minutes"] = pd.NA
+    # Live roster snapshots contain season totals, not future match outcomes.
+    # Keep price/projection context, but never publish those totals as results
+    # on pending fixtures (including when restoring an older observed surface).
+    outcome_columns = set(authoritative_stats.values()) - {"price", "xp"}
+    outcome_columns.update({"gls", "ast", "xg", "xa"})
+    for column in outcome_columns.intersection(output.columns):
+        output.loc[~completed, column] = pd.NA
     minutes = pd.to_numeric(output.get("minutes"), errors="coerce")
     output.loc[completed & minutes.isna(), "minutes"] = 0
     minutes = pd.to_numeric(output["minutes"], errors="coerce")

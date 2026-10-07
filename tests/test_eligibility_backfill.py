@@ -128,6 +128,14 @@ def test_pending_preseason_rows_keep_unknown_minutes_and_apply_snapshot_status()
                 "position": "FW",
                 "minutes": pd.NA,
                 "starts": pd.NA,
+                "bonus": 9,
+                "bps": 250,
+                "total_points": 40,
+                "clean_sheets": 3,
+                "goals_scored": 5,
+                "assists": 2,
+                "value": 100,
+                "xP": 4.5,
             }
             for fixture_id in (1, 2)
         ]
@@ -154,10 +162,25 @@ def test_pending_preseason_rows_keep_unknown_minutes_and_apply_snapshot_status()
     )
 
     assert panel["minutes"].isna().all()
+    assert panel[["bonus", "bps", "total_points", "clean_sheets", "goals", "assists"]].isna().all().all()
+    assert panel["price"].eq(100).all()
+    assert panel["xp"].eq(4.5).all()
     assert panel["did_not_play"].isna().all()
     assert panel["observation_status"].eq("fixture_pending").all()
     assert ~panel["eligible_for_fixture"].all()
     assert audit["pending_rows"] == 2
+
+    # A provider match record must not reintroduce outcomes while the
+    # canonical fixture is still pending.
+    root = Path(".tmp") / f"pending_attacking_{uuid.uuid4().hex}"
+    root.mkdir(parents=True)
+    source = root / "player_match.csv"
+    pd.DataFrame([{
+        "match_id": "m1", "player_id": "p1", "goals": 2,
+        "assists": 1, "xg": 0.9, "xa": 0.4,
+    }]).to_csv(source, index=False)
+    enriched, _ = enrich_player_attacking_stats(panel, source)
+    assert enriched[["goals", "assists", "xg", "xa", "gls", "ast"]].isna().all().all()
 
 
 def test_understat_enrichment_separates_player_metrics_from_team_context():
