@@ -30,6 +30,12 @@ navigation = st.navigation(
     {
         "Plan": [
             st.Page(
+                APP_ROOT / "pages" / "4_minutes.py",
+                title="Minutes Forecast",
+                icon="⏱️",
+                url_path="minutes",
+            ),
+            st.Page(
                 APP_ROOT / "pages" / "0_home.py",
                 title="Gameweek Hub",
                 icon="⚽",

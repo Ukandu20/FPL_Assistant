@@ -10,6 +10,7 @@ import streamlit as st
 import streamlit_shadcn_ui as ui
 
 from apps.fpl.app_data import archetypes as app_archetypes, player_archetype_history
+from apps.fpl.minutes import add_fixture_minutes, load_minutes, render_minutes
 from apps.fpl.catalog import (
     PREDICTIONS_ROOT,
     FPL_ROOT,
@@ -593,6 +594,18 @@ def load_archetype_artifact(
     if "player_id" in artifact:
         artifact["player_id"] = artifact["player_id"].astype("string")
     return artifact
+
+
+@st.cache_data(show_spinner=False)
+def load_current_season_signal_profiles(
+    artifact_path: str | None, season: str, gameweeks: pd.DataFrame,
+    data_version: tuple[int, int] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cache display-only season signals across player selections."""
+    matches = load_archetype_artifact(artifact_path, data_version) if artifact_path else pd.DataFrame()
+    return player_signal_profile_viewmodels.current_season_signal_profiles(
+        matches, season, gameweeks
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -1360,6 +1373,7 @@ def render_player_bio(
 def render_signal_component_cards(cards: list[dict[str, object]]) -> None:
     """Render the stable signal-card view model in the player Overview."""
     st.markdown("### Player signals")
+    st.caption("Selected season only. Small samples carry lower confidence; model profiles use longer history.")
     for start in range(0, len(cards), 2):
         columns = st.columns(2)
         for column, card in zip(columns, cards[start : start + 2]):
@@ -1417,6 +1431,12 @@ def render_signal_component_cards(cards: list[dict[str, object]]) -> None:
                         )
                     if sample:
                         st.caption(" | ".join(sample))
+                    if "covered_appearances" in card:
+                        st.caption(
+                            f"Detailed statistics available for {int(card['covered_appearances'])} "
+                            f"of {0 if pd.isna(appearances) else int(appearances)} eligible appearances. "
+                            "Missing statistics remain unavailable."
+                        )
 
                     components = card.get("components", [])
                     if not components:
@@ -2864,6 +2884,8 @@ def main() -> None:
         forecast=player_forecast,
         limit=5,
     )
+    minutes_data, minutes_path = load_minutes(selected_season)
+    player_fixtures = add_fixture_minutes(player_fixtures, minutes_data, str(selected_player_id))
     alternatives = comparable_players(
         season_players, str(selected_player_id), price_tolerance=5, limit=3
     )
@@ -2885,17 +2907,26 @@ def main() -> None:
             else profile_freshness_path
         ),
         "forecast": updated_label(forecast_path),
+        "minutes forecast": updated_label(minutes_path),
     }
 
+    signal_archetypes, signal_evidence = pd.DataFrame(), pd.DataFrame()
+    if selected_view == "Overview":
+        signal_archetypes, signal_evidence = load_current_season_signal_profiles(
+            str(match_evidence_path) if archetype_snapshot_dir is not None else None,
+            selected_season, gameweeks,
+            file_version(match_evidence_path) if archetype_snapshot_dir is not None else None,
+        )
     signal_cards = (
         build_player_signal_cards(
-            v1_archetypes,
-            component_evidence,
+            signal_archetypes,
+            signal_evidence,
             selected_record,
             gameweeks,
             player_id=selected_player_id,
             player_name=player_name,
             fpl_position=str(raw_record.get("fpl_pos", selected_record["Position"])),
+            current_season_only=True,
         )
         if selected_view == "Overview"
         else []
@@ -2931,6 +2962,8 @@ def main() -> None:
             signal_cards,
         )
     elif selected_view == "Form & Forecast":
+        render_minutes(minutes_data, minutes_path, player_id=str(selected_player_id))
+        st.divider()
         render_performance_tab(
             player_name, selected_season, gameweek_history, percentile_table
         )

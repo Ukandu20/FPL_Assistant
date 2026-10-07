@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+import pytest
 
 from fpl_assistant.apps.viewmodels.player_signal_profile import (
     build_player_signal_cards,
+    current_season_signal_profiles,
 )
 
 
@@ -233,3 +235,148 @@ def test_missing_profile_artifact_keeps_explicit_unavailable_cards() -> None:
         card["status"] == "Profile not published" for card in cards[:3]
     )
     assert cards[3]["status"] == "Insufficient appearances"
+
+
+def _season_matches() -> pd.DataFrame:
+    metrics = {}
+    for row in _component_evidence().query("evidence_window == 'recent'").to_dict("records"):
+        metrics.update(json.loads(row["metric_values"]))
+    return pd.DataFrame([
+        {
+            **metrics,
+            "player_id": player,
+            "season": "2026-2027",
+            "kickoff_utc": f"2026-08-{day:02d}T12:00:00Z",
+            "snapshot_date": "2026-09-01T00:00:00Z",
+            "fpl_position": "MID",
+            "minutes": 90,
+            "npxg": (1.0 if day <= 2 else 0.1) * scale,
+        }
+        for player, scale in [("selected", 1), ("peer", 2)]
+        for day in range(1, 13)
+    ])
+
+
+def test_season_signals_use_full_season_and_ignore_previous_and_future_rows() -> None:
+    matches = _season_matches()
+    original = matches.copy(deep=True)
+    scores, evidence = current_season_signal_profiles(matches, "2026-2027")
+    old = matches.assign(season="2025-2026", npxg=9999)
+    future = matches.assign(kickoff_utc="2026-09-02T12:00:00Z", npxg=9999)
+    actual_scores, actual_evidence = current_season_signal_profiles(
+        pd.concat([matches, old, future], ignore_index=True), "2026-2027"
+    )
+    pd.testing.assert_frame_equal(scores, actual_scores)
+    pd.testing.assert_frame_equal(evidence, actual_evidence)
+    pd.testing.assert_frame_equal(matches, original)
+    cards = build_player_signal_cards(
+        scores, evidence, pd.Series({"Points": 15}), _official_season_matches(),
+        player_id="selected", player_name="Selected", fpl_position="MID",
+        current_season_only=True,
+    )
+    goal = cards[0]
+    assert goal["evidence_minutes"] == 1080
+    assert goal["eligible_appearances"] == 12
+    assert goal["evidence_window"] == "current_season"
+    assert goal["trend"] is None
+    assert goal["components"][0]["raw_value"] == pytest.approx(0.25)
+    assert goal["components"][0]["percentile"] == 50
+    assert cards[3]["eligible_appearances"] == 12
+
+
+def test_season_signals_have_no_previous_season_fallback() -> None:
+    scores, evidence = current_season_signal_profiles(_season_matches(), "2027-2028")
+    assert scores.empty and evidence.empty
+    cards = build_player_signal_cards(
+        scores, evidence, pd.Series({"Points": 0}), pd.DataFrame(),
+        player_id="selected", player_name="Selected", fpl_position="MID",
+        current_season_only=True,
+    )
+    assert all(card["headline_value"] is None for card in cards[:3])
+    assert all(card["status"] == "Current-season evidence unavailable" for card in cards[:3])
+
+
+def test_season_signals_preserve_eligibility_and_missing_data_rules() -> None:
+    matches = _season_matches()
+    matches.loc[0, "minutes"] = 29
+    matches.loc[1, "red_cards"] = 1
+    matches.loc[2, "npxg"] = float("nan")
+    scores, evidence = current_season_signal_profiles(matches, "2026-2027")
+    goal = scores.loc[
+        scores["player_id"].eq("selected") & scores["archetype_id"].eq("GOAL_THREAT")
+    ].iloc[0]
+    assert goal["eligible_appearances"] == 10
+    assert goal["evidence_minutes"] == 900
+    assert pd.isna(goal["score_0_100"])
+    assert "npxg" in goal["missing_data_flags"]
+
+
+def _official_season_matches() -> pd.DataFrame:
+    matches = _season_matches()
+    return pd.DataFrame({
+        "player_id": matches["player_id"],
+        "fixture": list(range(1, 13)) * 2,
+        "fpl_pos": matches["fpl_position"],
+        "kickoff_time": matches["kickoff_utc"],
+        "minutes": matches["minutes"],
+        "total_points": 2,
+        "red_cards": 0,
+    })
+
+
+def test_shared_fpl_eligibility_includes_red_cards_and_reports_missing_matches() -> None:
+    official = _official_season_matches()
+    official.loc[0, "red_cards"] = 1
+    official.loc[1, "minutes"] = 29
+    provider = _season_matches().assign(fpl_fixture_id=list(range(1, 13)) * 2)
+    provider.loc[0, "red_cards"] = 1
+    provider.loc[0, "minutes"] = 10  # Official FPL minutes own eligibility.
+    provider = provider.drop(index=2)
+    scores, evidence = current_season_signal_profiles(provider, "2026-2027", official)
+    cards = build_player_signal_cards(
+        scores, evidence, pd.Series({"Points": 24}), official,
+        player_id="selected", player_name="Selected", fpl_position="MID",
+        current_season_only=True,
+    )
+    assert all(card["eligible_appearances"] == 11 for card in cards)
+    assert all(card["evidence_minutes"] == 990 for card in cards)
+    assert cards[0]["covered_appearances"] == 10
+    assert cards[0]["headline_value"] is None
+    assert cards[0]["components"][0]["raw_value"] is None
+    assert pd.isna(cards[0]["confidence_band"])
+    complete, _ = current_season_signal_profiles(
+        _season_matches().assign(fpl_fixture_id=list(range(1, 13)) * 2, red_cards=1),
+        "2026-2027", official,
+    )
+    goal = complete.query("player_id == 'selected' and archetype_id == 'GOAL_THREAT'").iloc[0]
+    assert goal["covered_appearances"] == 11
+    assert pd.notna(goal["score_0_100"])
+
+
+def test_missing_provider_season_keeps_fpl_sample_and_no_zero_statistics() -> None:
+    official = _official_season_matches()
+    keeper = official.iloc[[0]].assign(player_id="keeper", fpl_pos="GKP")
+    official = pd.concat([official, keeper], ignore_index=True)
+    provider = _season_matches().assign(season="2025-2026", fpl_fixture_id=list(range(1, 13)) * 2)
+    scores, evidence = current_season_signal_profiles(provider, "2026-2027", official)
+    cards = build_player_signal_cards(
+        scores, evidence, pd.Series({"Points": 24}), official,
+        player_id="selected", player_name="Selected", fpl_position="MID",
+        current_season_only=True,
+    )
+    for card in cards[:3]:
+        assert card["eligible_appearances"] == 12
+        assert card["covered_appearances"] == 0
+        assert card["headline_value"] is None
+        assert all(component["raw_value"] is None for component in card["components"])
+        assert all(component["percentile"] is None for component in card["components"])
+
+
+def test_fixture_join_never_uses_same_gameweek_or_ambiguous_provider_rows() -> None:
+    official = _official_season_matches().assign(round=1)
+    provider = _season_matches().assign(fpl_fixture_id=list(range(1, 13)) * 2)
+    provider = pd.concat([provider, provider.iloc[[0]]], ignore_index=True)
+    scores, _ = current_season_signal_profiles(provider, "2026-2027", official)
+    goal = scores.query("player_id == 'selected' and archetype_id == 'GOAL_THREAT'").iloc[0]
+    assert goal["eligible_appearances"] == 12
+    assert goal["covered_appearances"] == 11

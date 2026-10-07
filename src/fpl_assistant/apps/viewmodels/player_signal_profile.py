@@ -5,6 +5,142 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from fpl_assistant.archetypes.config import ArchetypeConfig, load_config
+from fpl_assistant.archetypes.scoring import score_base_components_with_evidence
+
+
+def current_season_signal_profiles(
+    match_evidence: pd.DataFrame, season: str, gameweeks: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Recompute display-only season totals without changing published models.
+
+    Use one season-wide window so raw components, peer rankings, headline and
+    confidence all describe the same sample. Retain the model's eligibility,
+    missing-data and shrinkage rules, but never inherit historical states.
+    """
+    if gameweeks is not None:
+        return _fpl_eligible_signal_profiles(match_evidence, season, gameweeks)
+    required = {
+        "season", "snapshot_date", "player_id", "kickoff_utc",
+        "fpl_position", "minutes",
+    }
+    if match_evidence.empty or not required.issubset(match_evidence):
+        return pd.DataFrame(), pd.DataFrame()
+    current = match_evidence.loc[
+        match_evidence["season"].astype("string").eq(str(season))
+    ].copy()
+    if current.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    cutoff = pd.to_datetime(current["snapshot_date"], utc=True, errors="coerce").max()
+    if pd.isna(cutoff):
+        return pd.DataFrame(), pd.DataFrame()
+    config = load_config()
+    season_config = ArchetypeConfig(
+        values={**config.values, "recent_appearances": len(current)},
+        source_path=config.source_path,
+    )
+    result = score_base_components_with_evidence(
+        current, as_of=cutoff, current_season=season, config=season_config,
+    )
+    if not result.scores.empty:
+        # A season-wide total has no separate recent-versus-baseline trend.
+        result.scores["trend"] = None
+    if not result.evidence.empty:
+        result.evidence["evidence_window"] = "current_season"
+        result.evidence["applied_window_weights"] = '{"current_season": 1.0}'
+    return result.scores, result.evidence
+
+
+def _eligible_fpl_matches(gameweeks: pd.DataFrame) -> pd.DataFrame:
+    """The shared appearance rule for Overview signals and FPL Output."""
+    if not {"player_id", "fpl_pos", "minutes", "total_points"}.issubset(gameweeks):
+        return pd.DataFrame()
+    work = gameweeks.copy()
+    work["minutes"] = pd.to_numeric(work["minutes"], errors="coerce").fillna(0)
+    return work.loc[work["minutes"].ge(30)].copy()
+
+
+def _fpl_eligible_signal_profiles(
+    match_evidence: pd.DataFrame, season: str, gameweeks: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Left-join provider statistics onto the official eligible fixture list.
+
+    Missing provider rows stay missing. Red-card appearances remain eligible,
+    just as they do for FPL Output; this never changes model scoring rules.
+    """
+    eligible = _eligible_fpl_matches(gameweeks)
+    if eligible.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    eligible["player_id"] = eligible["player_id"].astype("string")
+    config = load_config()
+    metrics = set(config.values["provider_fields"]) - {"minutes"}
+    metrics.update({"defcon_hit", "non_penalty_goals"})
+    # Only bring metric fields across: FPL owns membership, minutes and position.
+    provider = match_evidence.copy()
+    if "season" in provider:
+        provider = provider.loc[provider["season"].astype("string").eq(season)].copy()
+    else:
+        provider = pd.DataFrame()
+    key_pair = next((
+        (left, right) for left, right in (
+            ("fixture", "fpl_fixture_id"), ("match_id", "match_id"),
+            ("game_id", "match_id"),
+        ) if left in eligible and right in provider and "player_id" in provider
+    ), None)
+    if key_pair is not None:
+        left, right = key_pair
+        provider["player_id"] = provider["player_id"].astype("string")
+        if left == "fixture":
+            eligible["_fixture_key"] = pd.to_numeric(eligible[left], errors="coerce")
+            provider["_fixture_key"] = pd.to_numeric(provider[right], errors="coerce")
+        else:
+            eligible["_fixture_key"] = eligible[left].astype("string")
+            provider["_fixture_key"] = provider[right].astype("string")
+        keys = ["player_id", "_fixture_key"]
+        provider = provider.dropna(subset=keys)
+        # Ambiguous rows cannot safely establish provider coverage.
+        provider = provider.loc[~provider.duplicated(keys, keep=False)]
+        fields = sorted(metrics.intersection(provider.columns) - {"red_cards"})
+        aligned = eligible[keys].merge(
+            provider[keys + fields], on=keys, how="left", validate="many_to_one"
+        )
+    else:
+        aligned = pd.DataFrame(index=range(len(eligible)))
+    for metric in metrics:
+        if metric not in aligned:
+            aligned[metric] = float("nan")
+    aligned["player_id"] = eligible["player_id"].to_numpy()
+    aligned["minutes"] = eligible["minutes"].to_numpy()
+    aligned["fpl_position"] = eligible["fpl_pos"].to_numpy()
+    aligned["season"] = season
+    date_column = next((name for name in ("kickoff_time", "kickoff_utc", "date_played") if name in eligible), None)
+    if date_column is None:
+        return pd.DataFrame(), pd.DataFrame()
+    kickoff = pd.to_datetime(eligible[date_column], utc=True, errors="coerce")
+    if kickoff.isna().any():
+        return pd.DataFrame(), pd.DataFrame()
+    aligned["kickoff_utc"] = kickoff.to_numpy()
+    # Include the complete official appearance set, even if provider data lags.
+    aligned["snapshot_date"] = kickoff.max() + pd.Timedelta(nanoseconds=1)
+    aligned["red_cards"] = 0
+    if "defensive_contribution" in eligible:
+        actions = pd.to_numeric(eligible["defensive_contribution"], errors="coerce")
+        threshold = eligible["fpl_pos"].eq("DEF").map({True: 10, False: 12})
+        aligned["defcon_hit"] = actions.ge(threshold).where(actions.notna()).to_numpy()
+    scores, evidence = current_season_signal_profiles(aligned, season)
+    for index, row in scores.iterrows():
+        if row["archetype_id"] not in COMPONENT_CATALOGUE:
+            continue  # Goalkeepers currently receive only the FPL Output card.
+        definition = config.values["components"][row["archetype_id"]]
+        weights = definition.get("weights") or definition["weights_by_position"][row["fpl_position"]]
+        player_rows = aligned.loc[aligned["player_id"].eq(row["player_id"])]
+        available = player_rows[list(weights)].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+        scores.loc[index, "covered_appearances"] = int(available.sum())
+        if pd.isna(row["score_0_100"]):
+            scores.loc[index, "confidence_band"] = None
+            scores.loc[index, "status"] = "Provider evidence incomplete"
+    return scores, evidence
+
 
 PROFILE_ARCHETYPE_CARDS = (
     ("GOAL_THREAT", "goal_threat", "Goal Scoring"),
@@ -216,7 +352,10 @@ def _peer_component_percentiles(
     ]
     values: dict[str, dict[str, float]] = {}
     for row in peer_rows.to_dict("records"):
+        raw_values = _mapping(row.get("metric_values"))
         for component_id, value in _mapping(row.get("position_z_scores")).items():
+            if _number(raw_values.get(component_id)) is None:
+                continue
             number = _number(value)
             if number is not None:
                 values.setdefault(component_id, {})[str(row["player_id"])] = number
@@ -363,6 +502,7 @@ def _profile_card(
         "trend": headline.get("trend"),
         "evidence_minutes": _number(headline.get("evidence_minutes")),
         "eligible_appearances": _number(headline.get("eligible_appearances")),
+        "covered_appearances": _number(headline.get("covered_appearances")),
         "evidence_window": evidence_window,
         "status": headline.get("status"),
         "components": _component_rows(
@@ -393,8 +533,7 @@ def _fpl_player_summaries(gameweeks: pd.DataFrame) -> pd.DataFrame:
     required = {"player_id", "fpl_pos", "minutes", "total_points"}
     if gameweeks.empty or not required.issubset(gameweeks):
         return pd.DataFrame()
-    work = gameweeks.copy()
-    work["minutes"] = pd.to_numeric(work["minutes"], errors="coerce").fillna(0)
+    work = _eligible_fpl_matches(gameweeks)
     work["total_points"] = pd.to_numeric(work["total_points"], errors="coerce")
     work["fpl_pos"] = work["fpl_pos"].astype("string").str.upper().replace("GK", "GKP")
     work = work.loc[work["minutes"].ge(30)].copy()
@@ -548,6 +687,7 @@ def build_player_signal_cards(
     player_id: str,
     player_name: str,
     fpl_position: str,
+    current_season_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the four Overview signal cards from persisted and official data."""
     cards = []
@@ -575,4 +715,23 @@ def build_player_signal_cards(
             player_name=player_name,
         )
     )
+    if current_season_only:
+        summaries = _fpl_player_summaries(gameweeks)
+        selected_summary = (
+            summaries.loc[summaries["player_id"].astype("string").eq(str(player_id))]
+            if "player_id" in summaries else pd.DataFrame()
+        )
+        for card in cards:
+            if card["id"] == "fpl_output":
+                continue
+            card["scale_label"] = "Current-season same-position percentile"
+            card["evidence_window"] = "current_season"
+            if not selected_summary.empty:
+                official = selected_summary.iloc[-1]
+                card["eligible_appearances"] = int(official["eligible_appearances"])
+                card["evidence_minutes"] = float(official["evidence_minutes"])
+            covered = card.get("covered_appearances")
+            card["covered_appearances"] = 0 if covered is None else covered
+            if card["status"] == "Profile not published":
+                card["status"] = "Current-season evidence unavailable"
     return cards
