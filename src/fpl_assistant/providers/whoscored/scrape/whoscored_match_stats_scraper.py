@@ -287,6 +287,10 @@ def init_logger(verbose: bool) -> None:
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
+        # soccerdata configures root handlers at import time with ERROR as the
+        # default level. The CLI must replace that configuration so refresh
+        # warnings and --verbose diagnostics actually reach the terminal.
+        force=True,
     )
 
 
